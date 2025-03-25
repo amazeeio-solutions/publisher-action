@@ -6,6 +6,6 @@ core.info('Notifying Publisher');
 await notifyPublisher({ status: 'started' });
 
 if (config.cache && config.publisherPayload.clearCache) {
-  core.info('Clearing cache');
+  core.info('Clearing caches');
   await clearCache();
 }

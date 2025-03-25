@@ -29231,7 +29231,7 @@ _lib_js__WEBPACK_IMPORTED_MODULE_1__ = (__webpack_async_dependencies__.then ? (a
 _actions_core__WEBPACK_IMPORTED_MODULE_0__.info('Notifying Publisher');
 await (0,_lib_js__WEBPACK_IMPORTED_MODULE_1__/* .notifyPublisher */ .FM)({ status: 'started' });
 if (_lib_js__WEBPACK_IMPORTED_MODULE_1__/* .config.cache */ .vc.cache && _lib_js__WEBPACK_IMPORTED_MODULE_1__/* .config.publisherPayload.clearCache */ .vc.publisherPayload.clearCache) {
-    _actions_core__WEBPACK_IMPORTED_MODULE_0__.info('Clearing cache');
+    _actions_core__WEBPACK_IMPORTED_MODULE_0__.info('Clearing caches');
     await (0,_lib_js__WEBPACK_IMPORTED_MODULE_1__/* .clearCache */ .LK)();
 }
 

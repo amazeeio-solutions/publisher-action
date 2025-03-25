@@ -65810,9 +65810,9 @@ if (isSuccess && _lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache */ .vc.cac
             .replace(/[-:]/g, '')
             .replace(/\..+/, '')
             .replace('T', '_');
-        const savedKey = await _actions_cache__WEBPACK_IMPORTED_MODULE_0__.saveCache(_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.paths */ .vc.cache.paths, `${_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.key */ .vc.cache.key}-${timestamp}`);
-        if (savedKey) {
-            _actions_core__WEBPACK_IMPORTED_MODULE_1__.info(`Cache saved: ${savedKey}`);
+        const savedId = await _actions_cache__WEBPACK_IMPORTED_MODULE_0__.saveCache(_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.paths */ .vc.cache.paths, `${_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.key */ .vc.cache.key}-${timestamp}`);
+        if (savedId) {
+            _actions_core__WEBPACK_IMPORTED_MODULE_1__.info(`Cache saved with ID ${savedId}`);
         }
         else {
             // While saving a cache sounds like an optional thing to do, actually it's
