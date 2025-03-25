@@ -29191,20 +29191,23 @@ async function clearCache() {
         const octokit = new _octokit_rest__WEBPACK_IMPORTED_MODULE_4__/* .Octokit */ .v({ auth: config.githubToken });
         const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
         const list = await octokit.actions.getActionsCacheList({
-            key: config.cache.key,
             owner,
             repo,
         });
-        if (list.data.total_count) {
-            await octokit.actions.deleteActionsCacheByKey({
-                key: config.cache.key,
+        await Promise.all(list.data.actions_caches
+            .filter((cache) => !!cache.key?.startsWith(`${config.cache.key}-`))
+            .map((cache) => {
+            _actions_core__WEBPACK_IMPORTED_MODULE_0__.info(`Deleting cache ${cache.key}`);
+            return octokit.actions.deleteActionsCacheByKey({
+                key: cache.key,
                 owner,
                 repo,
             });
-        }
+        }));
     }
     catch (error) {
         _actions_core__WEBPACK_IMPORTED_MODULE_0__.error('ℹ️Tip: It can be that you need to give both "read" and "write" permissions to the GITHUB_TOKEN. The easiest way to do this is to update Actions settings of the repository.');
+        // It's critical to delete old caches. Otherwise, we will get stale builds.
         await fail(`Failed to delete cache: ${error}`);
     }
 }

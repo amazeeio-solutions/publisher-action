@@ -65651,9 +65651,9 @@ __nccwpck_require__.a(module, async (__webpack_handle_async_dependencies__, __we
 /* harmony export */ __nccwpck_require__.d(__webpack_exports__, {
 /* harmony export */   "FM": () => (/* binding */ notifyPublisher),
 /* harmony export */   "LK": () => (/* binding */ clearCache),
+/* harmony export */   "bG": () => (/* binding */ fail),
 /* harmony export */   "vc": () => (/* binding */ config)
 /* harmony export */ });
-/* unused harmony export fail */
 /* harmony import */ var _actions_core__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(9093);
 /* harmony import */ var _actions_core__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__nccwpck_require__.n(_actions_core__WEBPACK_IMPORTED_MODULE_0__);
 /* harmony import */ var _actions_github__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(5942);
@@ -65759,20 +65759,23 @@ async function clearCache() {
         const octokit = new _octokit_rest__WEBPACK_IMPORTED_MODULE_4__/* .Octokit */ .v({ auth: config.githubToken });
         const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
         const list = await octokit.actions.getActionsCacheList({
-            key: config.cache.key,
             owner,
             repo,
         });
-        if (list.data.total_count) {
-            await octokit.actions.deleteActionsCacheByKey({
-                key: config.cache.key,
+        await Promise.all(list.data.actions_caches
+            .filter((cache) => !!cache.key?.startsWith(`${config.cache.key}-`))
+            .map((cache) => {
+            _actions_core__WEBPACK_IMPORTED_MODULE_0__.info(`Deleting cache ${cache.key}`);
+            return octokit.actions.deleteActionsCacheByKey({
+                key: cache.key,
                 owner,
                 repo,
             });
-        }
+        }));
     }
     catch (error) {
         _actions_core__WEBPACK_IMPORTED_MODULE_0__.error('ℹ️Tip: It can be that you need to give both "read" and "write" permissions to the GITHUB_TOKEN. The easiest way to do this is to update Actions settings of the repository.');
+        // It's critical to delete old caches. Otherwise, we will get stale builds.
         await fail(`Failed to delete cache: ${error}`);
     }
 }
@@ -65798,17 +65801,28 @@ _lib_js__WEBPACK_IMPORTED_MODULE_2__ = (__webpack_async_dependencies__.then ? (a
 
 const isSuccess = _lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.successEnvVarName */ .vc.successEnvVarName in process.env;
 if (isSuccess && _lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache */ .vc.cache) {
-    _actions_core__WEBPACK_IMPORTED_MODULE_1__.info('Deleting previous cache');
+    _actions_core__WEBPACK_IMPORTED_MODULE_1__.info('Deleting previous caches');
     await (0,_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .clearCache */ .LK)();
     _actions_core__WEBPACK_IMPORTED_MODULE_1__.info('Saving cache');
     try {
-        const savedKey = await _actions_cache__WEBPACK_IMPORTED_MODULE_0__.saveCache(_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.paths */ .vc.cache.paths, _lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.key */ .vc.cache.key);
-        if (!savedKey) {
-            _actions_core__WEBPACK_IMPORTED_MODULE_1__.warning('Cache not saved');
+        const timestamp = new Date()
+            .toISOString()
+            .replace(/[-:]/g, '')
+            .replace(/\..+/, '')
+            .replace('T', '_');
+        const savedKey = await _actions_cache__WEBPACK_IMPORTED_MODULE_0__.saveCache(_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.paths */ .vc.cache.paths, `${_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.key */ .vc.cache.key}-${timestamp}`);
+        if (savedKey) {
+            _actions_core__WEBPACK_IMPORTED_MODULE_1__.info(`Cache saved: ${savedKey}`);
+        }
+        else {
+            // While saving a cache sounds like an optional thing to do, actually it's
+            // critical to do it. Otherwise, we might get stale builds. For example,
+            // if there is an issue with Github not properly deleting old caches.
+            await (0,_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .fail */ .bG)('Cache not saved');
         }
     }
     catch (error) {
-        _actions_core__WEBPACK_IMPORTED_MODULE_1__.warning(`Failed to save cache: ${error}`);
+        await (0,_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .fail */ .bG)(`Failed to save cache: ${error}`);
     }
 }
 _actions_core__WEBPACK_IMPORTED_MODULE_1__.info('Notifying Publisher');

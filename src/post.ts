@@ -1,25 +1,35 @@
 import * as cache from '@actions/cache';
 import * as core from '@actions/core';
 
-import { clearCache, config, notifyPublisher } from './lib.js';
+import { clearCache, config, fail, notifyPublisher } from './lib.js';
 
 const isSuccess = config.successEnvVarName in process.env;
 
 if (isSuccess && config.cache) {
-  core.info('Deleting previous cache');
+  core.info('Deleting previous caches');
   await clearCache();
 
   core.info('Saving cache');
   try {
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, '')
+      .replace(/\..+/, '')
+      .replace('T', '_');
     const savedKey = await cache.saveCache(
       config.cache.paths,
-      config.cache.key,
+      `${config.cache.key}-${timestamp}`,
     );
-    if (!savedKey) {
-      core.warning('Cache not saved');
+    if (savedKey) {
+      core.info(`Cache saved: ${savedKey}`);
+    } else {
+      // While saving a cache sounds like an optional thing to do, actually it's
+      // critical to do it. Otherwise, we might get stale builds. For example,
+      // if there is an issue with Github not properly deleting old caches.
+      await fail('Cache not saved');
     }
   } catch (error) {
-    core.warning(`Failed to save cache: ${error}`);
+    await fail(`Failed to save cache: ${error}`);
   }
 }
 

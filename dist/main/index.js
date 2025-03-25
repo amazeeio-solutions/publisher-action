@@ -65757,20 +65757,23 @@ async function clearCache() {
         const octokit = new Octokit({ auth: config.githubToken });
         const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
         const list = await octokit.actions.getActionsCacheList({
-            key: config.cache.key,
             owner,
             repo,
         });
-        if (list.data.total_count) {
-            await octokit.actions.deleteActionsCacheByKey({
-                key: config.cache.key,
+        await Promise.all(list.data.actions_caches
+            .filter((cache) => !!cache.key?.startsWith(`${config.cache.key}-`))
+            .map((cache) => {
+            core.info(`Deleting cache ${cache.key}`);
+            return octokit.actions.deleteActionsCacheByKey({
+                key: cache.key,
                 owner,
                 repo,
             });
-        }
+        }));
     }
     catch (error) {
         core.error('ℹ️Tip: It can be that you need to give both "read" and "write" permissions to the GITHUB_TOKEN. The easiest way to do this is to update Actions settings of the repository.');
+        // It's critical to delete old caches. Otherwise, we will get stale builds.
         await fail(`Failed to delete cache: ${error}`);
     }
 }
@@ -65808,8 +65811,18 @@ if (_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.publisherPayload.environmentV
 if (_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache */ .vc.cache && !_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.publisherPayload.clearCache */ .vc.publisherPayload.clearCache) {
     _actions_core__WEBPACK_IMPORTED_MODULE_1__.info('Restoring cache');
     try {
-        const restoredKey = await _actions_cache__WEBPACK_IMPORTED_MODULE_0__.restoreCache(_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.paths */ .vc.cache.paths, _lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.key */ .vc.cache.key);
-        if (!restoredKey) {
+        const restoredKey = await _actions_cache__WEBPACK_IMPORTED_MODULE_0__.restoreCache(_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.paths */ .vc.cache.paths, 
+        // We are going to use the restoreKeys instead.
+        `${_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.key */ .vc.cache.key}-FAKE-KEY`, 
+        // From the Github Actions docs:
+        // https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#matching-a-cache-key
+        // If there are multiple partial matches for a restore key, the action
+        // returns the most recently created cache.
+        [`${_lib_js__WEBPACK_IMPORTED_MODULE_2__/* .config.cache.key */ .vc.cache.key}-`]);
+        if (restoredKey) {
+            _actions_core__WEBPACK_IMPORTED_MODULE_1__.info(`Cache restored: ${restoredKey}`);
+        }
+        else {
             _actions_core__WEBPACK_IMPORTED_MODULE_1__.info('Cache not found');
         }
     }
