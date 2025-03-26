@@ -146,6 +146,10 @@ export async function clearCache(): Promise<void> {
 
     await Promise.all(
       list.data.actions_caches
+        .map((cache) => {
+          core.info(`Debug cache: ${JSON.stringify(cache)}`);
+          return cache;
+        })
         .filter(
           (cache): cache is { key: string } =>
             !!cache.key?.startsWith(`${config.cache!.key}-`),
