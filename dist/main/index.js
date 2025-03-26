@@ -69460,10 +69460,6 @@ async function clearCache() {
             repo,
         });
         await Promise.all(list.data.actions_caches
-            .map((cache) => {
-            core.info(`Debug cache: ${JSON.stringify(cache)}`);
-            return cache;
-        })
             .filter((cache) => !!cache.key?.startsWith(`${config.cache.key}-`))
             .map((cache) => {
             core.info(`Deleting cache ${cache.key}`);
