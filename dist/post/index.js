@@ -1,7 +1,7 @@
 import { createRequire as __WEBPACK_EXTERNAL_createRequire } from "module";
 /******/ var __webpack_modules__ = ({
 
-/***/ 6878:
+/***/ 1217:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -39,11 +39,14 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.saveCache = exports.restoreCache = exports.isFeatureAvailable = exports.ReserveCacheError = exports.ValidationError = void 0;
-const core = __importStar(__nccwpck_require__(9093));
+const core = __importStar(__nccwpck_require__(8407));
 const path = __importStar(__nccwpck_require__(1017));
-const utils = __importStar(__nccwpck_require__(9522));
-const cacheHttpClient = __importStar(__nccwpck_require__(5213));
-const tar_1 = __nccwpck_require__(3686);
+const utils = __importStar(__nccwpck_require__(6797));
+const cacheHttpClient = __importStar(__nccwpck_require__(9966));
+const cacheTwirpClient = __importStar(__nccwpck_require__(4523));
+const config_1 = __nccwpck_require__(5844);
+const tar_1 = __nccwpck_require__(9219);
+const constants_1 = __nccwpck_require__(9531);
 class ValidationError extends Error {
     constructor(message) {
         super(message);
@@ -87,15 +90,39 @@ exports.isFeatureAvailable = isFeatureAvailable;
  * Restores cache from keys
  *
  * @param paths a list of file paths to restore from the cache
- * @param primaryKey an explicit key for restoring the cache
- * @param restoreKeys an optional ordered list of keys to use for restoring the cache if no cache hit occurred for key
+ * @param primaryKey an explicit key for restoring the cache. Lookup is done with prefix matching.
+ * @param restoreKeys an optional ordered list of keys to use for restoring the cache if no cache hit occurred for primaryKey
  * @param downloadOptions cache download options
  * @param enableCrossOsArchive an optional boolean enabled to restore on windows any cache created on any platform
  * @returns string returns the key for the cache hit, otherwise returns undefined
  */
 function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArchive = false) {
     return __awaiter(this, void 0, void 0, function* () {
+        const cacheServiceVersion = (0, config_1.getCacheServiceVersion)();
+        core.debug(`Cache service version: ${cacheServiceVersion}`);
         checkPaths(paths);
+        switch (cacheServiceVersion) {
+            case 'v2':
+                return yield restoreCacheV2(paths, primaryKey, restoreKeys, options, enableCrossOsArchive);
+            case 'v1':
+            default:
+                return yield restoreCacheV1(paths, primaryKey, restoreKeys, options, enableCrossOsArchive);
+        }
+    });
+}
+exports.restoreCache = restoreCache;
+/**
+ * Restores cache using the legacy Cache Service
+ *
+ * @param paths a list of file paths to restore from the cache
+ * @param primaryKey an explicit key for restoring the cache. Lookup is done with prefix matching.
+ * @param restoreKeys an optional ordered list of keys to use for restoring the cache if no cache hit occurred for primaryKey
+ * @param options cache download options
+ * @param enableCrossOsArchive an optional boolean enabled to restore on Windows any cache created on any platform
+ * @returns string returns the key for the cache hit, otherwise returns undefined
+ */
+function restoreCacheV1(paths, primaryKey, restoreKeys, options, enableCrossOsArchive = false) {
+    return __awaiter(this, void 0, void 0, function* () {
         restoreKeys = restoreKeys || [];
         const keys = [primaryKey, ...restoreKeys];
         core.debug('Resolved Keys:');
@@ -157,7 +184,85 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         return undefined;
     });
 }
-exports.restoreCache = restoreCache;
+/**
+ * Restores cache using Cache Service v2
+ *
+ * @param paths a list of file paths to restore from the cache
+ * @param primaryKey an explicit key for restoring the cache. Lookup is done with prefix matching
+ * @param restoreKeys an optional ordered list of keys to use for restoring the cache if no cache hit occurred for primaryKey
+ * @param downloadOptions cache download options
+ * @param enableCrossOsArchive an optional boolean enabled to restore on windows any cache created on any platform
+ * @returns string returns the key for the cache hit, otherwise returns undefined
+ */
+function restoreCacheV2(paths, primaryKey, restoreKeys, options, enableCrossOsArchive = false) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // Override UploadOptions to force the use of Azure
+        options = Object.assign(Object.assign({}, options), { useAzureSdk: true });
+        restoreKeys = restoreKeys || [];
+        const keys = [primaryKey, ...restoreKeys];
+        core.debug('Resolved Keys:');
+        core.debug(JSON.stringify(keys));
+        if (keys.length > 10) {
+            throw new ValidationError(`Key Validation Error: Keys are limited to a maximum of 10.`);
+        }
+        for (const key of keys) {
+            checkKey(key);
+        }
+        let archivePath = '';
+        try {
+            const twirpClient = cacheTwirpClient.internalCacheTwirpClient();
+            const compressionMethod = yield utils.getCompressionMethod();
+            const request = {
+                key: primaryKey,
+                restoreKeys,
+                version: utils.getCacheVersion(paths, compressionMethod, enableCrossOsArchive)
+            };
+            const response = yield twirpClient.GetCacheEntryDownloadURL(request);
+            if (!response.ok) {
+                core.debug(`Cache not found for version ${request.version} of keys: ${keys.join(', ')}`);
+                return undefined;
+            }
+            core.info(`Cache hit for: ${request.key}`);
+            if (options === null || options === void 0 ? void 0 : options.lookupOnly) {
+                core.info('Lookup only - skipping download');
+                return response.matchedKey;
+            }
+            archivePath = path.join(yield utils.createTempDirectory(), utils.getCacheFileName(compressionMethod));
+            core.debug(`Archive path: ${archivePath}`);
+            core.debug(`Starting download of archive to: ${archivePath}`);
+            yield cacheHttpClient.downloadCache(response.signedDownloadUrl, archivePath, options);
+            const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
+            core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
+            if (core.isDebug()) {
+                yield (0, tar_1.listTar)(archivePath, compressionMethod);
+            }
+            yield (0, tar_1.extractTar)(archivePath, compressionMethod);
+            core.info('Cache restored successfully');
+            return response.matchedKey;
+        }
+        catch (error) {
+            const typedError = error;
+            if (typedError.name === ValidationError.name) {
+                throw error;
+            }
+            else {
+                // Supress all non-validation cache related errors because caching should be optional
+                core.warning(`Failed to restore: ${error.message}`);
+            }
+        }
+        finally {
+            try {
+                if (archivePath) {
+                    yield utils.unlinkFile(archivePath);
+                }
+            }
+            catch (error) {
+                core.debug(`Failed to delete archive: ${error}`);
+            }
+        }
+        return undefined;
+    });
+}
 /**
  * Saves a list of files with the specified key
  *
@@ -168,10 +273,33 @@ exports.restoreCache = restoreCache;
  * @returns number returns cacheId if the cache was saved successfully and throws an error if save fails
  */
 function saveCache(paths, key, options, enableCrossOsArchive = false) {
-    var _a, _b, _c, _d, _e;
     return __awaiter(this, void 0, void 0, function* () {
+        const cacheServiceVersion = (0, config_1.getCacheServiceVersion)();
+        core.debug(`Cache service version: ${cacheServiceVersion}`);
         checkPaths(paths);
         checkKey(key);
+        switch (cacheServiceVersion) {
+            case 'v2':
+                return yield saveCacheV2(paths, key, options, enableCrossOsArchive);
+            case 'v1':
+            default:
+                return yield saveCacheV1(paths, key, options, enableCrossOsArchive);
+        }
+    });
+}
+exports.saveCache = saveCache;
+/**
+ * Save cache using the legacy Cache Service
+ *
+ * @param paths
+ * @param key
+ * @param options
+ * @param enableCrossOsArchive
+ * @returns
+ */
+function saveCacheV1(paths, key, options, enableCrossOsArchive = false) {
+    var _a, _b, _c, _d, _e;
+    return __awaiter(this, void 0, void 0, function* () {
         const compressionMethod = yield utils.getCompressionMethod();
         let cacheId = -1;
         const cachePaths = yield utils.resolvePaths(paths);
@@ -192,7 +320,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false) {
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
             core.debug(`File Size: ${archiveFileSize}`);
             // For GHES, this check will take place in ReserveCache API with enterprise file size limit
-            if (archiveFileSize > fileSizeLimit && !utils.isGhes()) {
+            if (archiveFileSize > fileSizeLimit && !(0, config_1.isGhes)()) {
                 throw new Error(`Cache size of ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B) is over the 10GB limit, not saving cache.`);
             }
             core.debug('Reserving Cache');
@@ -211,7 +339,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false) {
                 throw new ReserveCacheError(`Unable to reserve cache with key ${key}, another job may be creating this cache. More details: ${(_e = reserveCacheResponse === null || reserveCacheResponse === void 0 ? void 0 : reserveCacheResponse.error) === null || _e === void 0 ? void 0 : _e.message}`);
             }
             core.debug(`Saving Cache (ID: ${cacheId})`);
-            yield cacheHttpClient.saveCache(cacheId, archivePath, options);
+            yield cacheHttpClient.saveCache(cacheId, archivePath, '', options);
         }
         catch (error) {
             const typedError = error;
@@ -237,12 +365,714 @@ function saveCache(paths, key, options, enableCrossOsArchive = false) {
         return cacheId;
     });
 }
-exports.saveCache = saveCache;
+/**
+ * Save cache using Cache Service v2
+ *
+ * @param paths a list of file paths to restore from the cache
+ * @param key an explicit key for restoring the cache
+ * @param options cache upload options
+ * @param enableCrossOsArchive an optional boolean enabled to save cache on windows which could be restored on any platform
+ * @returns
+ */
+function saveCacheV2(paths, key, options, enableCrossOsArchive = false) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // Override UploadOptions to force the use of Azure
+        // ...options goes first because we want to override the default values
+        // set in UploadOptions with these specific figures
+        options = Object.assign(Object.assign({}, options), { uploadChunkSize: 64 * 1024 * 1024, uploadConcurrency: 8, useAzureSdk: true });
+        const compressionMethod = yield utils.getCompressionMethod();
+        const twirpClient = cacheTwirpClient.internalCacheTwirpClient();
+        let cacheId = -1;
+        const cachePaths = yield utils.resolvePaths(paths);
+        core.debug('Cache Paths:');
+        core.debug(`${JSON.stringify(cachePaths)}`);
+        if (cachePaths.length === 0) {
+            throw new Error(`Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved.`);
+        }
+        const archiveFolder = yield utils.createTempDirectory();
+        const archivePath = path.join(archiveFolder, utils.getCacheFileName(compressionMethod));
+        core.debug(`Archive Path: ${archivePath}`);
+        try {
+            yield (0, tar_1.createTar)(archiveFolder, cachePaths, compressionMethod);
+            if (core.isDebug()) {
+                yield (0, tar_1.listTar)(archivePath, compressionMethod);
+            }
+            const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
+            core.debug(`File Size: ${archiveFileSize}`);
+            // For GHES, this check will take place in ReserveCache API with enterprise file size limit
+            if (archiveFileSize > constants_1.CacheFileSizeLimit && !(0, config_1.isGhes)()) {
+                throw new Error(`Cache size of ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B) is over the 10GB limit, not saving cache.`);
+            }
+            // Set the archive size in the options, will be used to display the upload progress
+            options.archiveSizeBytes = archiveFileSize;
+            core.debug('Reserving Cache');
+            const version = utils.getCacheVersion(paths, compressionMethod, enableCrossOsArchive);
+            const request = {
+                key,
+                version
+            };
+            let signedUploadUrl;
+            try {
+                const response = yield twirpClient.CreateCacheEntry(request);
+                if (!response.ok) {
+                    throw new Error('Response was not ok');
+                }
+                signedUploadUrl = response.signedUploadUrl;
+            }
+            catch (error) {
+                core.debug(`Failed to reserve cache: ${error}`);
+                throw new ReserveCacheError(`Unable to reserve cache with key ${key}, another job may be creating this cache.`);
+            }
+            core.debug(`Attempting to upload cache located at: ${archivePath}`);
+            yield cacheHttpClient.saveCache(cacheId, archivePath, signedUploadUrl, options);
+            const finalizeRequest = {
+                key,
+                version,
+                sizeBytes: `${archiveFileSize}`
+            };
+            const finalizeResponse = yield twirpClient.FinalizeCacheEntryUpload(finalizeRequest);
+            core.debug(`FinalizeCacheEntryUploadResponse: ${finalizeResponse.ok}`);
+            if (!finalizeResponse.ok) {
+                throw new Error(`Unable to finalize cache with key ${key}, another job may be finalizing this cache.`);
+            }
+            cacheId = parseInt(finalizeResponse.entryId);
+        }
+        catch (error) {
+            const typedError = error;
+            if (typedError.name === ValidationError.name) {
+                throw error;
+            }
+            else if (typedError.name === ReserveCacheError.name) {
+                core.info(`Failed to save: ${typedError.message}`);
+            }
+            else {
+                core.warning(`Failed to save: ${typedError.message}`);
+            }
+        }
+        finally {
+            // Try to delete the archive to save space
+            try {
+                yield utils.unlinkFile(archivePath);
+            }
+            catch (error) {
+                core.debug(`Failed to delete archive: ${error}`);
+            }
+        }
+        return cacheId;
+    });
+}
 //# sourceMappingURL=cache.js.map
 
 /***/ }),
 
-/***/ 5213:
+/***/ 2246:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.CacheService = exports.GetCacheEntryDownloadURLResponse = exports.GetCacheEntryDownloadURLRequest = exports.FinalizeCacheEntryUploadResponse = exports.FinalizeCacheEntryUploadRequest = exports.CreateCacheEntryResponse = exports.CreateCacheEntryRequest = void 0;
+// @generated by protobuf-ts 2.9.1 with parameter long_type_string,client_none,generate_dependencies
+// @generated from protobuf file "results/api/v1/cache.proto" (package "github.actions.results.api.v1", syntax proto3)
+// tslint:disable
+const runtime_rpc_1 = __nccwpck_require__(1730);
+const runtime_1 = __nccwpck_require__(7509);
+const runtime_2 = __nccwpck_require__(7509);
+const runtime_3 = __nccwpck_require__(7509);
+const runtime_4 = __nccwpck_require__(7509);
+const runtime_5 = __nccwpck_require__(7509);
+const cachemetadata_1 = __nccwpck_require__(2708);
+// @generated message type with reflection information, may provide speed optimized methods
+class CreateCacheEntryRequest$Type extends runtime_5.MessageType {
+    constructor() {
+        super("github.actions.results.api.v1.CreateCacheEntryRequest", [
+            { no: 1, name: "metadata", kind: "message", T: () => cachemetadata_1.CacheMetadata },
+            { no: 2, name: "key", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "version", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value) {
+        const message = { key: "", version: "" };
+        globalThis.Object.defineProperty(message, runtime_4.MESSAGE_TYPE, { enumerable: false, value: this });
+        if (value !== undefined)
+            (0, runtime_3.reflectionMergePartial)(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader, length, options, target) {
+        let message = target !== null && target !== void 0 ? target : this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* github.actions.results.entities.v1.CacheMetadata metadata */ 1:
+                    message.metadata = cachemetadata_1.CacheMetadata.internalBinaryRead(reader, reader.uint32(), options, message.metadata);
+                    break;
+                case /* string key */ 2:
+                    message.key = reader.string();
+                    break;
+                case /* string version */ 3:
+                    message.version = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? runtime_2.UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message, writer, options) {
+        /* github.actions.results.entities.v1.CacheMetadata metadata = 1; */
+        if (message.metadata)
+            cachemetadata_1.CacheMetadata.internalBinaryWrite(message.metadata, writer.tag(1, runtime_1.WireType.LengthDelimited).fork(), options).join();
+        /* string key = 2; */
+        if (message.key !== "")
+            writer.tag(2, runtime_1.WireType.LengthDelimited).string(message.key);
+        /* string version = 3; */
+        if (message.version !== "")
+            writer.tag(3, runtime_1.WireType.LengthDelimited).string(message.version);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? runtime_2.UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message github.actions.results.api.v1.CreateCacheEntryRequest
+ */
+exports.CreateCacheEntryRequest = new CreateCacheEntryRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class CreateCacheEntryResponse$Type extends runtime_5.MessageType {
+    constructor() {
+        super("github.actions.results.api.v1.CreateCacheEntryResponse", [
+            { no: 1, name: "ok", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 2, name: "signed_upload_url", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value) {
+        const message = { ok: false, signedUploadUrl: "" };
+        globalThis.Object.defineProperty(message, runtime_4.MESSAGE_TYPE, { enumerable: false, value: this });
+        if (value !== undefined)
+            (0, runtime_3.reflectionMergePartial)(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader, length, options, target) {
+        let message = target !== null && target !== void 0 ? target : this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bool ok */ 1:
+                    message.ok = reader.bool();
+                    break;
+                case /* string signed_upload_url */ 2:
+                    message.signedUploadUrl = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? runtime_2.UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message, writer, options) {
+        /* bool ok = 1; */
+        if (message.ok !== false)
+            writer.tag(1, runtime_1.WireType.Varint).bool(message.ok);
+        /* string signed_upload_url = 2; */
+        if (message.signedUploadUrl !== "")
+            writer.tag(2, runtime_1.WireType.LengthDelimited).string(message.signedUploadUrl);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? runtime_2.UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message github.actions.results.api.v1.CreateCacheEntryResponse
+ */
+exports.CreateCacheEntryResponse = new CreateCacheEntryResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class FinalizeCacheEntryUploadRequest$Type extends runtime_5.MessageType {
+    constructor() {
+        super("github.actions.results.api.v1.FinalizeCacheEntryUploadRequest", [
+            { no: 1, name: "metadata", kind: "message", T: () => cachemetadata_1.CacheMetadata },
+            { no: 2, name: "key", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "size_bytes", kind: "scalar", T: 3 /*ScalarType.INT64*/ },
+            { no: 4, name: "version", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value) {
+        const message = { key: "", sizeBytes: "0", version: "" };
+        globalThis.Object.defineProperty(message, runtime_4.MESSAGE_TYPE, { enumerable: false, value: this });
+        if (value !== undefined)
+            (0, runtime_3.reflectionMergePartial)(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader, length, options, target) {
+        let message = target !== null && target !== void 0 ? target : this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* github.actions.results.entities.v1.CacheMetadata metadata */ 1:
+                    message.metadata = cachemetadata_1.CacheMetadata.internalBinaryRead(reader, reader.uint32(), options, message.metadata);
+                    break;
+                case /* string key */ 2:
+                    message.key = reader.string();
+                    break;
+                case /* int64 size_bytes */ 3:
+                    message.sizeBytes = reader.int64().toString();
+                    break;
+                case /* string version */ 4:
+                    message.version = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? runtime_2.UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message, writer, options) {
+        /* github.actions.results.entities.v1.CacheMetadata metadata = 1; */
+        if (message.metadata)
+            cachemetadata_1.CacheMetadata.internalBinaryWrite(message.metadata, writer.tag(1, runtime_1.WireType.LengthDelimited).fork(), options).join();
+        /* string key = 2; */
+        if (message.key !== "")
+            writer.tag(2, runtime_1.WireType.LengthDelimited).string(message.key);
+        /* int64 size_bytes = 3; */
+        if (message.sizeBytes !== "0")
+            writer.tag(3, runtime_1.WireType.Varint).int64(message.sizeBytes);
+        /* string version = 4; */
+        if (message.version !== "")
+            writer.tag(4, runtime_1.WireType.LengthDelimited).string(message.version);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? runtime_2.UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message github.actions.results.api.v1.FinalizeCacheEntryUploadRequest
+ */
+exports.FinalizeCacheEntryUploadRequest = new FinalizeCacheEntryUploadRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class FinalizeCacheEntryUploadResponse$Type extends runtime_5.MessageType {
+    constructor() {
+        super("github.actions.results.api.v1.FinalizeCacheEntryUploadResponse", [
+            { no: 1, name: "ok", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 2, name: "entry_id", kind: "scalar", T: 3 /*ScalarType.INT64*/ }
+        ]);
+    }
+    create(value) {
+        const message = { ok: false, entryId: "0" };
+        globalThis.Object.defineProperty(message, runtime_4.MESSAGE_TYPE, { enumerable: false, value: this });
+        if (value !== undefined)
+            (0, runtime_3.reflectionMergePartial)(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader, length, options, target) {
+        let message = target !== null && target !== void 0 ? target : this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bool ok */ 1:
+                    message.ok = reader.bool();
+                    break;
+                case /* int64 entry_id */ 2:
+                    message.entryId = reader.int64().toString();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? runtime_2.UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message, writer, options) {
+        /* bool ok = 1; */
+        if (message.ok !== false)
+            writer.tag(1, runtime_1.WireType.Varint).bool(message.ok);
+        /* int64 entry_id = 2; */
+        if (message.entryId !== "0")
+            writer.tag(2, runtime_1.WireType.Varint).int64(message.entryId);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? runtime_2.UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message github.actions.results.api.v1.FinalizeCacheEntryUploadResponse
+ */
+exports.FinalizeCacheEntryUploadResponse = new FinalizeCacheEntryUploadResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetCacheEntryDownloadURLRequest$Type extends runtime_5.MessageType {
+    constructor() {
+        super("github.actions.results.api.v1.GetCacheEntryDownloadURLRequest", [
+            { no: 1, name: "metadata", kind: "message", T: () => cachemetadata_1.CacheMetadata },
+            { no: 2, name: "key", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "restore_keys", kind: "scalar", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "version", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value) {
+        const message = { key: "", restoreKeys: [], version: "" };
+        globalThis.Object.defineProperty(message, runtime_4.MESSAGE_TYPE, { enumerable: false, value: this });
+        if (value !== undefined)
+            (0, runtime_3.reflectionMergePartial)(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader, length, options, target) {
+        let message = target !== null && target !== void 0 ? target : this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* github.actions.results.entities.v1.CacheMetadata metadata */ 1:
+                    message.metadata = cachemetadata_1.CacheMetadata.internalBinaryRead(reader, reader.uint32(), options, message.metadata);
+                    break;
+                case /* string key */ 2:
+                    message.key = reader.string();
+                    break;
+                case /* repeated string restore_keys */ 3:
+                    message.restoreKeys.push(reader.string());
+                    break;
+                case /* string version */ 4:
+                    message.version = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? runtime_2.UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message, writer, options) {
+        /* github.actions.results.entities.v1.CacheMetadata metadata = 1; */
+        if (message.metadata)
+            cachemetadata_1.CacheMetadata.internalBinaryWrite(message.metadata, writer.tag(1, runtime_1.WireType.LengthDelimited).fork(), options).join();
+        /* string key = 2; */
+        if (message.key !== "")
+            writer.tag(2, runtime_1.WireType.LengthDelimited).string(message.key);
+        /* repeated string restore_keys = 3; */
+        for (let i = 0; i < message.restoreKeys.length; i++)
+            writer.tag(3, runtime_1.WireType.LengthDelimited).string(message.restoreKeys[i]);
+        /* string version = 4; */
+        if (message.version !== "")
+            writer.tag(4, runtime_1.WireType.LengthDelimited).string(message.version);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? runtime_2.UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message github.actions.results.api.v1.GetCacheEntryDownloadURLRequest
+ */
+exports.GetCacheEntryDownloadURLRequest = new GetCacheEntryDownloadURLRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetCacheEntryDownloadURLResponse$Type extends runtime_5.MessageType {
+    constructor() {
+        super("github.actions.results.api.v1.GetCacheEntryDownloadURLResponse", [
+            { no: 1, name: "ok", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 2, name: "signed_download_url", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "matched_key", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value) {
+        const message = { ok: false, signedDownloadUrl: "", matchedKey: "" };
+        globalThis.Object.defineProperty(message, runtime_4.MESSAGE_TYPE, { enumerable: false, value: this });
+        if (value !== undefined)
+            (0, runtime_3.reflectionMergePartial)(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader, length, options, target) {
+        let message = target !== null && target !== void 0 ? target : this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bool ok */ 1:
+                    message.ok = reader.bool();
+                    break;
+                case /* string signed_download_url */ 2:
+                    message.signedDownloadUrl = reader.string();
+                    break;
+                case /* string matched_key */ 3:
+                    message.matchedKey = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? runtime_2.UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message, writer, options) {
+        /* bool ok = 1; */
+        if (message.ok !== false)
+            writer.tag(1, runtime_1.WireType.Varint).bool(message.ok);
+        /* string signed_download_url = 2; */
+        if (message.signedDownloadUrl !== "")
+            writer.tag(2, runtime_1.WireType.LengthDelimited).string(message.signedDownloadUrl);
+        /* string matched_key = 3; */
+        if (message.matchedKey !== "")
+            writer.tag(3, runtime_1.WireType.LengthDelimited).string(message.matchedKey);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? runtime_2.UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message github.actions.results.api.v1.GetCacheEntryDownloadURLResponse
+ */
+exports.GetCacheEntryDownloadURLResponse = new GetCacheEntryDownloadURLResponse$Type();
+/**
+ * @generated ServiceType for protobuf service github.actions.results.api.v1.CacheService
+ */
+exports.CacheService = new runtime_rpc_1.ServiceType("github.actions.results.api.v1.CacheService", [
+    { name: "CreateCacheEntry", options: {}, I: exports.CreateCacheEntryRequest, O: exports.CreateCacheEntryResponse },
+    { name: "FinalizeCacheEntryUpload", options: {}, I: exports.FinalizeCacheEntryUploadRequest, O: exports.FinalizeCacheEntryUploadResponse },
+    { name: "GetCacheEntryDownloadURL", options: {}, I: exports.GetCacheEntryDownloadURLRequest, O: exports.GetCacheEntryDownloadURLResponse }
+]);
+//# sourceMappingURL=cache.js.map
+
+/***/ }),
+
+/***/ 4990:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.CacheServiceClientProtobuf = exports.CacheServiceClientJSON = void 0;
+const cache_1 = __nccwpck_require__(2246);
+class CacheServiceClientJSON {
+    constructor(rpc) {
+        this.rpc = rpc;
+        this.CreateCacheEntry.bind(this);
+        this.FinalizeCacheEntryUpload.bind(this);
+        this.GetCacheEntryDownloadURL.bind(this);
+    }
+    CreateCacheEntry(request) {
+        const data = cache_1.CreateCacheEntryRequest.toJson(request, {
+            useProtoFieldName: true,
+            emitDefaultValues: false,
+        });
+        const promise = this.rpc.request("github.actions.results.api.v1.CacheService", "CreateCacheEntry", "application/json", data);
+        return promise.then((data) => cache_1.CreateCacheEntryResponse.fromJson(data, {
+            ignoreUnknownFields: true,
+        }));
+    }
+    FinalizeCacheEntryUpload(request) {
+        const data = cache_1.FinalizeCacheEntryUploadRequest.toJson(request, {
+            useProtoFieldName: true,
+            emitDefaultValues: false,
+        });
+        const promise = this.rpc.request("github.actions.results.api.v1.CacheService", "FinalizeCacheEntryUpload", "application/json", data);
+        return promise.then((data) => cache_1.FinalizeCacheEntryUploadResponse.fromJson(data, {
+            ignoreUnknownFields: true,
+        }));
+    }
+    GetCacheEntryDownloadURL(request) {
+        const data = cache_1.GetCacheEntryDownloadURLRequest.toJson(request, {
+            useProtoFieldName: true,
+            emitDefaultValues: false,
+        });
+        const promise = this.rpc.request("github.actions.results.api.v1.CacheService", "GetCacheEntryDownloadURL", "application/json", data);
+        return promise.then((data) => cache_1.GetCacheEntryDownloadURLResponse.fromJson(data, {
+            ignoreUnknownFields: true,
+        }));
+    }
+}
+exports.CacheServiceClientJSON = CacheServiceClientJSON;
+class CacheServiceClientProtobuf {
+    constructor(rpc) {
+        this.rpc = rpc;
+        this.CreateCacheEntry.bind(this);
+        this.FinalizeCacheEntryUpload.bind(this);
+        this.GetCacheEntryDownloadURL.bind(this);
+    }
+    CreateCacheEntry(request) {
+        const data = cache_1.CreateCacheEntryRequest.toBinary(request);
+        const promise = this.rpc.request("github.actions.results.api.v1.CacheService", "CreateCacheEntry", "application/protobuf", data);
+        return promise.then((data) => cache_1.CreateCacheEntryResponse.fromBinary(data));
+    }
+    FinalizeCacheEntryUpload(request) {
+        const data = cache_1.FinalizeCacheEntryUploadRequest.toBinary(request);
+        const promise = this.rpc.request("github.actions.results.api.v1.CacheService", "FinalizeCacheEntryUpload", "application/protobuf", data);
+        return promise.then((data) => cache_1.FinalizeCacheEntryUploadResponse.fromBinary(data));
+    }
+    GetCacheEntryDownloadURL(request) {
+        const data = cache_1.GetCacheEntryDownloadURLRequest.toBinary(request);
+        const promise = this.rpc.request("github.actions.results.api.v1.CacheService", "GetCacheEntryDownloadURL", "application/protobuf", data);
+        return promise.then((data) => cache_1.GetCacheEntryDownloadURLResponse.fromBinary(data));
+    }
+}
+exports.CacheServiceClientProtobuf = CacheServiceClientProtobuf;
+//# sourceMappingURL=cache.twirp-client.js.map
+
+/***/ }),
+
+/***/ 2708:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.CacheMetadata = void 0;
+const runtime_1 = __nccwpck_require__(7509);
+const runtime_2 = __nccwpck_require__(7509);
+const runtime_3 = __nccwpck_require__(7509);
+const runtime_4 = __nccwpck_require__(7509);
+const runtime_5 = __nccwpck_require__(7509);
+const cachescope_1 = __nccwpck_require__(6998);
+// @generated message type with reflection information, may provide speed optimized methods
+class CacheMetadata$Type extends runtime_5.MessageType {
+    constructor() {
+        super("github.actions.results.entities.v1.CacheMetadata", [
+            { no: 1, name: "repository_id", kind: "scalar", T: 3 /*ScalarType.INT64*/ },
+            { no: 2, name: "scope", kind: "message", repeat: 1 /*RepeatType.PACKED*/, T: () => cachescope_1.CacheScope }
+        ]);
+    }
+    create(value) {
+        const message = { repositoryId: "0", scope: [] };
+        globalThis.Object.defineProperty(message, runtime_4.MESSAGE_TYPE, { enumerable: false, value: this });
+        if (value !== undefined)
+            (0, runtime_3.reflectionMergePartial)(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader, length, options, target) {
+        let message = target !== null && target !== void 0 ? target : this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* int64 repository_id */ 1:
+                    message.repositoryId = reader.int64().toString();
+                    break;
+                case /* repeated github.actions.results.entities.v1.CacheScope scope */ 2:
+                    message.scope.push(cachescope_1.CacheScope.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? runtime_2.UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message, writer, options) {
+        /* int64 repository_id = 1; */
+        if (message.repositoryId !== "0")
+            writer.tag(1, runtime_1.WireType.Varint).int64(message.repositoryId);
+        /* repeated github.actions.results.entities.v1.CacheScope scope = 2; */
+        for (let i = 0; i < message.scope.length; i++)
+            cachescope_1.CacheScope.internalBinaryWrite(message.scope[i], writer.tag(2, runtime_1.WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? runtime_2.UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message github.actions.results.entities.v1.CacheMetadata
+ */
+exports.CacheMetadata = new CacheMetadata$Type();
+//# sourceMappingURL=cachemetadata.js.map
+
+/***/ }),
+
+/***/ 6998:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.CacheScope = void 0;
+const runtime_1 = __nccwpck_require__(7509);
+const runtime_2 = __nccwpck_require__(7509);
+const runtime_3 = __nccwpck_require__(7509);
+const runtime_4 = __nccwpck_require__(7509);
+const runtime_5 = __nccwpck_require__(7509);
+// @generated message type with reflection information, may provide speed optimized methods
+class CacheScope$Type extends runtime_5.MessageType {
+    constructor() {
+        super("github.actions.results.entities.v1.CacheScope", [
+            { no: 1, name: "scope", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "permission", kind: "scalar", T: 3 /*ScalarType.INT64*/ }
+        ]);
+    }
+    create(value) {
+        const message = { scope: "", permission: "0" };
+        globalThis.Object.defineProperty(message, runtime_4.MESSAGE_TYPE, { enumerable: false, value: this });
+        if (value !== undefined)
+            (0, runtime_3.reflectionMergePartial)(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader, length, options, target) {
+        let message = target !== null && target !== void 0 ? target : this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string scope */ 1:
+                    message.scope = reader.string();
+                    break;
+                case /* int64 permission */ 2:
+                    message.permission = reader.int64().toString();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? runtime_2.UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message, writer, options) {
+        /* string scope = 1; */
+        if (message.scope !== "")
+            writer.tag(1, runtime_1.WireType.LengthDelimited).string(message.scope);
+        /* int64 permission = 2; */
+        if (message.permission !== "0")
+            writer.tag(2, runtime_1.WireType.Varint).int64(message.permission);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? runtime_2.UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message github.actions.results.entities.v1.CacheScope
+ */
+exports.CacheScope = new CacheScope$Type();
+//# sourceMappingURL=cachescope.js.map
+
+/***/ }),
+
+/***/ 9966:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -279,20 +1109,21 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.saveCache = exports.reserveCache = exports.downloadCache = exports.getCacheEntry = exports.getCacheVersion = void 0;
-const core = __importStar(__nccwpck_require__(9093));
-const http_client_1 = __nccwpck_require__(6372);
-const auth_1 = __nccwpck_require__(8603);
-const crypto = __importStar(__nccwpck_require__(6113));
+exports.saveCache = exports.reserveCache = exports.downloadCache = exports.getCacheEntry = void 0;
+const core = __importStar(__nccwpck_require__(8407));
+const http_client_1 = __nccwpck_require__(6634);
+const auth_1 = __nccwpck_require__(2177);
 const fs = __importStar(__nccwpck_require__(7147));
 const url_1 = __nccwpck_require__(7310);
-const utils = __importStar(__nccwpck_require__(9522));
-const downloadUtils_1 = __nccwpck_require__(1428);
-const options_1 = __nccwpck_require__(730);
-const requestUtils_1 = __nccwpck_require__(6264);
-const versionSalt = '1.0';
+const utils = __importStar(__nccwpck_require__(6797));
+const uploadUtils_1 = __nccwpck_require__(9393);
+const downloadUtils_1 = __nccwpck_require__(3332);
+const options_1 = __nccwpck_require__(3711);
+const requestUtils_1 = __nccwpck_require__(2257);
+const config_1 = __nccwpck_require__(5844);
+const user_agent_1 = __nccwpck_require__(2451);
 function getCacheApiUrl(resource) {
-    const baseUrl = process.env['ACTIONS_CACHE_URL'] || '';
+    const baseUrl = (0, config_1.getCacheServiceURL)();
     if (!baseUrl) {
         throw new Error('Cache Service Url not found, unable to restore cache.');
     }
@@ -314,29 +1145,12 @@ function getRequestOptions() {
 function createHttpClient() {
     const token = process.env['ACTIONS_RUNTIME_TOKEN'] || '';
     const bearerCredentialHandler = new auth_1.BearerCredentialHandler(token);
-    return new http_client_1.HttpClient('actions/cache', [bearerCredentialHandler], getRequestOptions());
+    return new http_client_1.HttpClient((0, user_agent_1.getUserAgentString)(), [bearerCredentialHandler], getRequestOptions());
 }
-function getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false) {
-    // don't pass changes upstream
-    const components = paths.slice();
-    // Add compression method to cache version to restore
-    // compressed cache as per compression method
-    if (compressionMethod) {
-        components.push(compressionMethod);
-    }
-    // Only check for windows platforms if enableCrossOsArchive is false
-    if (process.platform === 'win32' && !enableCrossOsArchive) {
-        components.push('windows-only');
-    }
-    // Add salt to cache version to support breaking changes in cache entry
-    components.push(versionSalt);
-    return crypto.createHash('sha256').update(components.join('|')).digest('hex');
-}
-exports.getCacheVersion = getCacheVersion;
 function getCacheEntry(keys, paths, options) {
     return __awaiter(this, void 0, void 0, function* () {
         const httpClient = createHttpClient();
-        const version = getCacheVersion(paths, options === null || options === void 0 ? void 0 : options.compressionMethod, options === null || options === void 0 ? void 0 : options.enableCrossOsArchive);
+        const version = utils.getCacheVersion(paths, options === null || options === void 0 ? void 0 : options.compressionMethod, options === null || options === void 0 ? void 0 : options.enableCrossOsArchive);
         const resource = `cache?keys=${encodeURIComponent(keys.join(','))}&version=${version}`;
         const response = yield (0, requestUtils_1.retryTypedResponse)('getCacheEntry', () => __awaiter(this, void 0, void 0, function* () { return httpClient.getJson(getCacheApiUrl(resource)); }));
         // Cache not found
@@ -407,7 +1221,7 @@ exports.downloadCache = downloadCache;
 function reserveCache(key, paths, options) {
     return __awaiter(this, void 0, void 0, function* () {
         const httpClient = createHttpClient();
-        const version = getCacheVersion(paths, options === null || options === void 0 ? void 0 : options.compressionMethod, options === null || options === void 0 ? void 0 : options.enableCrossOsArchive);
+        const version = utils.getCacheVersion(paths, options === null || options === void 0 ? void 0 : options.compressionMethod, options === null || options === void 0 ? void 0 : options.enableCrossOsArchive);
         const reserveCacheRequest = {
             key,
             version,
@@ -489,20 +1303,30 @@ function commitCache(httpClient, cacheId, filesize) {
         }));
     });
 }
-function saveCache(cacheId, archivePath, options) {
+function saveCache(cacheId, archivePath, signedUploadURL, options) {
     return __awaiter(this, void 0, void 0, function* () {
-        const httpClient = createHttpClient();
-        core.debug('Upload cache');
-        yield uploadFile(httpClient, cacheId, archivePath, options);
-        // Commit Cache
-        core.debug('Commiting cache');
-        const cacheSize = utils.getArchiveFileSizeInBytes(archivePath);
-        core.info(`Cache Size: ~${Math.round(cacheSize / (1024 * 1024))} MB (${cacheSize} B)`);
-        const commitCacheResponse = yield commitCache(httpClient, cacheId, cacheSize);
-        if (!(0, requestUtils_1.isSuccessStatusCode)(commitCacheResponse.statusCode)) {
-            throw new Error(`Cache service responded with ${commitCacheResponse.statusCode} during commit cache.`);
+        const uploadOptions = (0, options_1.getUploadOptions)(options);
+        if (uploadOptions.useAzureSdk) {
+            // Use Azure storage SDK to upload caches directly to Azure
+            if (!signedUploadURL) {
+                throw new Error('Azure Storage SDK can only be used when a signed URL is provided.');
+            }
+            yield (0, uploadUtils_1.uploadCacheArchiveSDK)(signedUploadURL, archivePath, options);
         }
-        core.info('Cache saved successfully');
+        else {
+            const httpClient = createHttpClient();
+            core.debug('Upload cache');
+            yield uploadFile(httpClient, cacheId, archivePath, options);
+            // Commit Cache
+            core.debug('Commiting cache');
+            const cacheSize = utils.getArchiveFileSizeInBytes(archivePath);
+            core.info(`Cache Size: ~${Math.round(cacheSize / (1024 * 1024))} MB (${cacheSize} B)`);
+            const commitCacheResponse = yield commitCache(httpClient, cacheId, cacheSize);
+            if (!(0, requestUtils_1.isSuccessStatusCode)(commitCacheResponse.statusCode)) {
+                throw new Error(`Cache service responded with ${commitCacheResponse.statusCode} during commit cache.`);
+            }
+            core.info('Cache saved successfully');
+        }
     });
 }
 exports.saveCache = saveCache;
@@ -510,7 +1334,7 @@ exports.saveCache = saveCache;
 
 /***/ }),
 
-/***/ 9522:
+/***/ 6797:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -554,17 +1378,18 @@ var __asyncValues = (this && this.__asyncValues) || function (o) {
     function settle(resolve, reject, d, v) { Promise.resolve(v).then(function(v) { resolve({ value: v, done: d }); }, reject); }
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.isGhes = exports.assertDefined = exports.getGnuTarPathOnWindows = exports.getCacheFileName = exports.getCompressionMethod = exports.unlinkFile = exports.resolvePaths = exports.getArchiveFileSizeInBytes = exports.createTempDirectory = void 0;
-const core = __importStar(__nccwpck_require__(9093));
+exports.getRuntimeToken = exports.getCacheVersion = exports.assertDefined = exports.getGnuTarPathOnWindows = exports.getCacheFileName = exports.getCompressionMethod = exports.unlinkFile = exports.resolvePaths = exports.getArchiveFileSizeInBytes = exports.createTempDirectory = void 0;
+const core = __importStar(__nccwpck_require__(8407));
 const exec = __importStar(__nccwpck_require__(7775));
 const glob = __importStar(__nccwpck_require__(7272));
 const io = __importStar(__nccwpck_require__(2826));
+const crypto = __importStar(__nccwpck_require__(6113));
 const fs = __importStar(__nccwpck_require__(7147));
 const path = __importStar(__nccwpck_require__(1017));
 const semver = __importStar(__nccwpck_require__(6843));
 const util = __importStar(__nccwpck_require__(3837));
-const uuid_1 = __nccwpck_require__(8493);
-const constants_1 = __nccwpck_require__(4498);
+const constants_1 = __nccwpck_require__(9531);
+const versionSalt = '1.0';
 // From https://github.com/actions/toolkit/blob/main/packages/tool-cache/src/tool-cache.ts#L23
 function createTempDirectory() {
     return __awaiter(this, void 0, void 0, function* () {
@@ -586,7 +1411,7 @@ function createTempDirectory() {
             }
             tempDirectory = path.join(baseLocation, 'actions', 'temp');
         }
-        const dest = path.join(tempDirectory, (0, uuid_1.v4)());
+        const dest = path.join(tempDirectory, crypto.randomUUID());
         yield io.mkdirP(dest);
         return dest;
     });
@@ -702,24 +1527,84 @@ function assertDefined(name, value) {
     return value;
 }
 exports.assertDefined = assertDefined;
-function isGhes() {
-    const ghUrl = new URL(process.env['GITHUB_SERVER_URL'] || 'https://github.com');
-    const hostname = ghUrl.hostname.trimEnd().toUpperCase();
-    const isGitHubHost = hostname === 'GITHUB.COM';
-    const isGheHost = hostname.endsWith('.GHE.COM') || hostname.endsWith('.GHE.LOCALHOST');
-    return !isGitHubHost && !isGheHost;
+function getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false) {
+    // don't pass changes upstream
+    const components = paths.slice();
+    // Add compression method to cache version to restore
+    // compressed cache as per compression method
+    if (compressionMethod) {
+        components.push(compressionMethod);
+    }
+    // Only check for windows platforms if enableCrossOsArchive is false
+    if (process.platform === 'win32' && !enableCrossOsArchive) {
+        components.push('windows-only');
+    }
+    // Add salt to cache version to support breaking changes in cache entry
+    components.push(versionSalt);
+    return crypto.createHash('sha256').update(components.join('|')).digest('hex');
 }
-exports.isGhes = isGhes;
+exports.getCacheVersion = getCacheVersion;
+function getRuntimeToken() {
+    const token = process.env['ACTIONS_RUNTIME_TOKEN'];
+    if (!token) {
+        throw new Error('Unable to get the ACTIONS_RUNTIME_TOKEN env variable');
+    }
+    return token;
+}
+exports.getRuntimeToken = getRuntimeToken;
 //# sourceMappingURL=cacheUtils.js.map
 
 /***/ }),
 
-/***/ 4498:
+/***/ 5844:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.ManifestFilename = exports.TarFilename = exports.SystemTarPathOnWindows = exports.GnuTarPathOnWindows = exports.SocketTimeout = exports.DefaultRetryDelay = exports.DefaultRetryAttempts = exports.ArchiveToolType = exports.CompressionMethod = exports.CacheFilename = void 0;
+exports.getCacheServiceURL = exports.getCacheServiceVersion = exports.isGhes = void 0;
+function isGhes() {
+    const ghUrl = new URL(process.env['GITHUB_SERVER_URL'] || 'https://github.com');
+    const hostname = ghUrl.hostname.trimEnd().toUpperCase();
+    const isGitHubHost = hostname === 'GITHUB.COM';
+    const isGheHost = hostname.endsWith('.GHE.COM');
+    const isLocalHost = hostname.endsWith('.LOCALHOST');
+    return !isGitHubHost && !isGheHost && !isLocalHost;
+}
+exports.isGhes = isGhes;
+function getCacheServiceVersion() {
+    // Cache service v2 is not supported on GHES. We will default to
+    // cache service v1 even if the feature flag was enabled by user.
+    if (isGhes())
+        return 'v1';
+    return process.env['ACTIONS_CACHE_SERVICE_V2'] ? 'v2' : 'v1';
+}
+exports.getCacheServiceVersion = getCacheServiceVersion;
+function getCacheServiceURL() {
+    const version = getCacheServiceVersion();
+    // Based on the version of the cache service, we will determine which
+    // URL to use.
+    switch (version) {
+        case 'v1':
+            return (process.env['ACTIONS_CACHE_URL'] ||
+                process.env['ACTIONS_RESULTS_URL'] ||
+                '');
+        case 'v2':
+            return process.env['ACTIONS_RESULTS_URL'] || '';
+        default:
+            throw new Error(`Unsupported cache service version: ${version}`);
+    }
+}
+exports.getCacheServiceURL = getCacheServiceURL;
+//# sourceMappingURL=config.js.map
+
+/***/ }),
+
+/***/ 9531:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.CacheFileSizeLimit = exports.ManifestFilename = exports.TarFilename = exports.SystemTarPathOnWindows = exports.GnuTarPathOnWindows = exports.SocketTimeout = exports.DefaultRetryDelay = exports.DefaultRetryAttempts = exports.ArchiveToolType = exports.CompressionMethod = exports.CacheFilename = void 0;
 var CacheFilename;
 (function (CacheFilename) {
     CacheFilename["Gzip"] = "cache.tgz";
@@ -752,11 +1637,12 @@ exports.GnuTarPathOnWindows = `${process.env['PROGRAMFILES']}\\Git\\usr\\bin\\ta
 exports.SystemTarPathOnWindows = `${process.env['SYSTEMDRIVE']}\\Windows\\System32\\tar.exe`;
 exports.TarFilename = 'cache.tar';
 exports.ManifestFilename = 'manifest.txt';
+exports.CacheFileSizeLimit = 10 * Math.pow(1024, 3); // 10GiB per repository
 //# sourceMappingURL=constants.js.map
 
 /***/ }),
 
-/***/ 1428:
+/***/ 3332:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -794,16 +1680,16 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.downloadCacheStorageSDK = exports.downloadCacheHttpClientConcurrent = exports.downloadCacheHttpClient = exports.DownloadProgress = void 0;
-const core = __importStar(__nccwpck_require__(9093));
-const http_client_1 = __nccwpck_require__(6372);
-const storage_blob_1 = __nccwpck_require__(3626);
+const core = __importStar(__nccwpck_require__(8407));
+const http_client_1 = __nccwpck_require__(6634);
+const storage_blob_1 = __nccwpck_require__(2190);
 const buffer = __importStar(__nccwpck_require__(4300));
 const fs = __importStar(__nccwpck_require__(7147));
 const stream = __importStar(__nccwpck_require__(2781));
 const util = __importStar(__nccwpck_require__(3837));
-const utils = __importStar(__nccwpck_require__(9522));
-const constants_1 = __nccwpck_require__(4498);
-const requestUtils_1 = __nccwpck_require__(6264);
+const utils = __importStar(__nccwpck_require__(6797));
+const constants_1 = __nccwpck_require__(9531);
+const requestUtils_1 = __nccwpck_require__(2257);
 const abort_controller_1 = __nccwpck_require__(4732);
 /**
  * Pipes the body of a HTTP response to a stream
@@ -1140,7 +2026,7 @@ const promiseWithTimeout = (timeoutMs, promise) => __awaiter(void 0, void 0, voi
 
 /***/ }),
 
-/***/ 6264:
+/***/ 2257:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -1178,9 +2064,9 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.retryHttpClientResponse = exports.retryTypedResponse = exports.retry = exports.isRetryableStatusCode = exports.isServerErrorStatusCode = exports.isSuccessStatusCode = void 0;
-const core = __importStar(__nccwpck_require__(9093));
-const http_client_1 = __nccwpck_require__(6372);
-const constants_1 = __nccwpck_require__(4498);
+const core = __importStar(__nccwpck_require__(8407));
+const http_client_1 = __nccwpck_require__(6634);
+const constants_1 = __nccwpck_require__(9531);
 function isSuccessStatusCode(statusCode) {
     if (!statusCode) {
         return false;
@@ -1283,7 +2169,350 @@ exports.retryHttpClientResponse = retryHttpClientResponse;
 
 /***/ }),
 
-/***/ 3686:
+/***/ 4523:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.internalCacheTwirpClient = void 0;
+const core_1 = __nccwpck_require__(8407);
+const user_agent_1 = __nccwpck_require__(2451);
+const errors_1 = __nccwpck_require__(1470);
+const config_1 = __nccwpck_require__(5844);
+const cacheUtils_1 = __nccwpck_require__(6797);
+const auth_1 = __nccwpck_require__(2177);
+const http_client_1 = __nccwpck_require__(6634);
+const cache_twirp_client_1 = __nccwpck_require__(4990);
+const util_1 = __nccwpck_require__(1002);
+/**
+ * This class is a wrapper around the CacheServiceClientJSON class generated by Twirp.
+ *
+ * It adds retry logic to the request method, which is not present in the generated client.
+ *
+ * This class is used to interact with cache service v2.
+ */
+class CacheServiceClient {
+    constructor(userAgent, maxAttempts, baseRetryIntervalMilliseconds, retryMultiplier) {
+        this.maxAttempts = 5;
+        this.baseRetryIntervalMilliseconds = 3000;
+        this.retryMultiplier = 1.5;
+        const token = (0, cacheUtils_1.getRuntimeToken)();
+        this.baseUrl = (0, config_1.getCacheServiceURL)();
+        if (maxAttempts) {
+            this.maxAttempts = maxAttempts;
+        }
+        if (baseRetryIntervalMilliseconds) {
+            this.baseRetryIntervalMilliseconds = baseRetryIntervalMilliseconds;
+        }
+        if (retryMultiplier) {
+            this.retryMultiplier = retryMultiplier;
+        }
+        this.httpClient = new http_client_1.HttpClient(userAgent, [
+            new auth_1.BearerCredentialHandler(token)
+        ]);
+    }
+    // This function satisfies the Rpc interface. It is compatible with the JSON
+    // JSON generated client.
+    request(service, method, contentType, data) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const url = new URL(`/twirp/${service}/${method}`, this.baseUrl).href;
+            (0, core_1.debug)(`[Request] ${method} ${url}`);
+            const headers = {
+                'Content-Type': contentType
+            };
+            try {
+                const { body } = yield this.retryableRequest(() => __awaiter(this, void 0, void 0, function* () { return this.httpClient.post(url, JSON.stringify(data), headers); }));
+                return body;
+            }
+            catch (error) {
+                throw new Error(`Failed to ${method}: ${error.message}`);
+            }
+        });
+    }
+    retryableRequest(operation) {
+        return __awaiter(this, void 0, void 0, function* () {
+            let attempt = 0;
+            let errorMessage = '';
+            let rawBody = '';
+            while (attempt < this.maxAttempts) {
+                let isRetryable = false;
+                try {
+                    const response = yield operation();
+                    const statusCode = response.message.statusCode;
+                    rawBody = yield response.readBody();
+                    (0, core_1.debug)(`[Response] - ${response.message.statusCode}`);
+                    (0, core_1.debug)(`Headers: ${JSON.stringify(response.message.headers, null, 2)}`);
+                    const body = JSON.parse(rawBody);
+                    (0, util_1.maskSecretUrls)(body);
+                    (0, core_1.debug)(`Body: ${JSON.stringify(body, null, 2)}`);
+                    if (this.isSuccessStatusCode(statusCode)) {
+                        return { response, body };
+                    }
+                    isRetryable = this.isRetryableHttpStatusCode(statusCode);
+                    errorMessage = `Failed request: (${statusCode}) ${response.message.statusMessage}`;
+                    if (body.msg) {
+                        if (errors_1.UsageError.isUsageErrorMessage(body.msg)) {
+                            throw new errors_1.UsageError();
+                        }
+                        errorMessage = `${errorMessage}: ${body.msg}`;
+                    }
+                }
+                catch (error) {
+                    if (error instanceof SyntaxError) {
+                        (0, core_1.debug)(`Raw Body: ${rawBody}`);
+                    }
+                    if (error instanceof errors_1.UsageError) {
+                        throw error;
+                    }
+                    if (errors_1.NetworkError.isNetworkErrorCode(error === null || error === void 0 ? void 0 : error.code)) {
+                        throw new errors_1.NetworkError(error === null || error === void 0 ? void 0 : error.code);
+                    }
+                    isRetryable = true;
+                    errorMessage = error.message;
+                }
+                if (!isRetryable) {
+                    throw new Error(`Received non-retryable error: ${errorMessage}`);
+                }
+                if (attempt + 1 === this.maxAttempts) {
+                    throw new Error(`Failed to make request after ${this.maxAttempts} attempts: ${errorMessage}`);
+                }
+                const retryTimeMilliseconds = this.getExponentialRetryTimeMilliseconds(attempt);
+                (0, core_1.info)(`Attempt ${attempt + 1} of ${this.maxAttempts} failed with error: ${errorMessage}. Retrying request in ${retryTimeMilliseconds} ms...`);
+                yield this.sleep(retryTimeMilliseconds);
+                attempt++;
+            }
+            throw new Error(`Request failed`);
+        });
+    }
+    isSuccessStatusCode(statusCode) {
+        if (!statusCode)
+            return false;
+        return statusCode >= 200 && statusCode < 300;
+    }
+    isRetryableHttpStatusCode(statusCode) {
+        if (!statusCode)
+            return false;
+        const retryableStatusCodes = [
+            http_client_1.HttpCodes.BadGateway,
+            http_client_1.HttpCodes.GatewayTimeout,
+            http_client_1.HttpCodes.InternalServerError,
+            http_client_1.HttpCodes.ServiceUnavailable,
+            http_client_1.HttpCodes.TooManyRequests
+        ];
+        return retryableStatusCodes.includes(statusCode);
+    }
+    sleep(milliseconds) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return new Promise(resolve => setTimeout(resolve, milliseconds));
+        });
+    }
+    getExponentialRetryTimeMilliseconds(attempt) {
+        if (attempt < 0) {
+            throw new Error('attempt should be a positive integer');
+        }
+        if (attempt === 0) {
+            return this.baseRetryIntervalMilliseconds;
+        }
+        const minTime = this.baseRetryIntervalMilliseconds * Math.pow(this.retryMultiplier, attempt);
+        const maxTime = minTime * this.retryMultiplier;
+        // returns a random number between minTime and maxTime (exclusive)
+        return Math.trunc(Math.random() * (maxTime - minTime) + minTime);
+    }
+}
+function internalCacheTwirpClient(options) {
+    const client = new CacheServiceClient((0, user_agent_1.getUserAgentString)(), options === null || options === void 0 ? void 0 : options.maxAttempts, options === null || options === void 0 ? void 0 : options.retryIntervalMs, options === null || options === void 0 ? void 0 : options.retryMultiplier);
+    return new cache_twirp_client_1.CacheServiceClientJSON(client);
+}
+exports.internalCacheTwirpClient = internalCacheTwirpClient;
+//# sourceMappingURL=cacheTwirpClient.js.map
+
+/***/ }),
+
+/***/ 1470:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.UsageError = exports.NetworkError = exports.GHESNotSupportedError = exports.CacheNotFoundError = exports.InvalidResponseError = exports.FilesNotFoundError = void 0;
+class FilesNotFoundError extends Error {
+    constructor(files = []) {
+        let message = 'No files were found to upload';
+        if (files.length > 0) {
+            message += `: ${files.join(', ')}`;
+        }
+        super(message);
+        this.files = files;
+        this.name = 'FilesNotFoundError';
+    }
+}
+exports.FilesNotFoundError = FilesNotFoundError;
+class InvalidResponseError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'InvalidResponseError';
+    }
+}
+exports.InvalidResponseError = InvalidResponseError;
+class CacheNotFoundError extends Error {
+    constructor(message = 'Cache not found') {
+        super(message);
+        this.name = 'CacheNotFoundError';
+    }
+}
+exports.CacheNotFoundError = CacheNotFoundError;
+class GHESNotSupportedError extends Error {
+    constructor(message = '@actions/cache v4.1.4+, actions/cache/save@v4+ and actions/cache/restore@v4+ are not currently supported on GHES.') {
+        super(message);
+        this.name = 'GHESNotSupportedError';
+    }
+}
+exports.GHESNotSupportedError = GHESNotSupportedError;
+class NetworkError extends Error {
+    constructor(code) {
+        const message = `Unable to make request: ${code}\nIf you are using self-hosted runners, please make sure your runner has access to all GitHub endpoints: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#communication-between-self-hosted-runners-and-github`;
+        super(message);
+        this.code = code;
+        this.name = 'NetworkError';
+    }
+}
+exports.NetworkError = NetworkError;
+NetworkError.isNetworkErrorCode = (code) => {
+    if (!code)
+        return false;
+    return [
+        'ECONNRESET',
+        'ENOTFOUND',
+        'ETIMEDOUT',
+        'ECONNREFUSED',
+        'EHOSTUNREACH'
+    ].includes(code);
+};
+class UsageError extends Error {
+    constructor() {
+        const message = `Cache storage quota has been hit. Unable to upload any new cache entries. Usage is recalculated every 6-12 hours.\nMore info on storage limits: https://docs.github.com/en/billing/managing-billing-for-github-actions/about-billing-for-github-actions#calculating-minute-and-storage-spending`;
+        super(message);
+        this.name = 'UsageError';
+    }
+}
+exports.UsageError = UsageError;
+UsageError.isUsageErrorMessage = (msg) => {
+    if (!msg)
+        return false;
+    return msg.includes('insufficient usage');
+};
+//# sourceMappingURL=errors.js.map
+
+/***/ }),
+
+/***/ 2451:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.getUserAgentString = void 0;
+// eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+const packageJson = __nccwpck_require__(5873);
+/**
+ * Ensure that this User Agent String is used in all HTTP calls so that we can monitor telemetry between different versions of this package
+ */
+function getUserAgentString() {
+    return `@actions/cache-${packageJson.version}`;
+}
+exports.getUserAgentString = getUserAgentString;
+//# sourceMappingURL=user-agent.js.map
+
+/***/ }),
+
+/***/ 1002:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.maskSecretUrls = exports.maskSigUrl = void 0;
+const core_1 = __nccwpck_require__(8407);
+/**
+ * Masks the `sig` parameter in a URL and sets it as a secret.
+ *
+ * @param url - The URL containing the signature parameter to mask
+ * @remarks
+ * This function attempts to parse the provided URL and identify the 'sig' query parameter.
+ * If found, it registers both the raw and URL-encoded signature values as secrets using
+ * the Actions `setSecret` API, which prevents them from being displayed in logs.
+ *
+ * The function handles errors gracefully if URL parsing fails, logging them as debug messages.
+ *
+ * @example
+ * ```typescript
+ * // Mask a signature in an Azure SAS token URL
+ * maskSigUrl('https://example.blob.core.windows.net/container/file.txt?sig=abc123&se=2023-01-01');
+ * ```
+ */
+function maskSigUrl(url) {
+    if (!url)
+        return;
+    try {
+        const parsedUrl = new URL(url);
+        const signature = parsedUrl.searchParams.get('sig');
+        if (signature) {
+            (0, core_1.setSecret)(signature);
+            (0, core_1.setSecret)(encodeURIComponent(signature));
+        }
+    }
+    catch (error) {
+        (0, core_1.debug)(`Failed to parse URL: ${url} ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+exports.maskSigUrl = maskSigUrl;
+/**
+ * Masks sensitive information in URLs containing signature parameters.
+ * Currently supports masking 'sig' parameters in the 'signed_upload_url'
+ * and 'signed_download_url' properties of the provided object.
+ *
+ * @param body - The object should contain a signature
+ * @remarks
+ * This function extracts URLs from the object properties and calls maskSigUrl
+ * on each one to redact sensitive signature information. The function doesn't
+ * modify the original object; it only marks the signatures as secrets for
+ * logging purposes.
+ *
+ * @example
+ * ```typescript
+ * const responseBody = {
+ *   signed_upload_url: 'https://blob.core.windows.net/?sig=abc123',
+ *   signed_download_url: 'https://blob.core/windows.net/?sig=def456'
+ * };
+ * maskSecretUrls(responseBody);
+ * ```
+ */
+function maskSecretUrls(body) {
+    if (typeof body !== 'object' || body === null) {
+        (0, core_1.debug)('body is not an object or is null');
+        return;
+    }
+    if ('signed_upload_url' in body &&
+        typeof body.signed_upload_url === 'string') {
+        maskSigUrl(body.signed_upload_url);
+    }
+    if ('signed_download_url' in body &&
+        typeof body.signed_download_url === 'string') {
+        maskSigUrl(body.signed_download_url);
+    }
+}
+exports.maskSecretUrls = maskSecretUrls;
+//# sourceMappingURL=util.js.map
+
+/***/ }),
+
+/***/ 9219:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -1325,8 +2554,8 @@ const exec_1 = __nccwpck_require__(7775);
 const io = __importStar(__nccwpck_require__(2826));
 const fs_1 = __nccwpck_require__(7147);
 const path = __importStar(__nccwpck_require__(1017));
-const utils = __importStar(__nccwpck_require__(9522));
-const constants_1 = __nccwpck_require__(4498);
+const utils = __importStar(__nccwpck_require__(6797));
+const constants_1 = __nccwpck_require__(9531);
 const IS_WINDOWS = process.platform === 'win32';
 // Returns tar path and type: BSD or GNU
 function getTarPath() {
@@ -1561,7 +2790,180 @@ exports.createTar = createTar;
 
 /***/ }),
 
-/***/ 730:
+/***/ 9393:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.uploadCacheArchiveSDK = exports.UploadProgress = void 0;
+const core = __importStar(__nccwpck_require__(8407));
+const storage_blob_1 = __nccwpck_require__(2190);
+const errors_1 = __nccwpck_require__(1470);
+/**
+ * Class for tracking the upload state and displaying stats.
+ */
+class UploadProgress {
+    constructor(contentLength) {
+        this.contentLength = contentLength;
+        this.sentBytes = 0;
+        this.displayedComplete = false;
+        this.startTime = Date.now();
+    }
+    /**
+     * Sets the number of bytes sent
+     *
+     * @param sentBytes the number of bytes sent
+     */
+    setSentBytes(sentBytes) {
+        this.sentBytes = sentBytes;
+    }
+    /**
+     * Returns the total number of bytes transferred.
+     */
+    getTransferredBytes() {
+        return this.sentBytes;
+    }
+    /**
+     * Returns true if the upload is complete.
+     */
+    isDone() {
+        return this.getTransferredBytes() === this.contentLength;
+    }
+    /**
+     * Prints the current upload stats. Once the upload completes, this will print one
+     * last line and then stop.
+     */
+    display() {
+        if (this.displayedComplete) {
+            return;
+        }
+        const transferredBytes = this.sentBytes;
+        const percentage = (100 * (transferredBytes / this.contentLength)).toFixed(1);
+        const elapsedTime = Date.now() - this.startTime;
+        const uploadSpeed = (transferredBytes /
+            (1024 * 1024) /
+            (elapsedTime / 1000)).toFixed(1);
+        core.info(`Sent ${transferredBytes} of ${this.contentLength} (${percentage}%), ${uploadSpeed} MBs/sec`);
+        if (this.isDone()) {
+            this.displayedComplete = true;
+        }
+    }
+    /**
+     * Returns a function used to handle TransferProgressEvents.
+     */
+    onProgress() {
+        return (progress) => {
+            this.setSentBytes(progress.loadedBytes);
+        };
+    }
+    /**
+     * Starts the timer that displays the stats.
+     *
+     * @param delayInMs the delay between each write
+     */
+    startDisplayTimer(delayInMs = 1000) {
+        const displayCallback = () => {
+            this.display();
+            if (!this.isDone()) {
+                this.timeoutHandle = setTimeout(displayCallback, delayInMs);
+            }
+        };
+        this.timeoutHandle = setTimeout(displayCallback, delayInMs);
+    }
+    /**
+     * Stops the timer that displays the stats. As this typically indicates the upload
+     * is complete, this will display one last line, unless the last line has already
+     * been written.
+     */
+    stopDisplayTimer() {
+        if (this.timeoutHandle) {
+            clearTimeout(this.timeoutHandle);
+            this.timeoutHandle = undefined;
+        }
+        this.display();
+    }
+}
+exports.UploadProgress = UploadProgress;
+/**
+ * Uploads a cache archive directly to Azure Blob Storage using the Azure SDK.
+ * This function will display progress information to the console. Concurrency of the
+ * upload is determined by the calling functions.
+ *
+ * @param signedUploadURL
+ * @param archivePath
+ * @param options
+ * @returns
+ */
+function uploadCacheArchiveSDK(signedUploadURL, archivePath, options) {
+    var _a;
+    return __awaiter(this, void 0, void 0, function* () {
+        const blobClient = new storage_blob_1.BlobClient(signedUploadURL);
+        const blockBlobClient = blobClient.getBlockBlobClient();
+        const uploadProgress = new UploadProgress((_a = options === null || options === void 0 ? void 0 : options.archiveSizeBytes) !== null && _a !== void 0 ? _a : 0);
+        // Specify data transfer options
+        const uploadOptions = {
+            blockSize: options === null || options === void 0 ? void 0 : options.uploadChunkSize,
+            concurrency: options === null || options === void 0 ? void 0 : options.uploadConcurrency,
+            maxSingleShotSize: 128 * 1024 * 1024,
+            onProgress: uploadProgress.onProgress()
+        };
+        try {
+            uploadProgress.startDisplayTimer();
+            core.debug(`BlobClient: ${blobClient.name}:${blobClient.accountName}:${blobClient.containerName}`);
+            const response = yield blockBlobClient.uploadFile(archivePath, uploadOptions);
+            // TODO: better management of non-retryable errors
+            if (response._response.status >= 400) {
+                throw new errors_1.InvalidResponseError(`uploadCacheArchiveSDK: upload failed with status code ${response._response.status}`);
+            }
+            return response;
+        }
+        catch (error) {
+            core.warning(`uploadCacheArchiveSDK: internal error uploading cache archive: ${error.message}`);
+            throw error;
+        }
+        finally {
+            uploadProgress.stopDisplayTimer();
+        }
+    });
+}
+exports.uploadCacheArchiveSDK = uploadCacheArchiveSDK;
+//# sourceMappingURL=uploadUtils.js.map
+
+/***/ }),
+
+/***/ 3711:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -1590,18 +2992,23 @@ var __importStar = (this && this.__importStar) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getDownloadOptions = exports.getUploadOptions = void 0;
-const core = __importStar(__nccwpck_require__(9093));
+const core = __importStar(__nccwpck_require__(8407));
 /**
  * Returns a copy of the upload options with defaults filled in.
  *
  * @param copy the original upload options
  */
 function getUploadOptions(copy) {
+    // Defaults if not overriden
     const result = {
+        useAzureSdk: false,
         uploadConcurrency: 4,
         uploadChunkSize: 32 * 1024 * 1024
     };
     if (copy) {
+        if (typeof copy.useAzureSdk === 'boolean') {
+            result.useAzureSdk = copy.useAzureSdk;
+        }
         if (typeof copy.uploadConcurrency === 'number') {
             result.uploadConcurrency = copy.uploadConcurrency;
         }
@@ -1609,6 +3016,18 @@ function getUploadOptions(copy) {
             result.uploadChunkSize = copy.uploadChunkSize;
         }
     }
+    /**
+     * Add env var overrides
+     */
+    // Cap the uploadConcurrency at 32
+    result.uploadConcurrency = !isNaN(Number(process.env['CACHE_UPLOAD_CONCURRENCY']))
+        ? Math.min(32, Number(process.env['CACHE_UPLOAD_CONCURRENCY']))
+        : result.uploadConcurrency;
+    // Cap the uploadChunkSize at 128MiB
+    result.uploadChunkSize = !isNaN(Number(process.env['CACHE_UPLOAD_CHUNK_SIZE']))
+        ? Math.min(128 * 1024 * 1024, Number(process.env['CACHE_UPLOAD_CHUNK_SIZE']) * 1024 * 1024)
+        : result.uploadChunkSize;
+    core.debug(`Use Azure SDK: ${result.useAzureSdk}`);
     core.debug(`Upload concurrency: ${result.uploadConcurrency}`);
     core.debug(`Upload chunk size: ${result.uploadChunkSize}`);
     return result;
@@ -1667,13 +3086,17 @@ exports.getDownloadOptions = getDownloadOptions;
 
 /***/ }),
 
-/***/ 1513:
+/***/ 2561:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
 }) : (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     o[k2] = m[k];
@@ -1686,14 +3109,14 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 var __importStar = (this && this.__importStar) || function (mod) {
     if (mod && mod.__esModule) return mod;
     var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
     __setModuleDefault(result, mod);
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.issue = exports.issueCommand = void 0;
 const os = __importStar(__nccwpck_require__(2037));
-const utils_1 = __nccwpck_require__(1120);
+const utils_1 = __nccwpck_require__(1691);
 /**
  * Commands
  *
@@ -1748,13 +3171,13 @@ class Command {
     }
 }
 function escapeData(s) {
-    return utils_1.toCommandValue(s)
+    return (0, utils_1.toCommandValue)(s)
         .replace(/%/g, '%25')
         .replace(/\r/g, '%0D')
         .replace(/\n/g, '%0A');
 }
 function escapeProperty(s) {
-    return utils_1.toCommandValue(s)
+    return (0, utils_1.toCommandValue)(s)
         .replace(/%/g, '%25')
         .replace(/\r/g, '%0D')
         .replace(/\n/g, '%0A')
@@ -1765,13 +3188,17 @@ function escapeProperty(s) {
 
 /***/ }),
 
-/***/ 9093:
+/***/ 8407:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
 }) : (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     o[k2] = m[k];
@@ -1784,7 +3211,7 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 var __importStar = (this && this.__importStar) || function (mod) {
     if (mod && mod.__esModule) return mod;
     var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
     __setModuleDefault(result, mod);
     return result;
 };
@@ -1798,13 +3225,13 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.getIDToken = exports.getState = exports.saveState = exports.group = exports.endGroup = exports.startGroup = exports.info = exports.notice = exports.warning = exports.error = exports.debug = exports.isDebug = exports.setFailed = exports.setCommandEcho = exports.setOutput = exports.getBooleanInput = exports.getMultilineInput = exports.getInput = exports.addPath = exports.setSecret = exports.exportVariable = exports.ExitCode = void 0;
-const command_1 = __nccwpck_require__(1513);
-const file_command_1 = __nccwpck_require__(9017);
-const utils_1 = __nccwpck_require__(1120);
+exports.platform = exports.toPlatformPath = exports.toWin32Path = exports.toPosixPath = exports.markdownSummary = exports.summary = exports.getIDToken = exports.getState = exports.saveState = exports.group = exports.endGroup = exports.startGroup = exports.info = exports.notice = exports.warning = exports.error = exports.debug = exports.isDebug = exports.setFailed = exports.setCommandEcho = exports.setOutput = exports.getBooleanInput = exports.getMultilineInput = exports.getInput = exports.addPath = exports.setSecret = exports.exportVariable = exports.ExitCode = void 0;
+const command_1 = __nccwpck_require__(2561);
+const file_command_1 = __nccwpck_require__(1982);
+const utils_1 = __nccwpck_require__(1691);
 const os = __importStar(__nccwpck_require__(2037));
 const path = __importStar(__nccwpck_require__(1017));
-const oidc_utils_1 = __nccwpck_require__(9141);
+const oidc_utils_1 = __nccwpck_require__(5318);
 /**
  * The code to exit an action
  */
@@ -1818,7 +3245,7 @@ var ExitCode;
      * A code indicating that the action was a failure
      */
     ExitCode[ExitCode["Failure"] = 1] = "Failure";
-})(ExitCode = exports.ExitCode || (exports.ExitCode = {}));
+})(ExitCode || (exports.ExitCode = ExitCode = {}));
 //-----------------------------------------------------------------------
 // Variables
 //-----------------------------------------------------------------------
@@ -1829,13 +3256,13 @@ var ExitCode;
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function exportVariable(name, val) {
-    const convertedVal = utils_1.toCommandValue(val);
+    const convertedVal = (0, utils_1.toCommandValue)(val);
     process.env[name] = convertedVal;
     const filePath = process.env['GITHUB_ENV'] || '';
     if (filePath) {
-        return file_command_1.issueFileCommand('ENV', file_command_1.prepareKeyValueMessage(name, val));
+        return (0, file_command_1.issueFileCommand)('ENV', (0, file_command_1.prepareKeyValueMessage)(name, val));
     }
-    command_1.issueCommand('set-env', { name }, convertedVal);
+    (0, command_1.issueCommand)('set-env', { name }, convertedVal);
 }
 exports.exportVariable = exportVariable;
 /**
@@ -1843,7 +3270,7 @@ exports.exportVariable = exportVariable;
  * @param secret value of the secret
  */
 function setSecret(secret) {
-    command_1.issueCommand('add-mask', {}, secret);
+    (0, command_1.issueCommand)('add-mask', {}, secret);
 }
 exports.setSecret = setSecret;
 /**
@@ -1853,10 +3280,10 @@ exports.setSecret = setSecret;
 function addPath(inputPath) {
     const filePath = process.env['GITHUB_PATH'] || '';
     if (filePath) {
-        file_command_1.issueFileCommand('PATH', inputPath);
+        (0, file_command_1.issueFileCommand)('PATH', inputPath);
     }
     else {
-        command_1.issueCommand('add-path', {}, inputPath);
+        (0, command_1.issueCommand)('add-path', {}, inputPath);
     }
     process.env['PATH'] = `${inputPath}${path.delimiter}${process.env['PATH']}`;
 }
@@ -1931,10 +3358,10 @@ exports.getBooleanInput = getBooleanInput;
 function setOutput(name, value) {
     const filePath = process.env['GITHUB_OUTPUT'] || '';
     if (filePath) {
-        return file_command_1.issueFileCommand('OUTPUT', file_command_1.prepareKeyValueMessage(name, value));
+        return (0, file_command_1.issueFileCommand)('OUTPUT', (0, file_command_1.prepareKeyValueMessage)(name, value));
     }
     process.stdout.write(os.EOL);
-    command_1.issueCommand('set-output', { name }, utils_1.toCommandValue(value));
+    (0, command_1.issueCommand)('set-output', { name }, (0, utils_1.toCommandValue)(value));
 }
 exports.setOutput = setOutput;
 /**
@@ -1943,7 +3370,7 @@ exports.setOutput = setOutput;
  *
  */
 function setCommandEcho(enabled) {
-    command_1.issue('echo', enabled ? 'on' : 'off');
+    (0, command_1.issue)('echo', enabled ? 'on' : 'off');
 }
 exports.setCommandEcho = setCommandEcho;
 //-----------------------------------------------------------------------
@@ -1974,7 +3401,7 @@ exports.isDebug = isDebug;
  * @param message debug message
  */
 function debug(message) {
-    command_1.issueCommand('debug', {}, message);
+    (0, command_1.issueCommand)('debug', {}, message);
 }
 exports.debug = debug;
 /**
@@ -1983,7 +3410,7 @@ exports.debug = debug;
  * @param properties optional properties to add to the annotation.
  */
 function error(message, properties = {}) {
-    command_1.issueCommand('error', utils_1.toCommandProperties(properties), message instanceof Error ? message.toString() : message);
+    (0, command_1.issueCommand)('error', (0, utils_1.toCommandProperties)(properties), message instanceof Error ? message.toString() : message);
 }
 exports.error = error;
 /**
@@ -1992,7 +3419,7 @@ exports.error = error;
  * @param properties optional properties to add to the annotation.
  */
 function warning(message, properties = {}) {
-    command_1.issueCommand('warning', utils_1.toCommandProperties(properties), message instanceof Error ? message.toString() : message);
+    (0, command_1.issueCommand)('warning', (0, utils_1.toCommandProperties)(properties), message instanceof Error ? message.toString() : message);
 }
 exports.warning = warning;
 /**
@@ -2001,7 +3428,7 @@ exports.warning = warning;
  * @param properties optional properties to add to the annotation.
  */
 function notice(message, properties = {}) {
-    command_1.issueCommand('notice', utils_1.toCommandProperties(properties), message instanceof Error ? message.toString() : message);
+    (0, command_1.issueCommand)('notice', (0, utils_1.toCommandProperties)(properties), message instanceof Error ? message.toString() : message);
 }
 exports.notice = notice;
 /**
@@ -2020,14 +3447,14 @@ exports.info = info;
  * @param name The name of the output group
  */
 function startGroup(name) {
-    command_1.issue('group', name);
+    (0, command_1.issue)('group', name);
 }
 exports.startGroup = startGroup;
 /**
  * End an output group.
  */
 function endGroup() {
-    command_1.issue('endgroup');
+    (0, command_1.issue)('endgroup');
 }
 exports.endGroup = endGroup;
 /**
@@ -2065,9 +3492,9 @@ exports.group = group;
 function saveState(name, value) {
     const filePath = process.env['GITHUB_STATE'] || '';
     if (filePath) {
-        return file_command_1.issueFileCommand('STATE', file_command_1.prepareKeyValueMessage(name, value));
+        return (0, file_command_1.issueFileCommand)('STATE', (0, file_command_1.prepareKeyValueMessage)(name, value));
     }
-    command_1.issueCommand('save-state', { name }, utils_1.toCommandValue(value));
+    (0, command_1.issueCommand)('save-state', { name }, (0, utils_1.toCommandValue)(value));
 }
 exports.saveState = saveState;
 /**
@@ -2089,32 +3516,40 @@ exports.getIDToken = getIDToken;
 /**
  * Summary exports
  */
-var summary_1 = __nccwpck_require__(5276);
+var summary_1 = __nccwpck_require__(6970);
 Object.defineProperty(exports, "summary", ({ enumerable: true, get: function () { return summary_1.summary; } }));
 /**
  * @deprecated use core.summary
  */
-var summary_2 = __nccwpck_require__(5276);
+var summary_2 = __nccwpck_require__(6970);
 Object.defineProperty(exports, "markdownSummary", ({ enumerable: true, get: function () { return summary_2.markdownSummary; } }));
 /**
  * Path exports
  */
-var path_utils_1 = __nccwpck_require__(670);
+var path_utils_1 = __nccwpck_require__(2711);
 Object.defineProperty(exports, "toPosixPath", ({ enumerable: true, get: function () { return path_utils_1.toPosixPath; } }));
 Object.defineProperty(exports, "toWin32Path", ({ enumerable: true, get: function () { return path_utils_1.toWin32Path; } }));
 Object.defineProperty(exports, "toPlatformPath", ({ enumerable: true, get: function () { return path_utils_1.toPlatformPath; } }));
+/**
+ * Platform utilities exports
+ */
+exports.platform = __importStar(__nccwpck_require__(8170));
 //# sourceMappingURL=core.js.map
 
 /***/ }),
 
-/***/ 9017:
+/***/ 1982:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
 // For internal use, subject to change.
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
 }) : (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     o[k2] = m[k];
@@ -2127,7 +3562,7 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 var __importStar = (this && this.__importStar) || function (mod) {
     if (mod && mod.__esModule) return mod;
     var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
     __setModuleDefault(result, mod);
     return result;
 };
@@ -2135,10 +3570,10 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.prepareKeyValueMessage = exports.issueFileCommand = void 0;
 // We use any as a valid input type
 /* eslint-disable @typescript-eslint/no-explicit-any */
+const crypto = __importStar(__nccwpck_require__(6113));
 const fs = __importStar(__nccwpck_require__(7147));
 const os = __importStar(__nccwpck_require__(2037));
-const uuid_1 = __nccwpck_require__(7338);
-const utils_1 = __nccwpck_require__(1120);
+const utils_1 = __nccwpck_require__(1691);
 function issueFileCommand(command, message) {
     const filePath = process.env[`GITHUB_${command}`];
     if (!filePath) {
@@ -2147,14 +3582,14 @@ function issueFileCommand(command, message) {
     if (!fs.existsSync(filePath)) {
         throw new Error(`Missing file at path: ${filePath}`);
     }
-    fs.appendFileSync(filePath, `${utils_1.toCommandValue(message)}${os.EOL}`, {
+    fs.appendFileSync(filePath, `${(0, utils_1.toCommandValue)(message)}${os.EOL}`, {
         encoding: 'utf8'
     });
 }
 exports.issueFileCommand = issueFileCommand;
 function prepareKeyValueMessage(key, value) {
-    const delimiter = `ghadelimiter_${uuid_1.v4()}`;
-    const convertedValue = utils_1.toCommandValue(value);
+    const delimiter = `ghadelimiter_${crypto.randomUUID()}`;
+    const convertedValue = (0, utils_1.toCommandValue)(value);
     // These should realistically never happen, but just in case someone finds a
     // way to exploit uuid generation let's not allow keys or values that contain
     // the delimiter.
@@ -2171,7 +3606,7 @@ exports.prepareKeyValueMessage = prepareKeyValueMessage;
 
 /***/ }),
 
-/***/ 9141:
+/***/ 5318:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -2186,9 +3621,9 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.OidcClient = void 0;
-const http_client_1 = __nccwpck_require__(6372);
-const auth_1 = __nccwpck_require__(8603);
-const core_1 = __nccwpck_require__(9093);
+const http_client_1 = __nccwpck_require__(6634);
+const auth_1 = __nccwpck_require__(2177);
+const core_1 = __nccwpck_require__(8407);
 class OidcClient {
     static createHttpClient(allowRetry = true, maxRetry = 10) {
         const requestOptions = {
@@ -2238,9 +3673,9 @@ class OidcClient {
                     const encodedAudience = encodeURIComponent(audience);
                     id_token_url = `${id_token_url}&audience=${encodedAudience}`;
                 }
-                core_1.debug(`ID token url is ${id_token_url}`);
+                (0, core_1.debug)(`ID token url is ${id_token_url}`);
                 const id_token = yield OidcClient.getCall(id_token_url);
-                core_1.setSecret(id_token);
+                (0, core_1.setSecret)(id_token);
                 return id_token;
             }
             catch (error) {
@@ -2254,13 +3689,17 @@ exports.OidcClient = OidcClient;
 
 /***/ }),
 
-/***/ 670:
+/***/ 2711:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
 }) : (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     o[k2] = m[k];
@@ -2273,7 +3712,7 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 var __importStar = (this && this.__importStar) || function (mod) {
     if (mod && mod.__esModule) return mod;
     var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
     __setModuleDefault(result, mod);
     return result;
 };
@@ -2318,7 +3757,107 @@ exports.toPlatformPath = toPlatformPath;
 
 /***/ }),
 
-/***/ 5276:
+/***/ 8170:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.getDetails = exports.isLinux = exports.isMacOS = exports.isWindows = exports.arch = exports.platform = void 0;
+const os_1 = __importDefault(__nccwpck_require__(2037));
+const exec = __importStar(__nccwpck_require__(7775));
+const getWindowsInfo = () => __awaiter(void 0, void 0, void 0, function* () {
+    const { stdout: version } = yield exec.getExecOutput('powershell -command "(Get-CimInstance -ClassName Win32_OperatingSystem).Version"', undefined, {
+        silent: true
+    });
+    const { stdout: name } = yield exec.getExecOutput('powershell -command "(Get-CimInstance -ClassName Win32_OperatingSystem).Caption"', undefined, {
+        silent: true
+    });
+    return {
+        name: name.trim(),
+        version: version.trim()
+    };
+});
+const getMacOsInfo = () => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b, _c, _d;
+    const { stdout } = yield exec.getExecOutput('sw_vers', undefined, {
+        silent: true
+    });
+    const version = (_b = (_a = stdout.match(/ProductVersion:\s*(.+)/)) === null || _a === void 0 ? void 0 : _a[1]) !== null && _b !== void 0 ? _b : '';
+    const name = (_d = (_c = stdout.match(/ProductName:\s*(.+)/)) === null || _c === void 0 ? void 0 : _c[1]) !== null && _d !== void 0 ? _d : '';
+    return {
+        name,
+        version
+    };
+});
+const getLinuxInfo = () => __awaiter(void 0, void 0, void 0, function* () {
+    const { stdout } = yield exec.getExecOutput('lsb_release', ['-i', '-r', '-s'], {
+        silent: true
+    });
+    const [name, version] = stdout.trim().split('\n');
+    return {
+        name,
+        version
+    };
+});
+exports.platform = os_1.default.platform();
+exports.arch = os_1.default.arch();
+exports.isWindows = exports.platform === 'win32';
+exports.isMacOS = exports.platform === 'darwin';
+exports.isLinux = exports.platform === 'linux';
+function getDetails() {
+    return __awaiter(this, void 0, void 0, function* () {
+        return Object.assign(Object.assign({}, (yield (exports.isWindows
+            ? getWindowsInfo()
+            : exports.isMacOS
+                ? getMacOsInfo()
+                : getLinuxInfo()))), { platform: exports.platform,
+            arch: exports.arch,
+            isWindows: exports.isWindows,
+            isMacOS: exports.isMacOS,
+            isLinux: exports.isLinux });
+    });
+}
+exports.getDetails = getDetails;
+//# sourceMappingURL=platform.js.map
+
+/***/ }),
+
+/***/ 6970:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -2607,7 +4146,7 @@ exports.summary = _summary;
 
 /***/ }),
 
-/***/ 1120:
+/***/ 1691:
 /***/ ((__unused_webpack_module, exports) => {
 
 
@@ -3532,8 +5071,8 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getApiBaseUrl = exports.getProxyFetch = exports.getProxyAgentDispatcher = exports.getProxyAgent = exports.getAuthString = void 0;
-const httpClient = __importStar(__nccwpck_require__(6372));
-const undici_1 = __nccwpck_require__(7181);
+const httpClient = __importStar(__nccwpck_require__(6634));
+const undici_1 = __nccwpck_require__(624);
 function getAuthString(token, options) {
     if (!token && !options.auth) {
         throw new Error('Parameter token or opts.auth is required');
@@ -3602,9 +5141,9 @@ exports.getOctokitOptions = exports.GitHub = exports.defaults = exports.context 
 const Context = __importStar(__nccwpck_require__(8282));
 const Utils = __importStar(__nccwpck_require__(1181));
 // octokit + plugins
-const core_1 = __nccwpck_require__(9437);
-const plugin_rest_endpoint_methods_1 = __nccwpck_require__(3418);
-const plugin_paginate_rest_1 = __nccwpck_require__(8927);
+const core_1 = __nccwpck_require__(3157);
+const plugin_rest_endpoint_methods_1 = __nccwpck_require__(3607);
+const plugin_paginate_rest_1 = __nccwpck_require__(804);
 exports.context = new Context.Context();
 const baseUrl = Utils.getApiBaseUrl();
 exports.defaults = {
@@ -3692,7 +5231,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getOptions = void 0;
-const core = __importStar(__nccwpck_require__(9093));
+const core = __importStar(__nccwpck_require__(8407));
 /**
  * Returns a copy with defaults filled in.
  */
@@ -3776,7 +5315,7 @@ var __asyncGenerator = (this && this.__asyncGenerator) || function (thisArg, _ar
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.DefaultGlobber = void 0;
-const core = __importStar(__nccwpck_require__(9093));
+const core = __importStar(__nccwpck_require__(8407));
 const fs = __importStar(__nccwpck_require__(7147));
 const globOptionsHelper = __importStar(__nccwpck_require__(5228));
 const path = __importStar(__nccwpck_require__(1017));
@@ -4689,7 +6228,7 @@ exports.SearchState = SearchState;
 
 /***/ }),
 
-/***/ 8603:
+/***/ 2177:
 /***/ (function(__unused_webpack_module, exports) {
 
 
@@ -4776,7 +6315,7 @@ exports.PersonalAccessTokenCredentialHandler = PersonalAccessTokenCredentialHand
 
 /***/ }),
 
-/***/ 6372:
+/***/ 6634:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -4817,9 +6356,9 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.HttpClient = exports.isHttps = exports.HttpClientResponse = exports.HttpClientError = exports.getProxyUrl = exports.MediaTypes = exports.Headers = exports.HttpCodes = void 0;
 const http = __importStar(__nccwpck_require__(3685));
 const https = __importStar(__nccwpck_require__(5687));
-const pm = __importStar(__nccwpck_require__(2067));
+const pm = __importStar(__nccwpck_require__(4318));
 const tunnel = __importStar(__nccwpck_require__(4225));
-const undici_1 = __nccwpck_require__(7181);
+const undici_1 = __nccwpck_require__(624);
 var HttpCodes;
 (function (HttpCodes) {
     HttpCodes[HttpCodes["OK"] = 200] = "OK";
@@ -5342,7 +6881,7 @@ class HttpClient {
         }
         const usingSsl = parsedUrl.protocol === 'https:';
         proxyAgent = new undici_1.ProxyAgent(Object.assign({ uri: proxyUrl.href, pipelining: !this._keepAlive ? 0 : 1 }, ((proxyUrl.username || proxyUrl.password) && {
-            token: `${proxyUrl.username}:${proxyUrl.password}`
+            token: `Basic ${Buffer.from(`${proxyUrl.username}:${proxyUrl.password}`).toString('base64')}`
         })));
         this._proxyAgentDispatcher = proxyAgent;
         if (usingSsl && this._ignoreSslError) {
@@ -5434,7 +6973,7 @@ const lowercaseKeys = (obj) => Object.keys(obj).reduce((c, k) => ((c[k.toLowerCa
 
 /***/ }),
 
-/***/ 2067:
+/***/ 4318:
 /***/ ((__unused_webpack_module, exports) => {
 
 
@@ -5455,11 +6994,11 @@ function getProxyUrl(reqUrl) {
     })();
     if (proxyVar) {
         try {
-            return new URL(proxyVar);
+            return new DecodedURL(proxyVar);
         }
         catch (_a) {
             if (!proxyVar.startsWith('http://') && !proxyVar.startsWith('https://'))
-                return new URL(`http://${proxyVar}`);
+                return new DecodedURL(`http://${proxyVar}`);
         }
     }
     else {
@@ -5517,6 +7056,19 @@ function isLoopbackAddress(host) {
         hostLower.startsWith('127.') ||
         hostLower.startsWith('[::1]') ||
         hostLower.startsWith('[0:0:0:0:0:0:0:1]'));
+}
+class DecodedURL extends URL {
+    constructor(url, base) {
+        super(url, base);
+        this._decodedUsername = decodeURIComponent(super.username);
+        this._decodedPassword = decodeURIComponent(super.password);
+    }
+    get username() {
+        return this._decodedUsername;
+    }
+    get password() {
+        return this._decodedPassword;
+    }
 }
 //# sourceMappingURL=proxy.js.map
 
@@ -6262,24 +7814,24 @@ exports.AbortSignal = AbortSignal;
 
 /***/ }),
 
-/***/ 3626:
+/***/ 2190:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 
-var coreRestPipeline = __nccwpck_require__(7314);
-var tslib = __nccwpck_require__(6928);
-var coreAuth = __nccwpck_require__(9334);
-var coreUtil = __nccwpck_require__(8143);
-var coreHttpCompat = __nccwpck_require__(7050);
-var coreClient = __nccwpck_require__(2026);
-var coreXml = __nccwpck_require__(5182);
+var coreRestPipeline = __nccwpck_require__(7371);
+var tslib = __nccwpck_require__(1772);
+var coreAuth = __nccwpck_require__(3728);
+var coreUtil = __nccwpck_require__(1910);
+var coreHttpCompat = __nccwpck_require__(4490);
+var coreClient = __nccwpck_require__(9668);
+var coreXml = __nccwpck_require__(6228);
 var logger$1 = __nccwpck_require__(2208);
-var abortController = __nccwpck_require__(4732);
+var abortController = __nccwpck_require__(5964);
 var crypto = __nccwpck_require__(6113);
-var coreTracing = __nccwpck_require__(7423);
+var coreTracing = __nccwpck_require__(3810);
 var stream = __nccwpck_require__(2781);
 var coreLro = __nccwpck_require__(2045);
 var events = __nccwpck_require__(2361);
@@ -6310,14 +7862,14 @@ var fs__namespace = /*#__PURE__*/_interopNamespaceDefault(fs);
 var util__namespace = /*#__PURE__*/_interopNamespaceDefault(util);
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * The `@azure/logger` configuration for this package.
  */
 const logger = logger$1.createClientLogger("storage-blob");
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * The base class from which all request policies derive.
  */
@@ -6357,9 +7909,9 @@ class BaseRequestPolicy {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
-const SDK_VERSION = "12.24.0";
-const SERVICE_VERSION = "2024-08-04";
+// Licensed under the MIT License.
+const SDK_VERSION = "12.27.0";
+const SERVICE_VERSION = "2025-05-05";
 const BLOCK_BLOB_MAX_UPLOAD_BLOB_BYTES = 256 * 1024 * 1024; // 256MB
 const BLOCK_BLOB_MAX_STAGE_BLOCK_BYTES = 4000 * 1024 * 1024; // 4000MB
 const BLOCK_BLOB_MAX_BLOCKS = 50000;
@@ -6374,22 +7926,15 @@ const StorageOAuthScopes = "https://storage.azure.com/.default";
 const URLConstants = {
     Parameters: {
         FORCE_BROWSER_NO_CACHE: "_",
-        SIGNATURE: "sig",
         SNAPSHOT: "snapshot",
         VERSIONID: "versionid",
         TIMEOUT: "timeout",
     },
 };
 const HTTPURLConnection = {
-    HTTP_ACCEPTED: 202,
-    HTTP_CONFLICT: 409,
-    HTTP_NOT_FOUND: 404,
-    HTTP_PRECON_FAILED: 412,
-    HTTP_RANGE_NOT_SATISFIABLE: 416,
-};
+    HTTP_ACCEPTED: 202};
 const HeaderConstants = {
     AUTHORIZATION: "Authorization",
-    AUTHORIZATION_SCHEME: "Bearer",
     CONTENT_ENCODING: "Content-Encoding",
     CONTENT_ID: "Content-ID",
     CONTENT_LANGUAGE: "Content-Language",
@@ -6405,14 +7950,9 @@ const HeaderConstants = {
     IF_UNMODIFIED_SINCE: "if-unmodified-since",
     PREFIX_FOR_STORAGE: "x-ms-",
     RANGE: "Range",
-    USER_AGENT: "User-Agent",
-    X_MS_CLIENT_REQUEST_ID: "x-ms-client-request-id",
-    X_MS_COPY_SOURCE: "x-ms-copy-source",
     X_MS_DATE: "x-ms-date",
     X_MS_ERROR_CODE: "x-ms-error-code",
-    X_MS_VERSION: "x-ms-version",
-    X_MS_CopySourceErrorCode: "x-ms-copy-source-error-code",
-};
+    X_MS_VERSION: "x-ms-version"};
 const ETagNone = "";
 const ETagAny = "*";
 const SIZE_1_MB = 1 * 1024 * 1024;
@@ -6583,7 +8123,7 @@ const PathStylePorts = [
 ];
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Reserved URL characters must be properly escaped for Storage services like Blob or File.
  *
@@ -6631,8 +8171,8 @@ const PathStylePorts = [
  *
  * We will apply strategy one, and call encodeURIComponent for these parameters like blobName. Because what customers passes in is a plain name instead of a URL.
  *
- * @see https://docs.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata
- * @see https://docs.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-shares--directories--files--and-metadata
+ * @see https://learn.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata
+ * @see https://learn.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-shares--directories--files--and-metadata
  *
  * @param url -
  */
@@ -6646,7 +8186,7 @@ function escapeURLPath(url) {
 }
 function getProxyUriFromDevConnString(connectionString) {
     // Development Connection String
-    // https://docs.microsoft.com/en-us/azure/storage/common/storage-configure-connection-string#connect-to-the-emulator-account-using-the-well-known-account-name-and-key
+    // https://learn.microsoft.com/en-us/azure/storage/common/storage-configure-connection-string#connect-to-the-emulator-account-using-the-well-known-account-name-and-key
     let proxyUri = "";
     if (connectionString.search("DevelopmentStorageProxyUri=") !== -1) {
         // CONNECTION_STRING=UseDevelopmentStorage=true;DevelopmentStorageProxyUri=http://myProxyUri
@@ -7296,7 +8836,7 @@ function assertResponse(response) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * RetryPolicy types.
  */
@@ -7508,7 +9048,7 @@ class StorageRetryPolicy extends BaseRequestPolicy {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * StorageRetryPolicyFactory is a factory class helping generating {@link StorageRetryPolicy} objects.
  */
@@ -7532,7 +9072,7 @@ class StorageRetryPolicyFactory {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Credential policy used to sign HTTP(S) requests before sending. This is an
  * abstract class.
@@ -7560,7 +9100,7 @@ class CredentialPolicy extends BaseRequestPolicy {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /*
  * We need to imitate .Net culture-aware sorting, which is used in storage service.
  * Below tables contain sort-keys for en-US culture.
@@ -7633,7 +9173,7 @@ function isLessThan(lhs, rhs) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * StorageSharedKeyCredentialPolicy is a policy used to sign HTTP request with a shared key.
  */
@@ -7687,7 +9227,7 @@ class StorageSharedKeyCredentialPolicy extends CredentialPolicy {
     }
     /**
      * Retrieve header value according to shared key sign rules.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
      *
      * @param request -
      * @param headerName -
@@ -7699,7 +9239,7 @@ class StorageSharedKeyCredentialPolicy extends CredentialPolicy {
         }
         // When using version 2015-02-21 or later, if Content-Length is zero, then
         // set the Content-Length part of the StringToSign to an empty string.
-        // https://docs.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
+        // https://learn.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
         if (headerName === HeaderConstants.CONTENT_LENGTH && value === "0") {
             return "";
         }
@@ -7770,7 +9310,7 @@ class StorageSharedKeyCredentialPolicy extends CredentialPolicy {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Credential is an abstract class for Azure Storage HTTP requests signing. This
  * class will host an credentialPolicyCreator factory which generates CredentialPolicy.
@@ -7788,7 +9328,7 @@ class Credential {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
@@ -7825,7 +9365,7 @@ class StorageSharedKeyCredential extends Credential {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * AnonymousCredentialPolicy is used with HTTP(S) requests that read public resources
  * or for use with Shared Access Signatures (SAS).
@@ -7844,7 +9384,7 @@ class AnonymousCredentialPolicy extends CredentialPolicy {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * AnonymousCredential provides a credentialPolicyCreator member used to create
  * AnonymousCredentialPolicy objects. AnonymousCredentialPolicy is used with
@@ -7864,7 +9404,7 @@ class AnonymousCredential extends Credential {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 let _defaultHttpClient;
 function getCachedDefaultHttpClient() {
     if (!_defaultHttpClient) {
@@ -7874,7 +9414,7 @@ function getCachedDefaultHttpClient() {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * The programmatic identifier of the StorageBrowserPolicy.
  */
@@ -7902,7 +9442,7 @@ function storageBrowserPolicy() {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Name of the {@link storageRetryPolicy}
  */
@@ -8076,7 +9616,7 @@ function storageRetryPolicy(options = {}) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * The programmatic identifier of the storageSharedKeyCredentialPolicy.
  */
@@ -8120,7 +9660,7 @@ function storageSharedKeyCredentialPolicy(options) {
     }
     /**
      * Retrieve header value according to shared key sign rules.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
      */
     function getHeaderValueToSign(request, headerName) {
         const value = request.headers.get(headerName);
@@ -8129,7 +9669,7 @@ function storageSharedKeyCredentialPolicy(options) {
         }
         // When using version 2015-02-21 or later, if Content-Length is zero, then
         // set the Content-Length part of the StringToSign to an empty string.
-        // https://docs.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
+        // https://learn.microsoft.com/en-us/rest/api/storageservices/authenticate-with-shared-key
         if (headerName === HeaderConstants.CONTENT_LENGTH && value === "0") {
             return "";
         }
@@ -8204,7 +9744,7 @@ function storageSharedKeyCredentialPolicy(options) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * StorageBrowserPolicy will handle differences between Node.js and browser runtime, including:
  *
@@ -8247,7 +9787,7 @@ class StorageBrowserPolicy extends BaseRequestPolicy {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * StorageBrowserPolicyFactory is a factory class helping generating StorageBrowserPolicy objects.
  */
@@ -8264,7 +9804,7 @@ class StorageBrowserPolicyFactory {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * The programmatic identifier of the storageCorrectContentLengthPolicy.
  */
@@ -8290,7 +9830,7 @@ function storageCorrectContentLengthPolicy() {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * A helper to decide if a given argument satisfies the Pipeline contract
  * @param pipeline - An argument that may be a Pipeline
@@ -17021,7 +18561,7 @@ const timeoutInSeconds = {
 const version = {
     parameterPath: "version",
     mapper: {
-        defaultValue: "2024-08-04",
+        defaultValue: "2025-05-05",
         isConstant: true,
         serializedName: "x-ms-version",
         type: {
@@ -20019,7 +21559,12 @@ const setImmutabilityPolicyOperationSpec = {
             headersMapper: BlobSetImmutabilityPolicyExceptionHeaders,
         },
     },
-    queryParameters: [timeoutInSeconds, comp12],
+    queryParameters: [
+        timeoutInSeconds,
+        snapshot,
+        versionId,
+        comp12,
+    ],
     urlParameters: [url],
     headerParameters: [
         version,
@@ -20044,7 +21589,12 @@ const deleteImmutabilityPolicyOperationSpec = {
             headersMapper: BlobDeleteImmutabilityPolicyExceptionHeaders,
         },
     },
-    queryParameters: [timeoutInSeconds, comp12],
+    queryParameters: [
+        timeoutInSeconds,
+        snapshot,
+        versionId,
+        comp12,
+    ],
     urlParameters: [url],
     headerParameters: [
         version,
@@ -20066,7 +21616,12 @@ const setLegalHoldOperationSpec = {
             headersMapper: BlobSetLegalHoldExceptionHeaders,
         },
     },
-    queryParameters: [timeoutInSeconds, comp13],
+    queryParameters: [
+        timeoutInSeconds,
+        snapshot,
+        versionId,
+        comp13,
+    ],
     urlParameters: [url],
     headerParameters: [
         version,
@@ -21638,7 +23193,7 @@ let StorageClient$1 = class StorageClient extends coreHttpCompat__namespace.Exte
         const defaults = {
             requestContentType: "application/json; charset=utf-8",
         };
-        const packageDetails = `azsdk-js-azure-storage-blob/12.24.0`;
+        const packageDetails = `azsdk-js-azure-storage-blob/12.27.0`;
         const userAgentPrefix = options.userAgentOptions && options.userAgentOptions.userAgentPrefix
             ? `${options.userAgentOptions.userAgentPrefix} ${packageDetails}`
             : `${packageDetails}`;
@@ -21649,7 +23204,7 @@ let StorageClient$1 = class StorageClient extends coreHttpCompat__namespace.Exte
         // Parameter assignments
         this.url = url;
         // Assigning values to Constant parameters
-        this.version = options.version || "2024-08-04";
+        this.version = options.version || "2025-05-05";
         this.service = new ServiceImpl(this);
         this.container = new ContainerImpl(this);
         this.blob = new BlobImpl(this);
@@ -21660,7 +23215,7 @@ let StorageClient$1 = class StorageClient extends coreHttpCompat__namespace.Exte
 };
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * @internal
  */
@@ -21676,7 +23231,7 @@ class StorageContextClient extends StorageClient$1 {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * A StorageClient represents a based URL class for {@link BlobServiceClient}, {@link ContainerClient}
  * and etc.
@@ -21702,7 +23257,7 @@ class StorageClient {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Creates a span using the global tracer.
  * @internal
@@ -21714,7 +23269,7 @@ const tracingClient = coreTracing.createTracingClient({
 });
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
@@ -21909,7 +23464,7 @@ class BlobSASPermissions {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * This is a helper class to construct a string representing the permissions granted by a ServiceSAS to a container.
  * Setting a value to true means that any SAS which uses these permissions will grant permissions for that operation.
@@ -22081,7 +23636,7 @@ class ContainerSASPermissions {
      * order accepted by the service.
      *
      * The order of the characters should be as specified here to ensure correctness.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
      *
      */
     toString() {
@@ -22130,12 +23685,12 @@ class ContainerSASPermissions {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
  * UserDelegationKeyCredential is only used for generation of user delegation SAS.
- * @see https://docs.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas
+ * @see https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas
  */
 class UserDelegationKeyCredential {
     /**
@@ -22160,7 +23715,7 @@ class UserDelegationKeyCredential {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Generate SasIPRange format string. For example:
  *
@@ -22173,7 +23728,7 @@ function ipRangeToString(ipRange) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Protocols for generated SAS.
  */
@@ -22405,8 +23960,11 @@ class SASQueryParameters {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 function generateBlobSASQueryParameters(blobSASSignatureValues, sharedKeyCredentialOrUserDelegationKey, accountName) {
+    return generateBlobSASQueryParametersInternal(blobSASSignatureValues, sharedKeyCredentialOrUserDelegationKey, accountName).sasQueryParameters;
+}
+function generateBlobSASQueryParametersInternal(blobSASSignatureValues, sharedKeyCredentialOrUserDelegationKey, accountName) {
     const version = blobSASSignatureValues.version ? blobSASSignatureValues.version : SERVICE_VERSION;
     const sharedKeyCredential = sharedKeyCredentialOrUserDelegationKey instanceof StorageSharedKeyCredential
         ? sharedKeyCredentialOrUserDelegationKey
@@ -22429,7 +23987,7 @@ function generateBlobSASQueryParameters(blobSASSignatureValues, sharedKeyCredent
     }
     // Version 2019-12-12 adds support for the blob tags permission.
     // Version 2018-11-09 adds support for the signed resource and signed blob snapshot time fields.
-    // https://docs.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas#constructing-the-signature-string
+    // https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas#constructing-the-signature-string
     if (version >= "2018-11-09") {
         if (sharedKeyCredential !== undefined) {
             return generateBlobSASQueryParameters20181109(blobSASSignatureValues, sharedKeyCredential);
@@ -22511,7 +24069,10 @@ function generateBlobSASQueryParameters20150405(blobSASSignatureValues, sharedKe
         blobSASSignatureValues.contentType ? blobSASSignatureValues.contentType : "",
     ].join("\n");
     const signature = sharedKeyCredential.computeHMACSHA256(stringToSign);
-    return new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType);
+    return {
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType),
+        stringToSign: stringToSign,
+    };
 }
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
@@ -22580,7 +24141,10 @@ function generateBlobSASQueryParameters20181109(blobSASSignatureValues, sharedKe
         blobSASSignatureValues.contentType ? blobSASSignatureValues.contentType : "",
     ].join("\n");
     const signature = sharedKeyCredential.computeHMACSHA256(stringToSign);
-    return new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType);
+    return {
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType),
+        stringToSign: stringToSign,
+    };
 }
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
@@ -22650,7 +24214,10 @@ function generateBlobSASQueryParameters20201206(blobSASSignatureValues, sharedKe
         blobSASSignatureValues.contentType ? blobSASSignatureValues.contentType : "",
     ].join("\n");
     const signature = sharedKeyCredential.computeHMACSHA256(stringToSign);
-    return new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, undefined, undefined, undefined, blobSASSignatureValues.encryptionScope);
+    return {
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, undefined, undefined, undefined, blobSASSignatureValues.encryptionScope),
+        stringToSign: stringToSign,
+    };
 }
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
@@ -22726,7 +24293,10 @@ function generateBlobSASQueryParametersUDK20181109(blobSASSignatureValues, userD
         blobSASSignatureValues.contentType,
     ].join("\n");
     const signature = userDelegationKeyCredential.computeHMACSHA256(stringToSign);
-    return new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey);
+    return {
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey),
+        stringToSign: stringToSign,
+    };
 }
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
@@ -22805,7 +24375,10 @@ function generateBlobSASQueryParametersUDK20200210(blobSASSignatureValues, userD
         blobSASSignatureValues.contentType,
     ].join("\n");
     const signature = userDelegationKeyCredential.computeHMACSHA256(stringToSign);
-    return new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId);
+    return {
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId),
+        stringToSign: stringToSign,
+    };
 }
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
@@ -22885,7 +24458,10 @@ function generateBlobSASQueryParametersUDK20201206(blobSASSignatureValues, userD
         blobSASSignatureValues.contentType,
     ].join("\n");
     const signature = userDelegationKeyCredential.computeHMACSHA256(stringToSign);
-    return new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId, blobSASSignatureValues.encryptionScope);
+    return {
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId, blobSASSignatureValues.encryptionScope),
+        stringToSign: stringToSign,
+    };
 }
 function getCanonicalName(accountName, containerName, blobName) {
     // Container: "/blob/account/containerName"
@@ -22952,7 +24528,7 @@ function SASSignatureValuesSanityCheckAndAutofill(blobSASSignatureValues) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * A client that manages leases for a {@link ContainerClient} or a {@link BlobClient}.
  */
@@ -22998,9 +24574,9 @@ class BlobLeaseClient {
      * Establishes and manages a lock on a container for delete operations, or on a blob
      * for write and delete operations.
      * The lock duration can be 15 to 60 seconds, or can be infinite.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-container
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-container
      * and
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-blob
      *
      * @param duration - Must be between 15 to 60 seconds, or infinite (-1)
      * @param options - option to configure lease management operations.
@@ -23027,9 +24603,9 @@ class BlobLeaseClient {
     }
     /**
      * To change the ID of the lease.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-container
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-container
      * and
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-blob
      *
      * @param proposedLeaseId - the proposed new lease Id.
      * @param options - option to configure lease management operations.
@@ -23057,9 +24633,9 @@ class BlobLeaseClient {
     /**
      * To free the lease if it is no longer needed so that another client may
      * immediately acquire a lease against the container or the blob.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-container
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-container
      * and
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-blob
      *
      * @param options - option to configure lease management operations.
      * @returns Response data for release lease operation.
@@ -23083,9 +24659,9 @@ class BlobLeaseClient {
     }
     /**
      * To renew the lease.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-container
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-container
      * and
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-blob
      *
      * @param options - Optional option to configure lease management operations.
      * @returns Response data for renew lease operation.
@@ -23110,9 +24686,9 @@ class BlobLeaseClient {
     /**
      * To end the lease but ensure that another client cannot acquire a new lease
      * until the current lease period has expired.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-container
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-container
      * and
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/lease-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/lease-blob
      *
      * @param breakPeriod - Break period
      * @param options - Optional options to configure lease management operations.
@@ -23140,7 +24716,7 @@ class BlobLeaseClient {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
@@ -23257,7 +24833,7 @@ class RetriableReadableStream extends stream.Readable {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
@@ -23718,14 +25294,14 @@ class BlobDownloadResponse {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 const AVRO_SYNC_MARKER_SIZE = 16;
 const AVRO_INIT_BYTES = new Uint8Array([79, 98, 106, 1]);
 const AVRO_CODEC_KEY = "avro.codec";
 const AVRO_SCHEMA_KEY = "avro.schema";
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 class AvroParser {
     /**
      * Reads a fixed number of bytes from the stream.
@@ -23882,6 +25458,7 @@ class AvroType {
     /**
      * Determines the AvroType from the Avro Schema.
      */
+    // eslint-disable-next-line @typescript-eslint/no-wrapper-object-types
     static fromSchema(schema) {
         if (typeof schema === "string") {
             return AvroType.fromStringSchema(schema);
@@ -23917,8 +25494,8 @@ class AvroType {
         try {
             return AvroType.fromStringSchema(type);
         }
-        catch (err) {
-            // eslint-disable-line no-empty
+        catch (_a) {
+            // no-op
         }
         switch (type) {
             case AvroComplex.RECORD:
@@ -23962,6 +25539,7 @@ class AvroPrimitiveType extends AvroType {
         super();
         this._primitive = primitive;
     }
+    // eslint-disable-next-line @typescript-eslint/no-wrapper-object-types
     read(stream, options = {}) {
         switch (this._primitive) {
             case AvroPrimitive.NULL:
@@ -23990,6 +25568,7 @@ class AvroEnumType extends AvroType {
         super();
         this._symbols = symbols;
     }
+    // eslint-disable-next-line @typescript-eslint/no-wrapper-object-types
     async read(stream, options = {}) {
         const value = await AvroParser.readInt(stream, options);
         return this._symbols[value];
@@ -24001,7 +25580,6 @@ class AvroUnionType extends AvroType {
         this._types = types;
     }
     async read(stream, options = {}) {
-        // eslint-disable-line @typescript-eslint/ban-types
         const typeIndex = await AvroParser.readInt(stream, options);
         return this._types[typeIndex].read(stream, options);
     }
@@ -24011,6 +25589,7 @@ class AvroMapType extends AvroType {
         super();
         this._itemType = itemType;
     }
+    // eslint-disable-next-line @typescript-eslint/no-wrapper-object-types
     read(stream, options = {}) {
         const readItemMethod = (s, opts) => {
             return this._itemType.read(s, opts);
@@ -24024,7 +25603,9 @@ class AvroRecordType extends AvroType {
         this._fields = fields;
         this._name = name;
     }
+    // eslint-disable-next-line @typescript-eslint/no-wrapper-object-types
     async read(stream, options = {}) {
+        // eslint-disable-next-line @typescript-eslint/no-wrapper-object-types
         const record = {};
         record["$schema"] = this._name;
         for (const key in this._fields) {
@@ -24037,11 +25618,10 @@ class AvroRecordType extends AvroType {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 function arraysEqual(a, b) {
     if (a === b)
         return true;
-    // eslint-disable-next-line eqeqeq
     if (a == null || b == null)
         return false;
     if (a.length !== b.length)
@@ -24054,7 +25634,7 @@ function arraysEqual(a, b) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 class AvroReader {
     get blockOffset() {
         return this._blockOffset;
@@ -24138,7 +25718,7 @@ class AvroReader {
                             abortSignal: options.abortSignal,
                         }));
                     }
-                    catch (err) {
+                    catch (_a) {
                         // We hit the end of the stream.
                         this._itemsRemainingInBlock = 0;
                     }
@@ -24154,12 +25734,12 @@ class AvroReader {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 class AvroReadable {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 const ABORT_ERROR = new abortController.AbortError("Reading from the avro stream was aborted.");
 class AvroReadableFromStream extends AvroReadable {
     toUint8Array(data) {
@@ -24241,7 +25821,7 @@ class AvroReadableFromStream extends AvroReadable {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
@@ -24350,7 +25930,7 @@ class BlobQuickQueryStream extends stream.Readable {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
@@ -24715,10 +26295,10 @@ class BlobQueryResponse {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Represents the access tier on a blob.
- * For detailed information about block blob level tiering see {@link https://docs.microsoft.com/azure/storage/blobs/storage-blob-storage-tiers|Hot, cool and archive storage tiers.}
+ * For detailed information about block blob level tiering see {@link https://learn.microsoft.com/azure/storage/blobs/storage-blob-storage-tiers|Hot, cool and archive storage tiers.}
  */
 exports.BlockBlobTier = void 0;
 (function (BlockBlobTier) {
@@ -24742,7 +26322,7 @@ exports.BlockBlobTier = void 0;
 })(exports.BlockBlobTier || (exports.BlockBlobTier = {}));
 /**
  * Specifies the page blob tier to set the blob to. This is only applicable to page blobs on premium storage accounts.
- * Please see {@link https://docs.microsoft.com/azure/storage/storage-premium-storage#scalability-and-performance-targets|here}
+ * Please see {@link https://learn.microsoft.com/azure/storage/storage-premium-storage#scalability-and-performance-targets|here}
  * for detailed information on the corresponding IOPS and throughput per PageBlobTier.
  */
 exports.PremiumPageBlobTier = void 0;
@@ -24829,7 +26409,7 @@ function getBlobServiceAccountAudience(storageAccountName) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Function that converts PageRange and ClearRange to a common Range object.
  * PageRange and ClearRange have start and end while Range offset and count
@@ -24853,7 +26433,7 @@ function rangeResponseFromModel(response) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * This is the poller returned by {@link BlobClient.beginCopyFromURL}.
  * This can not be instantiated directly outside of this package.
@@ -24981,7 +26561,7 @@ function makeBlobBeginCopyFromURLPollOperation(state) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Generate a range string. For example:
  *
@@ -25002,7 +26582,7 @@ function rangeToString(iRange) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 // In browser, during webpack or browserify bundling, this module will be replaced by 'events'
 // https://github.com/Gozala/events
 /**
@@ -25123,7 +26703,7 @@ class Batch {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * This class generates a readable stream from the data in an array of buffers.
  */
@@ -25205,7 +26785,7 @@ class BuffersStream extends stream.Readable {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 const maxBufferLength = buffer.constants.MAX_LENGTH;
 /**
  * This class provides a buffer container which conceptually has no hard size limit.
@@ -25287,7 +26867,7 @@ class PooledBuffer {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * This class accepts a Node.js Readable stream as input, and keeps reading data
  * from the stream into the internal buffer structure, until it reaches maxBuffers.
@@ -25537,7 +27117,7 @@ class BufferScheduler {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * Reads a readable stream into buffer. Fill the buffer from offset to end.
  *
@@ -25647,7 +27227,7 @@ const fsStat = util__namespace.promisify(fs__namespace.stat);
 const fsCreateReadStream = fs__namespace.createReadStream;
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * A BlobClient represents a URL to an Azure Storage blob; the blob may be a block blob,
  * append blob, or page blob.
@@ -25785,7 +27365,7 @@ class BlobClient extends StorageClient {
      * * In Node.js, data returns in a Readable stream readableStreamBody
      * * In browsers, data returns in a promise blobBody
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob
      *
      * @param offset - From which position of the blob to download, greater than or equal to 0
      * @param count - How much data to be downloaded, greater than 0. Will download to the end when undefined
@@ -25801,16 +27381,16 @@ class BlobClient extends StorageClient {
      * console.log("Downloaded blob content:", downloaded.toString());
      *
      * async function streamToBuffer(readableStream) {
-     * return new Promise((resolve, reject) => {
-     * const chunks = [];
-     * readableStream.on("data", (data) => {
-     * chunks.push(data instanceof Buffer ? data : Buffer.from(data));
-     * });
-     * readableStream.on("end", () => {
-     * resolve(Buffer.concat(chunks));
-     * });
-     * readableStream.on("error", reject);
-     * });
+     *   return new Promise((resolve, reject) => {
+     *     const chunks = [];
+     *     readableStream.on("data", (data) => {
+     *       chunks.push(typeof data === "string" ? Buffer.from(data) : data);
+     *     });
+     *     readableStream.on("end", () => {
+     *       resolve(Buffer.concat(chunks));
+     *     });
+     *     readableStream.on("error", reject);
+     *   });
      * }
      * ```
      *
@@ -25949,7 +27529,7 @@ class BlobClient extends StorageClient {
     /**
      * Returns all user-defined metadata, standard HTTP properties, and system properties
      * for the blob. It does not return the content of the blob.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-blob-properties
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob-properties
      *
      * WARNING: The `metadata` object returned in the response will have its keys in lowercase, even if
      * they originally contained uppercase characters. This differs from the metadata keys returned by
@@ -25978,7 +27558,7 @@ class BlobClient extends StorageClient {
      * during garbage collection. Note that in order to delete a blob, you must delete
      * all of its snapshots. You can delete both at the same time with the Delete
      * Blob operation.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/delete-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob
      *
      * @param options - Optional options to Blob Delete operation.
      */
@@ -26000,7 +27580,7 @@ class BlobClient extends StorageClient {
      * during garbage collection. Note that in order to delete a blob, you must delete
      * all of its snapshots. You can delete both at the same time with the Delete
      * Blob operation.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/delete-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob
      *
      * @param options - Optional options to Blob Delete operation.
      */
@@ -26023,7 +27603,7 @@ class BlobClient extends StorageClient {
      * Restores the contents and metadata of soft deleted blob and any associated
      * soft deleted snapshots. Undelete Blob is supported only on version 2017-07-29
      * or later.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/undelete-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/undelete-blob
      *
      * @param options - Optional options to Blob Undelete operation.
      */
@@ -26040,7 +27620,7 @@ class BlobClient extends StorageClient {
      *
      * If no value provided, or no value provided for the specified blob HTTP headers,
      * these blob HTTP headers without a value will be cleared.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/set-blob-properties
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-properties
      *
      * @param blobHTTPHeaders - If no value provided, or no value provided for
      *                                                   the specified blob HTTP headers, these blob HTTP
@@ -26070,7 +27650,7 @@ class BlobClient extends StorageClient {
      *
      * If no option provided, or no metadata defined in the parameter, the blob
      * metadata will be removed.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/set-blob-metadata
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-metadata
      *
      * @param metadata - Replace existing metadata with this value.
      *                               If no value provided the existing metadata will be removed.
@@ -26142,7 +27722,7 @@ class BlobClient extends StorageClient {
     }
     /**
      * Creates a read-only snapshot of a blob.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/snapshot-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/snapshot-blob
      *
      * @param options - Optional options to the Blob Create Snapshot operation.
      */
@@ -26176,7 +27756,7 @@ class BlobClient extends StorageClient {
      * an Azure file in any Azure storage account.
      * Only storage accounts created on or after June 7th, 2012 allow the Copy Blob
      * operation to copy from another storage account.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/copy-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob
      *
      * Example using automatic polling:
      *
@@ -26256,7 +27836,7 @@ class BlobClient extends StorageClient {
     /**
      * Aborts a pending asynchronous Copy Blob operation, and leaves a destination blob with zero
      * length and full metadata. Version 2012-02-12 and newer.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/abort-copy-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/abort-copy-blob
      *
      * @param copyId - Id of the Copy From URL operation.
      * @param options - Optional options to the Blob Abort Copy From URL operation.
@@ -26273,7 +27853,7 @@ class BlobClient extends StorageClient {
     /**
      * The synchronous Copy From URL operation copies a blob or an internet resource to a new blob. It will not
      * return a response until the copy is complete.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/copy-blob-from-url
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob-from-url
      *
      * @param copySource - The source URL to copy from, Shared Access Signature(SAS) maybe needed for authentication
      * @param options -
@@ -26313,7 +27893,7 @@ class BlobClient extends StorageClient {
      * storage only). A premium page blob's tier determines the allowed size, IOPS,
      * and bandwidth of the blob. A block blob's tier determines Hot/Cool/Archive
      * storage type. This operation does not update the blob's ETag.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/set-blob-tier
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-tier
      *
      * @param tier - The tier to be set on the blob. Valid values are Hot, Cool, or Archive.
      * @param options - Optional options to the Blob Set Tier operation.
@@ -26498,7 +28078,7 @@ class BlobClient extends StorageClient {
      * an Azure file in any Azure storage account.
      * Only storage accounts created on or after June 7th, 2012 allow the Copy Blob
      * operation to copy from another storage account.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/copy-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob
      *
      * @param copySource - url to the source Azure Blob/File.
      * @param options - Optional options to the Blob Start Copy From URL operation.
@@ -26537,7 +28117,7 @@ class BlobClient extends StorageClient {
      * Generates a Blob Service Shared Access Signature (SAS) URI based on the client properties
      * and parameters passed in. The SAS is signed by the shared key credential of the client.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
      *
      * @param options - Optional parameters.
      * @returns The SAS URI consisting of the URI to the resource represented by this client, followed by the generated SAS token.
@@ -26550,6 +28130,56 @@ class BlobClient extends StorageClient {
             const sas = generateBlobSASQueryParameters(Object.assign({ containerName: this._containerName, blobName: this._name, snapshotTime: this._snapshot, versionId: this._versionId }, options), this.credential).toString();
             resolve(appendToURLQuery(this.url, sas));
         });
+    }
+    /**
+     * Only available for BlobClient constructed with a shared key credential.
+     *
+     * Generates string to sign for a Blob Service Shared Access Signature (SAS) URI based on
+     * the client properties and parameters passed in. The SAS is signed by the shared key credential of the client.
+     *
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+     *
+     * @param options - Optional parameters.
+     * @returns The SAS URI consisting of the URI to the resource represented by this client, followed by the generated SAS token.
+     */
+    /* eslint-disable-next-line @azure/azure-sdk/ts-naming-options*/
+    generateSasStringToSign(options) {
+        if (!(this.credential instanceof StorageSharedKeyCredential)) {
+            throw new RangeError("Can only generate the SAS when the client is initialized with a shared key credential");
+        }
+        return generateBlobSASQueryParametersInternal(Object.assign({ containerName: this._containerName, blobName: this._name, snapshotTime: this._snapshot, versionId: this._versionId }, options), this.credential).stringToSign;
+    }
+    /**
+     *
+     * Generates a Blob Service Shared Access Signature (SAS) URI based on
+     * the client properties and parameters passed in. The SAS is signed by the input user delegation key.
+     *
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+     *
+     * @param options - Optional parameters.
+     * @param userDelegationKey -  Return value of `blobServiceClient.getUserDelegationKey()`
+     * @returns The SAS URI consisting of the URI to the resource represented by this client, followed by the generated SAS token.
+     */
+    generateUserDelegationSasUrl(options, userDelegationKey) {
+        return new Promise((resolve) => {
+            const sas = generateBlobSASQueryParameters(Object.assign({ containerName: this._containerName, blobName: this._name, snapshotTime: this._snapshot, versionId: this._versionId }, options), userDelegationKey, this.accountName).toString();
+            resolve(appendToURLQuery(this.url, sas));
+        });
+    }
+    /**
+     * Only available for BlobClient constructed with a shared key credential.
+     *
+     * Generates string to sign for a Blob Service Shared Access Signature (SAS) URI based on
+     * the client properties and parameters passed in. The SAS is signed by the input user delegation key.
+     *
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+     *
+     * @param options - Optional parameters.
+     * @param userDelegationKey -  Return value of `blobServiceClient.getUserDelegationKey()`
+     * @returns The SAS URI consisting of the URI to the resource represented by this client, followed by the generated SAS token.
+     */
+    generateUserDelegationSasStringToSign(options, userDelegationKey) {
+        return generateBlobSASQueryParametersInternal(Object.assign({ containerName: this._containerName, blobName: this._name, snapshotTime: this._snapshot, versionId: this._versionId }, options), userDelegationKey, this.accountName).stringToSign;
     }
     /**
      * Delete the immutablility policy on the blob.
@@ -26594,7 +28224,7 @@ class BlobClient extends StorageClient {
      * for the specified account.
      * The Get Account Information operation is available on service versions beginning
      * with version 2018-03-28.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-account-information
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-account-information
      *
      * @param options - Options to the Service Get Account Info operation.
      * @returns Response data for the Service Get Account Info operation.
@@ -26692,7 +28322,7 @@ class AppendBlobClient extends BlobClient {
     }
     /**
      * Creates a 0-length append blob. Call AppendBlock to append data to an append blob.
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-blob
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-blob
      *
      * @param options - Options to the Append Block Create operation.
      *
@@ -26728,7 +28358,7 @@ class AppendBlobClient extends BlobClient {
     /**
      * Creates a 0-length append blob. Call AppendBlock to append data to an append blob.
      * If the blob with the same name already exists, the content of the existing blob will remain unchanged.
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-blob
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-blob
      *
      * @param options -
      */
@@ -26768,7 +28398,7 @@ class AppendBlobClient extends BlobClient {
     }
     /**
      * Commits a new block of data to the end of the existing append blob.
-     * @see https://docs.microsoft.com/rest/api/storageservices/append-block
+     * @see https://learn.microsoft.com/rest/api/storageservices/append-block
      *
      * @param body - Data to be appended.
      * @param contentLength - Length of the body in bytes.
@@ -26814,7 +28444,7 @@ class AppendBlobClient extends BlobClient {
     /**
      * The Append Block operation commits a new block of data to the end of an existing append blob
      * where the contents are read from a source url.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/append-block-from-url
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/append-block-from-url
      *
      * @param sourceURL -
      *                 The url to the blob that will be the source of the copy. A source blob in the same storage account can
@@ -26956,7 +28586,7 @@ class BlockBlobClient extends BlobClient {
      *   return new Promise((resolve, reject) => {
      *     const chunks = [];
      *     readableStream.on("data", (data) => {
-     *       chunks.push(data instanceof Buffer ? data : Buffer.from(data));
+     *       chunks.push(typeof data === "string" ? Buffer.from(data) : data);
      *     });
      *     readableStream.on("end", () => {
      *       resolve(Buffer.concat(chunks));
@@ -27007,7 +28637,7 @@ class BlockBlobClient extends BlobClient {
      * {@link uploadStream} or {@link uploadBrowserData} for better performance
      * with concurrency uploading.
      *
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-blob
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-blob
      *
      * @param body - Blob, string, ArrayBuffer, ArrayBufferView or a function
      *                               which returns a new Readable stream whose offset is from data source beginning.
@@ -27083,7 +28713,7 @@ class BlockBlobClient extends BlobClient {
     /**
      * Uploads the specified block to the block blob's "staging area" to be later
      * committed by a call to commitBlockList.
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-block
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-block
      *
      * @param blockId - A 64-byte value that is base64-encoded
      * @param body - Data to upload to the staging area.
@@ -27112,7 +28742,7 @@ class BlockBlobClient extends BlobClient {
      * The Stage Block From URL operation creates a new block to be committed as part
      * of a blob where the contents are read from a URL.
      * This API is available starting in version 2018-03-28.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/put-block-from-url
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-from-url
      *
      * @param blockId - A 64-byte value that is base64-encoded
      * @param sourceURL - Specifies the URL of the blob. The value
@@ -27151,7 +28781,7 @@ class BlockBlobClient extends BlobClient {
      * to the server in a prior {@link stageBlock} operation. You can call {@link commitBlockList} to
      * update a blob by uploading only those blocks that have changed, then committing the new and existing
      * blocks together. Any blocks not specified in the block list and permanently deleted.
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-block-list
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-block-list
      *
      * @param blocks -  Array of 64-byte value that is base64-encoded
      * @param options - Options to the Block Blob Commit Block List operation.
@@ -27182,7 +28812,7 @@ class BlockBlobClient extends BlobClient {
     /**
      * Returns the list of blocks that have been uploaded as part of a block blob
      * using the specified block list filter.
-     * @see https://docs.microsoft.com/rest/api/storageservices/get-block-list
+     * @see https://learn.microsoft.com/rest/api/storageservices/get-block-list
      *
      * @param listType - Specifies whether to return the list of committed blocks,
      *                                        the list of uncommitted blocks, or both lists together.
@@ -27410,6 +29040,7 @@ class BlockBlobClient extends BlobClient {
                 blockList.push(blockID);
                 blockNum++;
                 await this.stageBlock(blockID, body, length, {
+                    customerProvidedKey: options.customerProvidedKey,
                     conditions: options.conditions,
                     encryptionScope: options.encryptionScope,
                     tracingOptions: updatedOptions.tracingOptions,
@@ -27515,7 +29146,7 @@ class PageBlobClient extends BlobClient {
     /**
      * Creates a page blob of the specified length. Call uploadPages to upload data
      * data to a page blob.
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-blob
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-blob
      *
      * @param size - size of the page blob.
      * @param options - Options to the Page Blob Create operation.
@@ -27548,7 +29179,7 @@ class PageBlobClient extends BlobClient {
      * Creates a page blob of the specified length. Call uploadPages to upload data
      * data to a page blob. If the blob with the same name already exists, the content
      * of the existing blob will remain unchanged.
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-blob
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-blob
      *
      * @param size - size of the page blob.
      * @param options -
@@ -27571,7 +29202,7 @@ class PageBlobClient extends BlobClient {
     }
     /**
      * Writes 1 or more pages to the page blob. The start and end offsets must be a multiple of 512.
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-page
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-page
      *
      * @param body - Data to upload
      * @param offset - Offset of destination page blob
@@ -27604,7 +29235,7 @@ class PageBlobClient extends BlobClient {
     /**
      * The Upload Pages operation writes a range of pages to a page blob where the
      * contents are read from a URL.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/put-page-from-url
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/put-page-from-url
      *
      * @param sourceURL - Specify a URL to the copy source, Shared Access Signature(SAS) maybe needed for authentication
      * @param sourceOffset - The source offset to copy from. Pass 0 to copy from the beginning of source page blob
@@ -27640,7 +29271,7 @@ class PageBlobClient extends BlobClient {
     }
     /**
      * Frees the specified pages from the page blob.
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-page
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-page
      *
      * @param offset - Starting byte position of the pages to clear.
      * @param count - Number of bytes to clear.
@@ -27665,7 +29296,7 @@ class PageBlobClient extends BlobClient {
     }
     /**
      * Returns the list of valid page ranges for a page blob or snapshot of a page blob.
-     * @see https://docs.microsoft.com/rest/api/storageservices/get-page-ranges
+     * @see https://learn.microsoft.com/rest/api/storageservices/get-page-ranges
      *
      * @param offset - Starting byte position of the page ranges.
      * @param count - Number of bytes to get.
@@ -27691,7 +29322,7 @@ class PageBlobClient extends BlobClient {
      * specified Marker. Use an empty Marker to start enumeration from the beginning.
      * After getting a segment, process it, and then call getPageRangesSegment again
      * (passing the the previously-returned Marker) to get the next segment.
-     * @see https://docs.microsoft.com/rest/api/storageservices/get-page-ranges
+     * @see https://learn.microsoft.com/rest/api/storageservices/get-page-ranges
      *
      * @param offset - Starting byte position of the page ranges.
      * @param count - Number of bytes to get.
@@ -27768,7 +29399,7 @@ class PageBlobClient extends BlobClient {
     }
     /**
      * Returns an async iterable iterator to list of page ranges for a page blob.
-     * @see https://docs.microsoft.com/rest/api/storageservices/get-page-ranges
+     * @see https://learn.microsoft.com/rest/api/storageservices/get-page-ranges
      *
      *  .byPage() returns an async iterable iterator to list of page ranges for a page blob.
      *
@@ -27864,7 +29495,7 @@ class PageBlobClient extends BlobClient {
     }
     /**
      * Gets the collection of page ranges that differ between a specified snapshot and this page blob.
-     * @see https://docs.microsoft.com/rest/api/storageservices/get-page-ranges
+     * @see https://learn.microsoft.com/rest/api/storageservices/get-page-ranges
      *
      * @param offset - Starting byte position of the page blob
      * @param count - Number of bytes to get ranges diff.
@@ -27893,7 +29524,7 @@ class PageBlobClient extends BlobClient {
      * Use an empty Marker to start enumeration from the beginning.
      * After getting a segment, process it, and then call getPageRangesDiffSegment again
      * (passing the the previously-returned Marker) to get the next segment.
-     * @see https://docs.microsoft.com/rest/api/storageservices/get-page-ranges
+     * @see https://learn.microsoft.com/rest/api/storageservices/get-page-ranges
      *
      * @param offset - Starting byte position of the page ranges.
      * @param count - Number of bytes to get.
@@ -27978,7 +29609,7 @@ class PageBlobClient extends BlobClient {
     }
     /**
      * Returns an async iterable iterator to list of page ranges that differ between a specified snapshot and this page blob.
-     * @see https://docs.microsoft.com/rest/api/storageservices/get-page-ranges
+     * @see https://learn.microsoft.com/rest/api/storageservices/get-page-ranges
      *
      *  .byPage() returns an async iterable iterator to list of page ranges that differ between a specified snapshot and this page blob.
      *
@@ -28075,7 +29706,7 @@ class PageBlobClient extends BlobClient {
     }
     /**
      * Gets the collection of page ranges that differ between a specified snapshot and this page blob for managed disks.
-     * @see https://docs.microsoft.com/rest/api/storageservices/get-page-ranges
+     * @see https://learn.microsoft.com/rest/api/storageservices/get-page-ranges
      *
      * @param offset - Starting byte position of the page blob
      * @param count - Number of bytes to get ranges diff.
@@ -28100,7 +29731,7 @@ class PageBlobClient extends BlobClient {
     }
     /**
      * Resizes the page blob to the specified size (which must be a multiple of 512).
-     * @see https://docs.microsoft.com/rest/api/storageservices/set-blob-properties
+     * @see https://learn.microsoft.com/rest/api/storageservices/set-blob-properties
      *
      * @param size - Target size
      * @param options - Options to the Page Blob Resize operation.
@@ -28121,7 +29752,7 @@ class PageBlobClient extends BlobClient {
     }
     /**
      * Sets a page blob's sequence number.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/set-blob-properties
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-properties
      *
      * @param sequenceNumberAction - Indicates how the service should modify the blob's sequence number.
      * @param sequenceNumber - Required if sequenceNumberAction is max or update
@@ -28146,8 +29777,8 @@ class PageBlobClient extends BlobClient {
      * The snapshot is copied such that only the differential changes between the previously
      * copied snapshot are transferred to the destination.
      * The copied snapshots are complete copies of the original snapshot and can be read or copied from as usual.
-     * @see https://docs.microsoft.com/rest/api/storageservices/incremental-copy-blob
-     * @see https://docs.microsoft.com/en-us/azure/virtual-machines/windows/incremental-snapshots
+     * @see https://learn.microsoft.com/rest/api/storageservices/incremental-copy-blob
+     * @see https://learn.microsoft.com/en-us/azure/virtual-machines/windows/incremental-snapshots
      *
      * @param copySource - Specifies the name of the source page blob snapshot. For example,
      *                            https://myaccount.blob.core.windows.net/mycontainer/myblob?snapshot=<DateTime>
@@ -28167,7 +29798,7 @@ class PageBlobClient extends BlobClient {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 async function getBodyAsText(batchResponse) {
     let buffer = Buffer.alloc(BATCH_MAX_PAYLOAD_IN_BYTES);
     const responseLength = await streamToBuffer2(batchResponse.readableStreamBody, buffer);
@@ -28180,7 +29811,7 @@ function utf8ByteLength(str) {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 const HTTP_HEADER_DELIMITER = ": ";
 const SPACE_DELIMITER = " ";
 const NOT_FOUND = -1;
@@ -28203,7 +29834,7 @@ class BatchResponseParser {
         this.perResponsePrefix = `--${this.responseBatchBoundary}${HTTP_LINE_ENDING}`;
         this.batchResponseEnding = `--${this.responseBatchBoundary}--`;
     }
-    // For example of response, please refer to https://docs.microsoft.com/en-us/rest/api/storageservices/blob-batch#response
+    // For example of response, please refer to https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch#response
     async parseBatchResponse() {
         // When logic reach here, suppose batch request has already succeeded with 202, so we can further parse
         // sub request's response.
@@ -28312,7 +29943,7 @@ class BatchResponseParser {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 var MutexLockStatus;
 (function (MutexLockStatus) {
     MutexLockStatus[MutexLockStatus["LOCKED"] = 0] = "LOCKED";
@@ -28377,7 +30008,7 @@ Mutex.keys = {};
 Mutex.listeners = {};
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * A BlobBatch represents an aggregated set of operations on blobs.
  * Currently, only `delete` and `setAccessTier` are supported.
@@ -28498,7 +30129,7 @@ class BlobBatch {
 }
 /**
  * Inner batch request class which is responsible for assembling and serializing sub requests.
- * See https://docs.microsoft.com/en-us/rest/api/storageservices/blob-batch#request-body for how requests are assembled.
+ * See https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch#request-body for how requests are assembled.
  */
 class InnerBatchRequest {
     constructor() {
@@ -28629,11 +30260,11 @@ function batchHeaderFilterPolicy() {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * A BlobBatchClient allows you to make batched requests to the Azure Storage Blob service.
  *
- * @see https://docs.microsoft.com/en-us/rest/api/storageservices/blob-batch
+ * @see https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch
  */
 class BlobBatchClient {
     constructor(url, credentialOrPipeline, 
@@ -28728,7 +30359,7 @@ class BlobBatchClient {
      * console.log(batchResp.subResponsesSucceededCount);
      * ```
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/blob-batch
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch
      *
      * @param batchRequest - A set of Delete or SetTier operations.
      * @param options -
@@ -28835,7 +30466,7 @@ class ContainerClient extends StorageClient {
     /**
      * Creates a new container under the specified account. If the container with
      * the same name already exists, the operation fails.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/create-container
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/create-container
      * Naming rules: @see https://learn.microsoft.com/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata
      *
      * @param options - Options to Container Create operation.
@@ -28857,7 +30488,7 @@ class ContainerClient extends StorageClient {
     /**
      * Creates a new container under the specified account. If the container with
      * the same name already exists, it is not changed.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/create-container
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/create-container
      * Naming rules: @see https://learn.microsoft.com/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata
      *
      * @param options -
@@ -28951,7 +30582,7 @@ class ContainerClient extends StorageClient {
     /**
      * Returns all user-defined metadata and system properties for the specified
      * container. The data returned does not include the container's list of blobs.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-container-properties
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-container-properties
      *
      * WARNING: The `metadata` object returned in the response will have its keys in lowercase, even if
      * they originally contained uppercase characters. This differs from the metadata keys returned by
@@ -28971,7 +30602,7 @@ class ContainerClient extends StorageClient {
     /**
      * Marks the specified container for deletion. The container and any blobs
      * contained within it are later deleted during garbage collection.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/delete-container
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/delete-container
      *
      * @param options - Options to Container Delete operation.
      */
@@ -28991,7 +30622,7 @@ class ContainerClient extends StorageClient {
     /**
      * Marks the specified container for deletion if it exists. The container and any blobs
      * contained within it are later deleted during garbage collection.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/delete-container
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/delete-container
      *
      * @param options - Options to Container Delete operation.
      */
@@ -29016,7 +30647,7 @@ class ContainerClient extends StorageClient {
      * If no option provided, or no metadata defined in the parameter, the container
      * metadata will be removed.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/set-container-metadata
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/set-container-metadata
      *
      * @param metadata - Replace existing metadata with this value.
      *                            If no value provided the existing metadata will be removed.
@@ -29046,7 +30677,7 @@ class ContainerClient extends StorageClient {
      * WARNING: JavaScript Date will potentially lose precision when parsing startsOn and expiresOn strings.
      * For example, new Date("2018-12-31T03:44:23.8827891Z").toISOString() will get "2018-12-31T03:44:23.882Z".
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-container-acl
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-container-acl
      *
      * @param options - Options to Container Get Access Policy operation.
      */
@@ -29104,7 +30735,7 @@ class ContainerClient extends StorageClient {
      * When you establish a stored access policy on a container, it may take up to 30 seconds to take effect.
      * During this interval, a shared access signature that is associated with the stored access policy will
      * fail with status code 403 (Forbidden), until the access policy becomes active.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/set-container-acl
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/set-container-acl
      *
      * @param access - The level of public access to data in the container.
      * @param containerAcl - Array of elements each having a unique Id and details of the access policy.
@@ -29159,7 +30790,7 @@ class ContainerClient extends StorageClient {
      * {@link BlockBlobClient.uploadStream} or {@link BlockBlobClient.uploadBrowserData} for better
      * performance with concurrency uploading.
      *
-     * @see https://docs.microsoft.com/rest/api/storageservices/put-blob
+     * @see https://learn.microsoft.com/rest/api/storageservices/put-blob
      *
      * @param blobName - Name of the block blob to create or update.
      * @param body - Blob, string, ArrayBuffer, ArrayBufferView or a function
@@ -29184,7 +30815,7 @@ class ContainerClient extends StorageClient {
      * during garbage collection. Note that in order to delete a blob, you must delete
      * all of its snapshots. You can delete both at the same time with the Delete
      * Blob operation.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/delete-blob
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob
      *
      * @param blobName -
      * @param options - Options to Blob Delete operation.
@@ -29204,7 +30835,7 @@ class ContainerClient extends StorageClient {
      * specified Marker. Use an empty Marker to start enumeration from the beginning.
      * After getting a segment, process it, and then call listBlobsFlatSegment again
      * (passing the the previously-returned Marker) to get the next segment.
-     * @see https://docs.microsoft.com/rest/api/storageservices/list-blobs
+     * @see https://learn.microsoft.com/rest/api/storageservices/list-blobs
      *
      * @param marker - A string value that identifies the portion of the list to be returned with the next list operation.
      * @param options - Options to Container List Blob Flat Segment operation.
@@ -29224,7 +30855,7 @@ class ContainerClient extends StorageClient {
      * the specified Marker. Use an empty Marker to start enumeration from the
      * beginning. After getting a segment, process it, and then call listBlobsHierarchicalSegment
      * again (passing the the previously-returned Marker) to get the next segment.
-     * @see https://docs.microsoft.com/rest/api/storageservices/list-blobs
+     * @see https://learn.microsoft.com/rest/api/storageservices/list-blobs
      *
      * @param delimiter - The character or string used to define the virtual hierarchy
      * @param marker - A string value that identifies the portion of the list to be returned with the next list operation.
@@ -29826,7 +31457,7 @@ class ContainerClient extends StorageClient {
      * for the specified account.
      * The Get Account Information operation is available on service versions beginning
      * with version 2018-03-28.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-account-information
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-account-information
      *
      * @param options - Options to the Service Get Account Info operation.
      * @returns Response data for the Service Get Account Info operation.
@@ -29882,7 +31513,7 @@ class ContainerClient extends StorageClient {
      * Generates a Blob Container Service Shared Access Signature (SAS) URI based on the client properties
      * and parameters passed in. The SAS is signed by the shared key credential of the client.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
      *
      * @param options - Optional parameters.
      * @returns The SAS URI consisting of the URI to the resource represented by this client, followed by the generated SAS token.
@@ -29897,9 +31528,56 @@ class ContainerClient extends StorageClient {
         });
     }
     /**
+     * Only available for ContainerClient constructed with a shared key credential.
+     *
+     * Generates string to sign for a Blob Container Service Shared Access Signature (SAS) URI
+     * based on the client properties and parameters passed in. The SAS is signed by the shared key credential of the client.
+     *
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+     *
+     * @param options - Optional parameters.
+     * @returns The SAS URI consisting of the URI to the resource represented by this client, followed by the generated SAS token.
+     */
+    /* eslint-disable-next-line @azure/azure-sdk/ts-naming-options*/
+    generateSasStringToSign(options) {
+        if (!(this.credential instanceof StorageSharedKeyCredential)) {
+            throw new RangeError("Can only generate the SAS when the client is initialized with a shared key credential");
+        }
+        return generateBlobSASQueryParametersInternal(Object.assign({ containerName: this._containerName }, options), this.credential).stringToSign;
+    }
+    /**
+     * Generates a Blob Container Service Shared Access Signature (SAS) URI based on the client properties
+     * and parameters passed in. The SAS is signed by the input user delegation key.
+     *
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+     *
+     * @param options - Optional parameters.
+     * @param userDelegationKey -  Return value of `blobServiceClient.getUserDelegationKey()`
+     * @returns The SAS URI consisting of the URI to the resource represented by this client, followed by the generated SAS token.
+     */
+    generateUserDelegationSasUrl(options, userDelegationKey) {
+        return new Promise((resolve) => {
+            const sas = generateBlobSASQueryParameters(Object.assign({ containerName: this._containerName }, options), userDelegationKey, this.accountName).toString();
+            resolve(appendToURLQuery(this.url, sas));
+        });
+    }
+    /**
+     * Generates string to sign for a Blob Container Service Shared Access Signature (SAS) URI
+     * based on the client properties and parameters passed in. The SAS is signed by the input user delegation key.
+     *
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-a-service-sas
+     *
+     * @param options - Optional parameters.
+     * @param userDelegationKey -  Return value of `blobServiceClient.getUserDelegationKey()`
+     * @returns The SAS URI consisting of the URI to the resource represented by this client, followed by the generated SAS token.
+     */
+    generateUserDelegationSasStringToSign(options, userDelegationKey) {
+        return generateBlobSASQueryParametersInternal(Object.assign({ containerName: this._containerName }, options), userDelegationKey, this.accountName).stringToSign;
+    }
+    /**
      * Creates a BlobBatchClient object to conduct batch operations.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/blob-batch
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch
      *
      * @returns A new BlobBatchClient object for this container.
      */
@@ -29909,7 +31587,7 @@ class ContainerClient extends StorageClient {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
@@ -30084,12 +31762,12 @@ class AccountSASPermissions {
      * Using this method will guarantee the resource types are in
      * an order accepted by the service.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/constructing-an-account-sas
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-an-account-sas
      *
      */
     toString() {
         // The order of the characters should be as specified here to ensure correctness:
-        // https://docs.microsoft.com/en-us/rest/api/storageservices/constructing-an-account-sas
+        // https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-an-account-sas
         // Use a string array instead of string concatenating += operator for performance
         const permissions = [];
         if (this.read) {
@@ -30136,7 +31814,7 @@ class AccountSASPermissions {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
@@ -30189,7 +31867,7 @@ class AccountSASResourceTypes {
     /**
      * Converts the given resource types to a string.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/constructing-an-account-sas
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-an-account-sas
      *
      */
     toString() {
@@ -30208,7 +31886,7 @@ class AccountSASResourceTypes {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
@@ -30288,19 +31966,23 @@ class AccountSASServices {
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
  *
  * Generates a {@link SASQueryParameters} object which contains all SAS query parameters needed to make an actual
  * REST request.
  *
- * @see https://docs.microsoft.com/en-us/rest/api/storageservices/constructing-an-account-sas
+ * @see https://learn.microsoft.com/en-us/rest/api/storageservices/constructing-an-account-sas
  *
  * @param accountSASSignatureValues -
  * @param sharedKeyCredential -
  */
 function generateAccountSASQueryParameters(accountSASSignatureValues, sharedKeyCredential) {
+    return generateAccountSASQueryParametersInternal(accountSASSignatureValues, sharedKeyCredential)
+        .sasQueryParameters;
+}
+function generateAccountSASQueryParametersInternal(accountSASSignatureValues, sharedKeyCredential) {
     const version = accountSASSignatureValues.version
         ? accountSASSignatureValues.version
         : SERVICE_VERSION;
@@ -30370,7 +32052,10 @@ function generateAccountSASQueryParameters(accountSASSignatureValues, sharedKeyC
         ].join("\n");
     }
     const signature = sharedKeyCredential.computeHMACSHA256(stringToSign);
-    return new SASQueryParameters(version, signature, parsedPermissions.toString(), parsedServices, parsedResourceTypes, accountSASSignatureValues.protocol, accountSASSignatureValues.startsOn, accountSASSignatureValues.expiresOn, accountSASSignatureValues.ipRange, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, accountSASSignatureValues.encryptionScope);
+    return {
+        sasQueryParameters: new SASQueryParameters(version, signature, parsedPermissions.toString(), parsedServices, parsedResourceTypes, accountSASSignatureValues.protocol, accountSASSignatureValues.startsOn, accountSASSignatureValues.expiresOn, accountSASSignatureValues.ipRange, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, accountSASSignatureValues.encryptionScope),
+        stringToSign: stringToSign,
+    };
 }
 
 /**
@@ -30453,7 +32138,7 @@ class BlobServiceClient extends StorageClient {
         return new ContainerClient(appendToURLPath(this.url, encodeURIComponent(containerName)), this.pipeline);
     }
     /**
-     * Create a Blob container. @see https://docs.microsoft.com/en-us/rest/api/storageservices/create-container
+     * Create a Blob container. @see https://learn.microsoft.com/en-us/rest/api/storageservices/create-container
      *
      * @param containerName - Name of the container to create.
      * @param options - Options to configure Container Create operation.
@@ -30526,7 +32211,7 @@ class BlobServiceClient extends StorageClient {
     /**
      * Gets the properties of a storage account’s Blob service, including properties
      * for Storage Analytics and CORS (Cross-Origin Resource Sharing) rules.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-blob-service-properties
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob-service-properties
      *
      * @param options - Options to the Service Get Properties operation.
      * @returns Response data for the Service Get Properties operation.
@@ -30542,7 +32227,7 @@ class BlobServiceClient extends StorageClient {
     /**
      * Sets properties for a storage account’s Blob service endpoint, including properties
      * for Storage Analytics, CORS (Cross-Origin Resource Sharing) rules and soft delete settings.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/set-blob-service-properties
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-service-properties
      *
      * @param properties -
      * @param options - Options to the Service Set Properties operation.
@@ -30560,7 +32245,7 @@ class BlobServiceClient extends StorageClient {
      * Retrieves statistics related to replication for the Blob service. It is only
      * available on the secondary location endpoint when read-access geo-redundant
      * replication is enabled for the storage account.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-blob-service-stats
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob-service-stats
      *
      * @param options - Options to the Service Get Statistics operation.
      * @returns Response data for the Service Get Statistics operation.
@@ -30578,7 +32263,7 @@ class BlobServiceClient extends StorageClient {
      * for the specified account.
      * The Get Account Information operation is available on service versions beginning
      * with version 2018-03-28.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-account-information
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-account-information
      *
      * @param options - Options to the Service Get Account Info operation.
      * @returns Response data for the Service Get Account Info operation.
@@ -30593,7 +32278,7 @@ class BlobServiceClient extends StorageClient {
     }
     /**
      * Returns a list of the containers under the specified account.
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/list-containers2
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/list-containers2
      *
      * @param marker - A string value that identifies the portion of
      *                        the list of containers to be returned with the next listing operation. The
@@ -30713,7 +32398,7 @@ class BlobServiceClient extends StorageClient {
      *
      * .byPage() returns an async iterable iterator to list the blobs in pages.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-blob-service-properties
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob-service-properties
      *
      * Example using `for await` syntax:
      *
@@ -30981,7 +32666,7 @@ class BlobServiceClient extends StorageClient {
      * Retrieves a user delegation key for the Blob service. This is only a valid operation when using
      * bearer token authentication.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/get-user-delegation-key
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/get-user-delegation-key
      *
      * @param startsOn -      The start time for the user delegation SAS. Must be within 7 days of the current time
      * @param expiresOn -     The end time for the user delegation SAS. Must be within 7 days of the current time
@@ -31011,7 +32696,7 @@ class BlobServiceClient extends StorageClient {
     /**
      * Creates a BlobBatchClient object to conduct batch operations.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/blob-batch
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch
      *
      * @returns A new BlobBatchClient object for this service.
      */
@@ -31024,7 +32709,7 @@ class BlobServiceClient extends StorageClient {
      * Generates a Blob account Shared Access Signature (SAS) URI based on the client properties
      * and parameters passed in. The SAS is signed by the shared key credential of the client.
      *
-     * @see https://docs.microsoft.com/en-us/rest/api/storageservices/create-account-sas
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/create-account-sas
      *
      * @param expiresOn - Optional. The time at which the shared access signature becomes invalid. Default to an hour later if not provided.
      * @param permissions - Specifies the list of permissions to be associated with the SAS.
@@ -31045,10 +32730,36 @@ class BlobServiceClient extends StorageClient {
             resourceTypes, services: AccountSASServices.parse("b").toString() }, options), this.credential).toString();
         return appendToURLQuery(this.url, sas);
     }
+    /**
+     * Only available for BlobServiceClient constructed with a shared key credential.
+     *
+     * Generates string to sign for a Blob account Shared Access Signature (SAS) URI based on
+     * the client properties and parameters passed in. The SAS is signed by the shared key credential of the client.
+     *
+     * @see https://learn.microsoft.com/en-us/rest/api/storageservices/create-account-sas
+     *
+     * @param expiresOn - Optional. The time at which the shared access signature becomes invalid. Default to an hour later if not provided.
+     * @param permissions - Specifies the list of permissions to be associated with the SAS.
+     * @param resourceTypes - Specifies the resource types associated with the shared access signature.
+     * @param options - Optional parameters.
+     * @returns An account SAS URI consisting of the URI to the resource represented by this client, followed by the generated SAS token.
+     */
+    generateSasStringToSign(expiresOn, permissions = AccountSASPermissions.parse("r"), resourceTypes = "sco", options = {}) {
+        if (!(this.credential instanceof StorageSharedKeyCredential)) {
+            throw RangeError("Can only generate the account SAS when the client is initialized with a shared key credential");
+        }
+        if (expiresOn === undefined) {
+            const now = new Date();
+            expiresOn = new Date(now.getTime() + 3600 * 1000);
+        }
+        return generateAccountSASQueryParametersInternal(Object.assign({ permissions,
+            expiresOn,
+            resourceTypes, services: AccountSASServices.parse("b").toString() }, options), this.credential).stringToSign;
+    }
 }
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /** Known values of {@link EncryptionAlgorithmType} that the service accepts. */
 exports.KnownEncryptionAlgorithmType = void 0;
 (function (KnownEncryptionAlgorithmType) {
@@ -31182,7 +32893,7 @@ var createTokenAuth = function createTokenAuth2(token) {
 
 /***/ }),
 
-/***/ 9437:
+/***/ 3157:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -31205,19 +32916,19 @@ var __copyProps = (to, from, except, desc) => {
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // pkg/dist-src/index.js
-var dist_src_exports = {};
-__export(dist_src_exports, {
+var index_exports = {};
+__export(index_exports, {
   Octokit: () => Octokit
 });
-module.exports = __toCommonJS(dist_src_exports);
+module.exports = __toCommonJS(index_exports);
 var import_universal_user_agent = __nccwpck_require__(5592);
 var import_before_after_hook = __nccwpck_require__(3990);
-var import_request = __nccwpck_require__(4970);
-var import_graphql = __nccwpck_require__(4212);
+var import_request = __nccwpck_require__(8010);
+var import_graphql = __nccwpck_require__(3916);
 var import_auth_token = __nccwpck_require__(1410);
 
 // pkg/dist-src/version.js
-var VERSION = "5.2.0";
+var VERSION = "5.2.1";
 
 // pkg/dist-src/index.js
 var noop = () => {
@@ -31350,7 +33061,7 @@ var Octokit = class {
 
 /***/ }),
 
-/***/ 794:
+/***/ 1756:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -31383,7 +33094,7 @@ module.exports = __toCommonJS(dist_src_exports);
 var import_universal_user_agent = __nccwpck_require__(5592);
 
 // pkg/dist-src/version.js
-var VERSION = "9.0.5";
+var VERSION = "9.0.6";
 
 // pkg/dist-src/defaults.js
 var userAgent = `octokit-endpoint.js/${VERSION} ${(0, import_universal_user_agent.getUserAgent)()}`;
@@ -31488,9 +33199,9 @@ function addQueryParameters(url, parameters) {
 }
 
 // pkg/dist-src/util/extract-url-variable-names.js
-var urlVariableRegex = /\{[^}]+\}/g;
+var urlVariableRegex = /\{[^{}}]+\}/g;
 function removeNonChars(variableName) {
-  return variableName.replace(/^\W+|\W+$/g, "").split(/,/);
+  return variableName.replace(/(?:^\W+)|(?:(?<!\W)\W+$)/g, "").split(/,/);
 }
 function extractUrlVariableNames(url) {
   const matches = url.match(urlVariableRegex);
@@ -31676,7 +33387,7 @@ function parse(options) {
     }
     if (url.endsWith("/graphql")) {
       if (options.mediaType.previews?.length) {
-        const previewsFromAcceptHeader = headers.accept.match(/[\w-]+(?=-preview)/g) || [];
+        const previewsFromAcceptHeader = headers.accept.match(/(?<![\w-])[\w-]+(?=-preview)/g) || [];
         headers.accept = previewsFromAcceptHeader.concat(options.mediaType.previews).map((preview) => {
           const format = options.mediaType.format ? `.${options.mediaType.format}` : "+json";
           return `application/vnd.github.${preview}-preview${format}`;
@@ -31733,7 +33444,7 @@ var endpoint = withDefaults(null, DEFAULTS);
 
 /***/ }),
 
-/***/ 4212:
+/***/ 3916:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -31756,24 +33467,24 @@ var __copyProps = (to, from, except, desc) => {
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // pkg/dist-src/index.js
-var dist_src_exports = {};
-__export(dist_src_exports, {
+var index_exports = {};
+__export(index_exports, {
   GraphqlResponseError: () => GraphqlResponseError,
   graphql: () => graphql2,
   withCustomRequest: () => withCustomRequest
 });
-module.exports = __toCommonJS(dist_src_exports);
-var import_request3 = __nccwpck_require__(4970);
+module.exports = __toCommonJS(index_exports);
+var import_request3 = __nccwpck_require__(8010);
 var import_universal_user_agent = __nccwpck_require__(5592);
 
 // pkg/dist-src/version.js
-var VERSION = "7.1.0";
+var VERSION = "7.1.1";
 
 // pkg/dist-src/with-defaults.js
-var import_request2 = __nccwpck_require__(4970);
+var import_request2 = __nccwpck_require__(8010);
 
 // pkg/dist-src/graphql.js
-var import_request = __nccwpck_require__(4970);
+var import_request = __nccwpck_require__(8010);
 
 // pkg/dist-src/error.js
 function _buildMessageForResponseErrors(data) {
@@ -31815,8 +33526,7 @@ function graphql(request2, query, options) {
       );
     }
     for (const key in options) {
-      if (!FORBIDDEN_VARIABLE_OPTIONS.includes(key))
-        continue;
+      if (!FORBIDDEN_VARIABLE_OPTIONS.includes(key)) continue;
       return Promise.reject(
         new Error(
           `[@octokit/graphql] "${key}" cannot be used as variable name`
@@ -31890,7 +33600,7 @@ function withCustomRequest(customRequest) {
 
 /***/ }),
 
-/***/ 8927:
+/***/ 804:
 /***/ ((module) => {
 
 
@@ -31923,7 +33633,7 @@ __export(dist_src_exports, {
 module.exports = __toCommonJS(dist_src_exports);
 
 // pkg/dist-src/version.js
-var VERSION = "9.2.1";
+var VERSION = "9.2.2";
 
 // pkg/dist-src/normalize-paginated-list-response.js
 function normalizePaginatedListResponse(response) {
@@ -31971,7 +33681,7 @@ function iterator(octokit, route, parameters) {
           const response = await requestMethod({ method, url, headers });
           const normalizedResponse = normalizePaginatedListResponse(response);
           url = ((normalizedResponse.headers.link || "").match(
-            /<([^>]+)>;\s*rel="next"/
+            /<([^<>]+)>;\s*rel="next"/
           ) || [])[1];
           return { value: normalizedResponse };
         } catch (error) {
@@ -32290,7 +34000,7 @@ paginateRest.VERSION = VERSION;
 
 /***/ }),
 
-/***/ 3418:
+/***/ 3607:
 /***/ ((module) => {
 
 
@@ -34459,7 +36169,7 @@ legacyRestEndpointMethods.VERSION = VERSION;
 
 /***/ }),
 
-/***/ 1023:
+/***/ 6242:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -34521,7 +36231,7 @@ var RequestError = class extends Error {
     if (options.request.headers.authorization) {
       requestCopy.headers = Object.assign({}, options.request.headers, {
         authorization: options.request.headers.authorization.replace(
-          / .*$/,
+          /(?<! ) .*$/,
           " [REDACTED]"
         )
       });
@@ -34556,7 +36266,7 @@ var RequestError = class extends Error {
 
 /***/ }),
 
-/***/ 4970:
+/***/ 8010:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -34584,11 +36294,11 @@ __export(dist_src_exports, {
   request: () => request
 });
 module.exports = __toCommonJS(dist_src_exports);
-var import_endpoint = __nccwpck_require__(794);
+var import_endpoint = __nccwpck_require__(1756);
 var import_universal_user_agent = __nccwpck_require__(5592);
 
 // pkg/dist-src/version.js
-var VERSION = "8.4.0";
+var VERSION = "8.4.1";
 
 // pkg/dist-src/is-plain-object.js
 function isPlainObject(value) {
@@ -34604,7 +36314,7 @@ function isPlainObject(value) {
 }
 
 // pkg/dist-src/fetch-wrapper.js
-var import_request_error = __nccwpck_require__(1023);
+var import_request_error = __nccwpck_require__(6242);
 
 // pkg/dist-src/get-buffer-response.js
 function getBufferResponse(response) {
@@ -34647,7 +36357,7 @@ function fetchWrapper(requestOptions) {
       headers[keyAndValue[0]] = keyAndValue[1];
     }
     if ("deprecation" in headers) {
-      const matches = headers.link && headers.link.match(/<([^>]+)>; rel="deprecation"/);
+      const matches = headers.link && headers.link.match(/<([^<>]+)>; rel="deprecation"/);
       const deprecationLink = matches && matches.pop();
       log.warn(
         `[@octokit/request] "${requestOptions.method} ${requestOptions.url}" is deprecated. It is scheduled to be removed on ${headers.sunset}${deprecationLink ? `. See ${deprecationLink}` : ""}`
@@ -34785,7 +36495,4903 @@ var request = withDefaults(import_endpoint.endpoint, {
 
 /***/ }),
 
-/***/ 2035:
+/***/ 3182:
+/***/ (function(__unused_webpack_module, exports) {
+
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ClientStreamingCall = void 0;
+/**
+ * A client streaming RPC call. This means that the clients sends 0, 1, or
+ * more messages to the server, and the server replies with exactly one
+ * message.
+ */
+class ClientStreamingCall {
+    constructor(method, requestHeaders, request, headers, response, status, trailers) {
+        this.method = method;
+        this.requestHeaders = requestHeaders;
+        this.requests = request;
+        this.headers = headers;
+        this.response = response;
+        this.status = status;
+        this.trailers = trailers;
+    }
+    /**
+     * Instead of awaiting the response status and trailers, you can
+     * just as well await this call itself to receive the server outcome.
+     * Note that it may still be valid to send more request messages.
+     */
+    then(onfulfilled, onrejected) {
+        return this.promiseFinished().then(value => onfulfilled ? Promise.resolve(onfulfilled(value)) : value, reason => onrejected ? Promise.resolve(onrejected(reason)) : Promise.reject(reason));
+    }
+    promiseFinished() {
+        return __awaiter(this, void 0, void 0, function* () {
+            let [headers, response, status, trailers] = yield Promise.all([this.headers, this.response, this.status, this.trailers]);
+            return {
+                method: this.method,
+                requestHeaders: this.requestHeaders,
+                headers,
+                response,
+                status,
+                trailers
+            };
+        });
+    }
+}
+exports.ClientStreamingCall = ClientStreamingCall;
+
+
+/***/ }),
+
+/***/ 2139:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.Deferred = exports.DeferredState = void 0;
+var DeferredState;
+(function (DeferredState) {
+    DeferredState[DeferredState["PENDING"] = 0] = "PENDING";
+    DeferredState[DeferredState["REJECTED"] = 1] = "REJECTED";
+    DeferredState[DeferredState["RESOLVED"] = 2] = "RESOLVED";
+})(DeferredState = exports.DeferredState || (exports.DeferredState = {}));
+/**
+ * A deferred promise. This is a "controller" for a promise, which lets you
+ * pass a promise around and reject or resolve it from the outside.
+ *
+ * Warning: This class is to be used with care. Using it can make code very
+ * difficult to read. It is intended for use in library code that exposes
+ * promises, not for regular business logic.
+ */
+class Deferred {
+    /**
+     * @param preventUnhandledRejectionWarning - prevents the warning
+     * "Unhandled Promise rejection" by adding a noop rejection handler.
+     * Working with calls returned from the runtime-rpc package in an
+     * async function usually means awaiting one call property after
+     * the other. This means that the "status" is not being awaited when
+     * an earlier await for the "headers" is rejected. This causes the
+     * "unhandled promise reject" warning. A more correct behaviour for
+     * calls might be to become aware whether at least one of the
+     * promises is handled and swallow the rejection warning for the
+     * others.
+     */
+    constructor(preventUnhandledRejectionWarning = true) {
+        this._state = DeferredState.PENDING;
+        this._promise = new Promise((resolve, reject) => {
+            this._resolve = resolve;
+            this._reject = reject;
+        });
+        if (preventUnhandledRejectionWarning) {
+            this._promise.catch(_ => { });
+        }
+    }
+    /**
+     * Get the current state of the promise.
+     */
+    get state() {
+        return this._state;
+    }
+    /**
+     * Get the deferred promise.
+     */
+    get promise() {
+        return this._promise;
+    }
+    /**
+     * Resolve the promise. Throws if the promise is already resolved or rejected.
+     */
+    resolve(value) {
+        if (this.state !== DeferredState.PENDING)
+            throw new Error(`cannot resolve ${DeferredState[this.state].toLowerCase()}`);
+        this._resolve(value);
+        this._state = DeferredState.RESOLVED;
+    }
+    /**
+     * Reject the promise. Throws if the promise is already resolved or rejected.
+     */
+    reject(reason) {
+        if (this.state !== DeferredState.PENDING)
+            throw new Error(`cannot reject ${DeferredState[this.state].toLowerCase()}`);
+        this._reject(reason);
+        this._state = DeferredState.REJECTED;
+    }
+    /**
+     * Resolve the promise. Ignore if not pending.
+     */
+    resolvePending(val) {
+        if (this._state === DeferredState.PENDING)
+            this.resolve(val);
+    }
+    /**
+     * Reject the promise. Ignore if not pending.
+     */
+    rejectPending(reason) {
+        if (this._state === DeferredState.PENDING)
+            this.reject(reason);
+    }
+}
+exports.Deferred = Deferred;
+
+
+/***/ }),
+
+/***/ 2691:
+/***/ (function(__unused_webpack_module, exports) {
+
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.DuplexStreamingCall = void 0;
+/**
+ * A duplex streaming RPC call. This means that the clients sends an
+ * arbitrary amount of messages to the server, while at the same time,
+ * the server sends an arbitrary amount of messages to the client.
+ */
+class DuplexStreamingCall {
+    constructor(method, requestHeaders, request, headers, response, status, trailers) {
+        this.method = method;
+        this.requestHeaders = requestHeaders;
+        this.requests = request;
+        this.headers = headers;
+        this.responses = response;
+        this.status = status;
+        this.trailers = trailers;
+    }
+    /**
+     * Instead of awaiting the response status and trailers, you can
+     * just as well await this call itself to receive the server outcome.
+     * Note that it may still be valid to send more request messages.
+     */
+    then(onfulfilled, onrejected) {
+        return this.promiseFinished().then(value => onfulfilled ? Promise.resolve(onfulfilled(value)) : value, reason => onrejected ? Promise.resolve(onrejected(reason)) : Promise.reject(reason));
+    }
+    promiseFinished() {
+        return __awaiter(this, void 0, void 0, function* () {
+            let [headers, status, trailers] = yield Promise.all([this.headers, this.status, this.trailers]);
+            return {
+                method: this.method,
+                requestHeaders: this.requestHeaders,
+                headers,
+                status,
+                trailers,
+            };
+        });
+    }
+}
+exports.DuplexStreamingCall = DuplexStreamingCall;
+
+
+/***/ }),
+
+/***/ 1730:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+// Public API of the rpc runtime.
+// Note: we do not use `export * from ...` to help tree shakers,
+// webpack verbose output hints that this should be useful
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+var service_type_1 = __nccwpck_require__(9281);
+Object.defineProperty(exports, "ServiceType", ({ enumerable: true, get: function () { return service_type_1.ServiceType; } }));
+var reflection_info_1 = __nccwpck_require__(9459);
+Object.defineProperty(exports, "readMethodOptions", ({ enumerable: true, get: function () { return reflection_info_1.readMethodOptions; } }));
+Object.defineProperty(exports, "readMethodOption", ({ enumerable: true, get: function () { return reflection_info_1.readMethodOption; } }));
+Object.defineProperty(exports, "readServiceOption", ({ enumerable: true, get: function () { return reflection_info_1.readServiceOption; } }));
+var rpc_error_1 = __nccwpck_require__(7391);
+Object.defineProperty(exports, "RpcError", ({ enumerable: true, get: function () { return rpc_error_1.RpcError; } }));
+var rpc_options_1 = __nccwpck_require__(452);
+Object.defineProperty(exports, "mergeRpcOptions", ({ enumerable: true, get: function () { return rpc_options_1.mergeRpcOptions; } }));
+var rpc_output_stream_1 = __nccwpck_require__(670);
+Object.defineProperty(exports, "RpcOutputStreamController", ({ enumerable: true, get: function () { return rpc_output_stream_1.RpcOutputStreamController; } }));
+var test_transport_1 = __nccwpck_require__(9569);
+Object.defineProperty(exports, "TestTransport", ({ enumerable: true, get: function () { return test_transport_1.TestTransport; } }));
+var deferred_1 = __nccwpck_require__(2139);
+Object.defineProperty(exports, "Deferred", ({ enumerable: true, get: function () { return deferred_1.Deferred; } }));
+Object.defineProperty(exports, "DeferredState", ({ enumerable: true, get: function () { return deferred_1.DeferredState; } }));
+var duplex_streaming_call_1 = __nccwpck_require__(2691);
+Object.defineProperty(exports, "DuplexStreamingCall", ({ enumerable: true, get: function () { return duplex_streaming_call_1.DuplexStreamingCall; } }));
+var client_streaming_call_1 = __nccwpck_require__(3182);
+Object.defineProperty(exports, "ClientStreamingCall", ({ enumerable: true, get: function () { return client_streaming_call_1.ClientStreamingCall; } }));
+var server_streaming_call_1 = __nccwpck_require__(7370);
+Object.defineProperty(exports, "ServerStreamingCall", ({ enumerable: true, get: function () { return server_streaming_call_1.ServerStreamingCall; } }));
+var unary_call_1 = __nccwpck_require__(8157);
+Object.defineProperty(exports, "UnaryCall", ({ enumerable: true, get: function () { return unary_call_1.UnaryCall; } }));
+var rpc_interceptor_1 = __nccwpck_require__(3854);
+Object.defineProperty(exports, "stackIntercept", ({ enumerable: true, get: function () { return rpc_interceptor_1.stackIntercept; } }));
+Object.defineProperty(exports, "stackDuplexStreamingInterceptors", ({ enumerable: true, get: function () { return rpc_interceptor_1.stackDuplexStreamingInterceptors; } }));
+Object.defineProperty(exports, "stackClientStreamingInterceptors", ({ enumerable: true, get: function () { return rpc_interceptor_1.stackClientStreamingInterceptors; } }));
+Object.defineProperty(exports, "stackServerStreamingInterceptors", ({ enumerable: true, get: function () { return rpc_interceptor_1.stackServerStreamingInterceptors; } }));
+Object.defineProperty(exports, "stackUnaryInterceptors", ({ enumerable: true, get: function () { return rpc_interceptor_1.stackUnaryInterceptors; } }));
+var server_call_context_1 = __nccwpck_require__(2017);
+Object.defineProperty(exports, "ServerCallContextController", ({ enumerable: true, get: function () { return server_call_context_1.ServerCallContextController; } }));
+
+
+/***/ }),
+
+/***/ 9459:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.readServiceOption = exports.readMethodOption = exports.readMethodOptions = exports.normalizeMethodInfo = void 0;
+const runtime_1 = __nccwpck_require__(7509);
+/**
+ * Turns PartialMethodInfo into MethodInfo.
+ */
+function normalizeMethodInfo(method, service) {
+    var _a, _b, _c;
+    let m = method;
+    m.service = service;
+    m.localName = (_a = m.localName) !== null && _a !== void 0 ? _a : runtime_1.lowerCamelCase(m.name);
+    // noinspection PointlessBooleanExpressionJS
+    m.serverStreaming = !!m.serverStreaming;
+    // noinspection PointlessBooleanExpressionJS
+    m.clientStreaming = !!m.clientStreaming;
+    m.options = (_b = m.options) !== null && _b !== void 0 ? _b : {};
+    m.idempotency = (_c = m.idempotency) !== null && _c !== void 0 ? _c : undefined;
+    return m;
+}
+exports.normalizeMethodInfo = normalizeMethodInfo;
+/**
+ * Read custom method options from a generated service client.
+ *
+ * @deprecated use readMethodOption()
+ */
+function readMethodOptions(service, methodName, extensionName, extensionType) {
+    var _a;
+    const options = (_a = service.methods.find((m, i) => m.localName === methodName || i === methodName)) === null || _a === void 0 ? void 0 : _a.options;
+    return options && options[extensionName] ? extensionType.fromJson(options[extensionName]) : undefined;
+}
+exports.readMethodOptions = readMethodOptions;
+function readMethodOption(service, methodName, extensionName, extensionType) {
+    var _a;
+    const options = (_a = service.methods.find((m, i) => m.localName === methodName || i === methodName)) === null || _a === void 0 ? void 0 : _a.options;
+    if (!options) {
+        return undefined;
+    }
+    const optionVal = options[extensionName];
+    if (optionVal === undefined) {
+        return optionVal;
+    }
+    return extensionType ? extensionType.fromJson(optionVal) : optionVal;
+}
+exports.readMethodOption = readMethodOption;
+function readServiceOption(service, extensionName, extensionType) {
+    const options = service.options;
+    if (!options) {
+        return undefined;
+    }
+    const optionVal = options[extensionName];
+    if (optionVal === undefined) {
+        return optionVal;
+    }
+    return extensionType ? extensionType.fromJson(optionVal) : optionVal;
+}
+exports.readServiceOption = readServiceOption;
+
+
+/***/ }),
+
+/***/ 7391:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.RpcError = void 0;
+/**
+ * An error that occurred while calling a RPC method.
+ */
+class RpcError extends Error {
+    constructor(message, code = 'UNKNOWN', meta) {
+        super(message);
+        this.name = 'RpcError';
+        // see https://www.typescriptlang.org/docs/handbook/release-notes/typescript-2-2.html#example
+        Object.setPrototypeOf(this, new.target.prototype);
+        this.code = code;
+        this.meta = meta !== null && meta !== void 0 ? meta : {};
+    }
+    toString() {
+        const l = [this.name + ': ' + this.message];
+        if (this.code) {
+            l.push('');
+            l.push('Code: ' + this.code);
+        }
+        if (this.serviceName && this.methodName) {
+            l.push('Method: ' + this.serviceName + '/' + this.methodName);
+        }
+        let m = Object.entries(this.meta);
+        if (m.length) {
+            l.push('');
+            l.push('Meta:');
+            for (let [k, v] of m) {
+                l.push(`  ${k}: ${v}`);
+            }
+        }
+        return l.join('\n');
+    }
+}
+exports.RpcError = RpcError;
+
+
+/***/ }),
+
+/***/ 3854:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.stackDuplexStreamingInterceptors = exports.stackClientStreamingInterceptors = exports.stackServerStreamingInterceptors = exports.stackUnaryInterceptors = exports.stackIntercept = void 0;
+const runtime_1 = __nccwpck_require__(7509);
+/**
+ * Creates a "stack" of of all interceptors specified in the given `RpcOptions`.
+ * Used by generated client implementations.
+ * @internal
+ */
+function stackIntercept(kind, transport, method, options, input) {
+    var _a, _b, _c, _d;
+    if (kind == "unary") {
+        let tail = (mtd, inp, opt) => transport.unary(mtd, inp, opt);
+        for (const curr of ((_a = options.interceptors) !== null && _a !== void 0 ? _a : []).filter(i => i.interceptUnary).reverse()) {
+            const next = tail;
+            tail = (mtd, inp, opt) => curr.interceptUnary(next, mtd, inp, opt);
+        }
+        return tail(method, input, options);
+    }
+    if (kind == "serverStreaming") {
+        let tail = (mtd, inp, opt) => transport.serverStreaming(mtd, inp, opt);
+        for (const curr of ((_b = options.interceptors) !== null && _b !== void 0 ? _b : []).filter(i => i.interceptServerStreaming).reverse()) {
+            const next = tail;
+            tail = (mtd, inp, opt) => curr.interceptServerStreaming(next, mtd, inp, opt);
+        }
+        return tail(method, input, options);
+    }
+    if (kind == "clientStreaming") {
+        let tail = (mtd, opt) => transport.clientStreaming(mtd, opt);
+        for (const curr of ((_c = options.interceptors) !== null && _c !== void 0 ? _c : []).filter(i => i.interceptClientStreaming).reverse()) {
+            const next = tail;
+            tail = (mtd, opt) => curr.interceptClientStreaming(next, mtd, opt);
+        }
+        return tail(method, options);
+    }
+    if (kind == "duplex") {
+        let tail = (mtd, opt) => transport.duplex(mtd, opt);
+        for (const curr of ((_d = options.interceptors) !== null && _d !== void 0 ? _d : []).filter(i => i.interceptDuplex).reverse()) {
+            const next = tail;
+            tail = (mtd, opt) => curr.interceptDuplex(next, mtd, opt);
+        }
+        return tail(method, options);
+    }
+    runtime_1.assertNever(kind);
+}
+exports.stackIntercept = stackIntercept;
+/**
+ * @deprecated replaced by `stackIntercept()`, still here to support older generated code
+ */
+function stackUnaryInterceptors(transport, method, input, options) {
+    return stackIntercept("unary", transport, method, options, input);
+}
+exports.stackUnaryInterceptors = stackUnaryInterceptors;
+/**
+ * @deprecated replaced by `stackIntercept()`, still here to support older generated code
+ */
+function stackServerStreamingInterceptors(transport, method, input, options) {
+    return stackIntercept("serverStreaming", transport, method, options, input);
+}
+exports.stackServerStreamingInterceptors = stackServerStreamingInterceptors;
+/**
+ * @deprecated replaced by `stackIntercept()`, still here to support older generated code
+ */
+function stackClientStreamingInterceptors(transport, method, options) {
+    return stackIntercept("clientStreaming", transport, method, options);
+}
+exports.stackClientStreamingInterceptors = stackClientStreamingInterceptors;
+/**
+ * @deprecated replaced by `stackIntercept()`, still here to support older generated code
+ */
+function stackDuplexStreamingInterceptors(transport, method, options) {
+    return stackIntercept("duplex", transport, method, options);
+}
+exports.stackDuplexStreamingInterceptors = stackDuplexStreamingInterceptors;
+
+
+/***/ }),
+
+/***/ 452:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.mergeRpcOptions = void 0;
+const runtime_1 = __nccwpck_require__(7509);
+/**
+ * Merges custom RPC options with defaults. Returns a new instance and keeps
+ * the "defaults" and the "options" unmodified.
+ *
+ * Merges `RpcMetadata` "meta", overwriting values from "defaults" with
+ * values from "options". Does not append values to existing entries.
+ *
+ * Merges "jsonOptions", including "jsonOptions.typeRegistry", by creating
+ * a new array that contains types from "options.jsonOptions.typeRegistry"
+ * first, then types from "defaults.jsonOptions.typeRegistry".
+ *
+ * Merges "binaryOptions".
+ *
+ * Merges "interceptors" by creating a new array that contains interceptors
+ * from "defaults" first, then interceptors from "options".
+ *
+ * Works with objects that extend `RpcOptions`, but only if the added
+ * properties are of type Date, primitive like string, boolean, or Array
+ * of primitives. If you have other property types, you have to merge them
+ * yourself.
+ */
+function mergeRpcOptions(defaults, options) {
+    if (!options)
+        return defaults;
+    let o = {};
+    copy(defaults, o);
+    copy(options, o);
+    for (let key of Object.keys(options)) {
+        let val = options[key];
+        switch (key) {
+            case "jsonOptions":
+                o.jsonOptions = runtime_1.mergeJsonOptions(defaults.jsonOptions, o.jsonOptions);
+                break;
+            case "binaryOptions":
+                o.binaryOptions = runtime_1.mergeBinaryOptions(defaults.binaryOptions, o.binaryOptions);
+                break;
+            case "meta":
+                o.meta = {};
+                copy(defaults.meta, o.meta);
+                copy(options.meta, o.meta);
+                break;
+            case "interceptors":
+                o.interceptors = defaults.interceptors ? defaults.interceptors.concat(val) : val.concat();
+                break;
+        }
+    }
+    return o;
+}
+exports.mergeRpcOptions = mergeRpcOptions;
+function copy(a, into) {
+    if (!a)
+        return;
+    let c = into;
+    for (let [k, v] of Object.entries(a)) {
+        if (v instanceof Date)
+            c[k] = new Date(v.getTime());
+        else if (Array.isArray(v))
+            c[k] = v.concat();
+        else
+            c[k] = v;
+    }
+}
+
+
+/***/ }),
+
+/***/ 670:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.RpcOutputStreamController = void 0;
+const deferred_1 = __nccwpck_require__(2139);
+const runtime_1 = __nccwpck_require__(7509);
+/**
+ * A `RpcOutputStream` that you control.
+ */
+class RpcOutputStreamController {
+    constructor() {
+        this._lis = {
+            nxt: [],
+            msg: [],
+            err: [],
+            cmp: [],
+        };
+        this._closed = false;
+    }
+    // --- RpcOutputStream callback API
+    onNext(callback) {
+        return this.addLis(callback, this._lis.nxt);
+    }
+    onMessage(callback) {
+        return this.addLis(callback, this._lis.msg);
+    }
+    onError(callback) {
+        return this.addLis(callback, this._lis.err);
+    }
+    onComplete(callback) {
+        return this.addLis(callback, this._lis.cmp);
+    }
+    addLis(callback, list) {
+        list.push(callback);
+        return () => {
+            let i = list.indexOf(callback);
+            if (i >= 0)
+                list.splice(i, 1);
+        };
+    }
+    // remove all listeners
+    clearLis() {
+        for (let l of Object.values(this._lis))
+            l.splice(0, l.length);
+    }
+    // --- Controller API
+    /**
+     * Is this stream already closed by a completion or error?
+     */
+    get closed() {
+        return this._closed !== false;
+    }
+    /**
+     * Emit message, close with error, or close successfully, but only one
+     * at a time.
+     * Can be used to wrap a stream by using the other stream's `onNext`.
+     */
+    notifyNext(message, error, complete) {
+        runtime_1.assert((message ? 1 : 0) + (error ? 1 : 0) + (complete ? 1 : 0) <= 1, 'only one emission at a time');
+        if (message)
+            this.notifyMessage(message);
+        if (error)
+            this.notifyError(error);
+        if (complete)
+            this.notifyComplete();
+    }
+    /**
+     * Emits a new message. Throws if stream is closed.
+     *
+     * Triggers onNext and onMessage callbacks.
+     */
+    notifyMessage(message) {
+        runtime_1.assert(!this.closed, 'stream is closed');
+        this.pushIt({ value: message, done: false });
+        this._lis.msg.forEach(l => l(message));
+        this._lis.nxt.forEach(l => l(message, undefined, false));
+    }
+    /**
+     * Closes the stream with an error. Throws if stream is closed.
+     *
+     * Triggers onNext and onError callbacks.
+     */
+    notifyError(error) {
+        runtime_1.assert(!this.closed, 'stream is closed');
+        this._closed = error;
+        this.pushIt(error);
+        this._lis.err.forEach(l => l(error));
+        this._lis.nxt.forEach(l => l(undefined, error, false));
+        this.clearLis();
+    }
+    /**
+     * Closes the stream successfully. Throws if stream is closed.
+     *
+     * Triggers onNext and onComplete callbacks.
+     */
+    notifyComplete() {
+        runtime_1.assert(!this.closed, 'stream is closed');
+        this._closed = true;
+        this.pushIt({ value: null, done: true });
+        this._lis.cmp.forEach(l => l());
+        this._lis.nxt.forEach(l => l(undefined, undefined, true));
+        this.clearLis();
+    }
+    /**
+     * Creates an async iterator (that can be used with `for await {...}`)
+     * to consume the stream.
+     *
+     * Some things to note:
+     * - If an error occurs, the `for await` will throw it.
+     * - If an error occurred before the `for await` was started, `for await`
+     *   will re-throw it.
+     * - If the stream is already complete, the `for await` will be empty.
+     * - If your `for await` consumes slower than the stream produces,
+     *   for example because you are relaying messages in a slow operation,
+     *   messages are queued.
+     */
+    [Symbol.asyncIterator]() {
+        // init the iterator state, enabling pushIt()
+        if (!this._itState) {
+            this._itState = { q: [] };
+        }
+        // if we are closed, we are definitely not receiving any more messages.
+        // but we can't let the iterator get stuck. we want to either:
+        // a) finish the new iterator immediately, because we are completed
+        // b) reject the new iterator, because we errored
+        if (this._closed === true)
+            this.pushIt({ value: null, done: true });
+        else if (this._closed !== false)
+            this.pushIt(this._closed);
+        // the async iterator
+        return {
+            next: () => {
+                let state = this._itState;
+                runtime_1.assert(state, "bad state"); // if we don't have a state here, code is broken
+                // there should be no pending result.
+                // did the consumer call next() before we resolved our previous result promise?
+                runtime_1.assert(!state.p, "iterator contract broken");
+                // did we produce faster than the iterator consumed?
+                // return the oldest result from the queue.
+                let first = state.q.shift();
+                if (first)
+                    return ("value" in first) ? Promise.resolve(first) : Promise.reject(first);
+                // we have no result ATM, but we promise one.
+                // as soon as we have a result, we must resolve promise.
+                state.p = new deferred_1.Deferred();
+                return state.p.promise;
+            },
+        };
+    }
+    // "push" a new iterator result.
+    // this either resolves a pending promise, or enqueues the result.
+    pushIt(result) {
+        let state = this._itState;
+        if (!state)
+            return;
+        // is the consumer waiting for us?
+        if (state.p) {
+            // yes, consumer is waiting for this promise.
+            const p = state.p;
+            runtime_1.assert(p.state == deferred_1.DeferredState.PENDING, "iterator contract broken");
+            // resolve the promise
+            ("value" in result) ? p.resolve(result) : p.reject(result);
+            // must cleanup, otherwise iterator.next() would pick it up again.
+            delete state.p;
+        }
+        else {
+            // we are producing faster than the iterator consumes.
+            // push result onto queue.
+            state.q.push(result);
+        }
+    }
+}
+exports.RpcOutputStreamController = RpcOutputStreamController;
+
+
+/***/ }),
+
+/***/ 2017:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ServerCallContextController = void 0;
+class ServerCallContextController {
+    constructor(method, headers, deadline, sendResponseHeadersFn, defaultStatus = { code: 'OK', detail: '' }) {
+        this._cancelled = false;
+        this._listeners = [];
+        this.method = method;
+        this.headers = headers;
+        this.deadline = deadline;
+        this.trailers = {};
+        this._sendRH = sendResponseHeadersFn;
+        this.status = defaultStatus;
+    }
+    /**
+     * Set the call cancelled.
+     *
+     * Invokes all callbacks registered with onCancel() and
+     * sets `cancelled = true`.
+     */
+    notifyCancelled() {
+        if (!this._cancelled) {
+            this._cancelled = true;
+            for (let l of this._listeners) {
+                l();
+            }
+        }
+    }
+    /**
+     * Send response headers.
+     */
+    sendResponseHeaders(data) {
+        this._sendRH(data);
+    }
+    /**
+     * Is the call cancelled?
+     *
+     * When the client closes the connection before the server
+     * is done, the call is cancelled.
+     *
+     * If you want to cancel a request on the server, throw a
+     * RpcError with the CANCELLED status code.
+     */
+    get cancelled() {
+        return this._cancelled;
+    }
+    /**
+     * Add a callback for cancellation.
+     */
+    onCancel(callback) {
+        const l = this._listeners;
+        l.push(callback);
+        return () => {
+            let i = l.indexOf(callback);
+            if (i >= 0)
+                l.splice(i, 1);
+        };
+    }
+}
+exports.ServerCallContextController = ServerCallContextController;
+
+
+/***/ }),
+
+/***/ 7370:
+/***/ (function(__unused_webpack_module, exports) {
+
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ServerStreamingCall = void 0;
+/**
+ * A server streaming RPC call. The client provides exactly one input message
+ * but the server may respond with 0, 1, or more messages.
+ */
+class ServerStreamingCall {
+    constructor(method, requestHeaders, request, headers, response, status, trailers) {
+        this.method = method;
+        this.requestHeaders = requestHeaders;
+        this.request = request;
+        this.headers = headers;
+        this.responses = response;
+        this.status = status;
+        this.trailers = trailers;
+    }
+    /**
+     * Instead of awaiting the response status and trailers, you can
+     * just as well await this call itself to receive the server outcome.
+     * You should first setup some listeners to the `request` to
+     * see the actual messages the server replied with.
+     */
+    then(onfulfilled, onrejected) {
+        return this.promiseFinished().then(value => onfulfilled ? Promise.resolve(onfulfilled(value)) : value, reason => onrejected ? Promise.resolve(onrejected(reason)) : Promise.reject(reason));
+    }
+    promiseFinished() {
+        return __awaiter(this, void 0, void 0, function* () {
+            let [headers, status, trailers] = yield Promise.all([this.headers, this.status, this.trailers]);
+            return {
+                method: this.method,
+                requestHeaders: this.requestHeaders,
+                request: this.request,
+                headers,
+                status,
+                trailers,
+            };
+        });
+    }
+}
+exports.ServerStreamingCall = ServerStreamingCall;
+
+
+/***/ }),
+
+/***/ 9281:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ServiceType = void 0;
+const reflection_info_1 = __nccwpck_require__(9459);
+class ServiceType {
+    constructor(typeName, methods, options) {
+        this.typeName = typeName;
+        this.methods = methods.map(i => reflection_info_1.normalizeMethodInfo(i, this));
+        this.options = options !== null && options !== void 0 ? options : {};
+    }
+}
+exports.ServiceType = ServiceType;
+
+
+/***/ }),
+
+/***/ 9569:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.TestTransport = void 0;
+const rpc_error_1 = __nccwpck_require__(7391);
+const runtime_1 = __nccwpck_require__(7509);
+const rpc_output_stream_1 = __nccwpck_require__(670);
+const rpc_options_1 = __nccwpck_require__(452);
+const unary_call_1 = __nccwpck_require__(8157);
+const server_streaming_call_1 = __nccwpck_require__(7370);
+const client_streaming_call_1 = __nccwpck_require__(3182);
+const duplex_streaming_call_1 = __nccwpck_require__(2691);
+/**
+ * Transport for testing.
+ */
+class TestTransport {
+    /**
+     * Initialize with mock data. Omitted fields have default value.
+     */
+    constructor(data) {
+        /**
+         * Suppress warning / error about uncaught rejections of
+         * "status" and "trailers".
+         */
+        this.suppressUncaughtRejections = true;
+        this.headerDelay = 10;
+        this.responseDelay = 50;
+        this.betweenResponseDelay = 10;
+        this.afterResponseDelay = 10;
+        this.data = data !== null && data !== void 0 ? data : {};
+    }
+    /**
+     * Sent message(s) during the last operation.
+     */
+    get sentMessages() {
+        if (this.lastInput instanceof TestInputStream) {
+            return this.lastInput.sent;
+        }
+        else if (typeof this.lastInput == "object") {
+            return [this.lastInput.single];
+        }
+        return [];
+    }
+    /**
+     * Sending message(s) completed?
+     */
+    get sendComplete() {
+        if (this.lastInput instanceof TestInputStream) {
+            return this.lastInput.completed;
+        }
+        else if (typeof this.lastInput == "object") {
+            return true;
+        }
+        return false;
+    }
+    // Creates a promise for response headers from the mock data.
+    promiseHeaders() {
+        var _a;
+        const headers = (_a = this.data.headers) !== null && _a !== void 0 ? _a : TestTransport.defaultHeaders;
+        return headers instanceof rpc_error_1.RpcError
+            ? Promise.reject(headers)
+            : Promise.resolve(headers);
+    }
+    // Creates a promise for a single, valid, message from the mock data.
+    promiseSingleResponse(method) {
+        if (this.data.response instanceof rpc_error_1.RpcError) {
+            return Promise.reject(this.data.response);
+        }
+        let r;
+        if (Array.isArray(this.data.response)) {
+            runtime_1.assert(this.data.response.length > 0);
+            r = this.data.response[0];
+        }
+        else if (this.data.response !== undefined) {
+            r = this.data.response;
+        }
+        else {
+            r = method.O.create();
+        }
+        runtime_1.assert(method.O.is(r));
+        return Promise.resolve(r);
+    }
+    /**
+     * Pushes response messages from the mock data to the output stream.
+     * If an error response, status or trailers are mocked, the stream is
+     * closed with the respective error.
+     * Otherwise, stream is completed successfully.
+     *
+     * The returned promise resolves when the stream is closed. It should
+     * not reject. If it does, code is broken.
+     */
+    streamResponses(method, stream, abort) {
+        return __awaiter(this, void 0, void 0, function* () {
+            // normalize "data.response" into an array of valid output messages
+            const messages = [];
+            if (this.data.response === undefined) {
+                messages.push(method.O.create());
+            }
+            else if (Array.isArray(this.data.response)) {
+                for (let msg of this.data.response) {
+                    runtime_1.assert(method.O.is(msg));
+                    messages.push(msg);
+                }
+            }
+            else if (!(this.data.response instanceof rpc_error_1.RpcError)) {
+                runtime_1.assert(method.O.is(this.data.response));
+                messages.push(this.data.response);
+            }
+            // start the stream with an initial delay.
+            // if the request is cancelled, notify() error and exit.
+            try {
+                yield delay(this.responseDelay, abort)(undefined);
+            }
+            catch (error) {
+                stream.notifyError(error);
+                return;
+            }
+            // if error response was mocked, notify() error (stream is now closed with error) and exit.
+            if (this.data.response instanceof rpc_error_1.RpcError) {
+                stream.notifyError(this.data.response);
+                return;
+            }
+            // regular response messages were mocked. notify() them.
+            for (let msg of messages) {
+                stream.notifyMessage(msg);
+                // add a short delay between responses
+                // if the request is cancelled, notify() error and exit.
+                try {
+                    yield delay(this.betweenResponseDelay, abort)(undefined);
+                }
+                catch (error) {
+                    stream.notifyError(error);
+                    return;
+                }
+            }
+            // error status was mocked, notify() error (stream is now closed with error) and exit.
+            if (this.data.status instanceof rpc_error_1.RpcError) {
+                stream.notifyError(this.data.status);
+                return;
+            }
+            // error trailers were mocked, notify() error (stream is now closed with error) and exit.
+            if (this.data.trailers instanceof rpc_error_1.RpcError) {
+                stream.notifyError(this.data.trailers);
+                return;
+            }
+            // stream completed successfully
+            stream.notifyComplete();
+        });
+    }
+    // Creates a promise for response status from the mock data.
+    promiseStatus() {
+        var _a;
+        const status = (_a = this.data.status) !== null && _a !== void 0 ? _a : TestTransport.defaultStatus;
+        return status instanceof rpc_error_1.RpcError
+            ? Promise.reject(status)
+            : Promise.resolve(status);
+    }
+    // Creates a promise for response trailers from the mock data.
+    promiseTrailers() {
+        var _a;
+        const trailers = (_a = this.data.trailers) !== null && _a !== void 0 ? _a : TestTransport.defaultTrailers;
+        return trailers instanceof rpc_error_1.RpcError
+            ? Promise.reject(trailers)
+            : Promise.resolve(trailers);
+    }
+    maybeSuppressUncaught(...promise) {
+        if (this.suppressUncaughtRejections) {
+            for (let p of promise) {
+                p.catch(() => {
+                });
+            }
+        }
+    }
+    mergeOptions(options) {
+        return rpc_options_1.mergeRpcOptions({}, options);
+    }
+    unary(method, input, options) {
+        var _a;
+        const requestHeaders = (_a = options.meta) !== null && _a !== void 0 ? _a : {}, headersPromise = this.promiseHeaders()
+            .then(delay(this.headerDelay, options.abort)), responsePromise = headersPromise
+            .catch(_ => {
+        })
+            .then(delay(this.responseDelay, options.abort))
+            .then(_ => this.promiseSingleResponse(method)), statusPromise = responsePromise
+            .catch(_ => {
+        })
+            .then(delay(this.afterResponseDelay, options.abort))
+            .then(_ => this.promiseStatus()), trailersPromise = responsePromise
+            .catch(_ => {
+        })
+            .then(delay(this.afterResponseDelay, options.abort))
+            .then(_ => this.promiseTrailers());
+        this.maybeSuppressUncaught(statusPromise, trailersPromise);
+        this.lastInput = { single: input };
+        return new unary_call_1.UnaryCall(method, requestHeaders, input, headersPromise, responsePromise, statusPromise, trailersPromise);
+    }
+    serverStreaming(method, input, options) {
+        var _a;
+        const requestHeaders = (_a = options.meta) !== null && _a !== void 0 ? _a : {}, headersPromise = this.promiseHeaders()
+            .then(delay(this.headerDelay, options.abort)), outputStream = new rpc_output_stream_1.RpcOutputStreamController(), responseStreamClosedPromise = headersPromise
+            .then(delay(this.responseDelay, options.abort))
+            .catch(() => {
+        })
+            .then(() => this.streamResponses(method, outputStream, options.abort))
+            .then(delay(this.afterResponseDelay, options.abort)), statusPromise = responseStreamClosedPromise
+            .then(() => this.promiseStatus()), trailersPromise = responseStreamClosedPromise
+            .then(() => this.promiseTrailers());
+        this.maybeSuppressUncaught(statusPromise, trailersPromise);
+        this.lastInput = { single: input };
+        return new server_streaming_call_1.ServerStreamingCall(method, requestHeaders, input, headersPromise, outputStream, statusPromise, trailersPromise);
+    }
+    clientStreaming(method, options) {
+        var _a;
+        const requestHeaders = (_a = options.meta) !== null && _a !== void 0 ? _a : {}, headersPromise = this.promiseHeaders()
+            .then(delay(this.headerDelay, options.abort)), responsePromise = headersPromise
+            .catch(_ => {
+        })
+            .then(delay(this.responseDelay, options.abort))
+            .then(_ => this.promiseSingleResponse(method)), statusPromise = responsePromise
+            .catch(_ => {
+        })
+            .then(delay(this.afterResponseDelay, options.abort))
+            .then(_ => this.promiseStatus()), trailersPromise = responsePromise
+            .catch(_ => {
+        })
+            .then(delay(this.afterResponseDelay, options.abort))
+            .then(_ => this.promiseTrailers());
+        this.maybeSuppressUncaught(statusPromise, trailersPromise);
+        this.lastInput = new TestInputStream(this.data, options.abort);
+        return new client_streaming_call_1.ClientStreamingCall(method, requestHeaders, this.lastInput, headersPromise, responsePromise, statusPromise, trailersPromise);
+    }
+    duplex(method, options) {
+        var _a;
+        const requestHeaders = (_a = options.meta) !== null && _a !== void 0 ? _a : {}, headersPromise = this.promiseHeaders()
+            .then(delay(this.headerDelay, options.abort)), outputStream = new rpc_output_stream_1.RpcOutputStreamController(), responseStreamClosedPromise = headersPromise
+            .then(delay(this.responseDelay, options.abort))
+            .catch(() => {
+        })
+            .then(() => this.streamResponses(method, outputStream, options.abort))
+            .then(delay(this.afterResponseDelay, options.abort)), statusPromise = responseStreamClosedPromise
+            .then(() => this.promiseStatus()), trailersPromise = responseStreamClosedPromise
+            .then(() => this.promiseTrailers());
+        this.maybeSuppressUncaught(statusPromise, trailersPromise);
+        this.lastInput = new TestInputStream(this.data, options.abort);
+        return new duplex_streaming_call_1.DuplexStreamingCall(method, requestHeaders, this.lastInput, headersPromise, outputStream, statusPromise, trailersPromise);
+    }
+}
+exports.TestTransport = TestTransport;
+TestTransport.defaultHeaders = {
+    responseHeader: "test"
+};
+TestTransport.defaultStatus = {
+    code: "OK", detail: "all good"
+};
+TestTransport.defaultTrailers = {
+    responseTrailer: "test"
+};
+function delay(ms, abort) {
+    return (v) => new Promise((resolve, reject) => {
+        if (abort === null || abort === void 0 ? void 0 : abort.aborted) {
+            reject(new rpc_error_1.RpcError("user cancel", "CANCELLED"));
+        }
+        else {
+            const id = setTimeout(() => resolve(v), ms);
+            if (abort) {
+                abort.addEventListener("abort", ev => {
+                    clearTimeout(id);
+                    reject(new rpc_error_1.RpcError("user cancel", "CANCELLED"));
+                });
+            }
+        }
+    });
+}
+class TestInputStream {
+    constructor(data, abort) {
+        this._completed = false;
+        this._sent = [];
+        this.data = data;
+        this.abort = abort;
+    }
+    get sent() {
+        return this._sent;
+    }
+    get completed() {
+        return this._completed;
+    }
+    send(message) {
+        if (this.data.inputMessage instanceof rpc_error_1.RpcError) {
+            return Promise.reject(this.data.inputMessage);
+        }
+        const delayMs = this.data.inputMessage === undefined
+            ? 10
+            : this.data.inputMessage;
+        return Promise.resolve(undefined)
+            .then(() => {
+            this._sent.push(message);
+        })
+            .then(delay(delayMs, this.abort));
+    }
+    complete() {
+        if (this.data.inputComplete instanceof rpc_error_1.RpcError) {
+            return Promise.reject(this.data.inputComplete);
+        }
+        const delayMs = this.data.inputComplete === undefined
+            ? 10
+            : this.data.inputComplete;
+        return Promise.resolve(undefined)
+            .then(() => {
+            this._completed = true;
+        })
+            .then(delay(delayMs, this.abort));
+    }
+}
+
+
+/***/ }),
+
+/***/ 8157:
+/***/ (function(__unused_webpack_module, exports) {
+
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.UnaryCall = void 0;
+/**
+ * A unary RPC call. Unary means there is exactly one input message and
+ * exactly one output message unless an error occurred.
+ */
+class UnaryCall {
+    constructor(method, requestHeaders, request, headers, response, status, trailers) {
+        this.method = method;
+        this.requestHeaders = requestHeaders;
+        this.request = request;
+        this.headers = headers;
+        this.response = response;
+        this.status = status;
+        this.trailers = trailers;
+    }
+    /**
+     * If you are only interested in the final outcome of this call,
+     * you can await it to receive a `FinishedUnaryCall`.
+     */
+    then(onfulfilled, onrejected) {
+        return this.promiseFinished().then(value => onfulfilled ? Promise.resolve(onfulfilled(value)) : value, reason => onrejected ? Promise.resolve(onrejected(reason)) : Promise.reject(reason));
+    }
+    promiseFinished() {
+        return __awaiter(this, void 0, void 0, function* () {
+            let [headers, response, status, trailers] = yield Promise.all([this.headers, this.response, this.status, this.trailers]);
+            return {
+                method: this.method,
+                requestHeaders: this.requestHeaders,
+                request: this.request,
+                headers,
+                response,
+                status,
+                trailers
+            };
+        });
+    }
+}
+exports.UnaryCall = UnaryCall;
+
+
+/***/ }),
+
+/***/ 1651:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.assertFloat32 = exports.assertUInt32 = exports.assertInt32 = exports.assertNever = exports.assert = void 0;
+/**
+ * assert that condition is true or throw error (with message)
+ */
+function assert(condition, msg) {
+    if (!condition) {
+        throw new Error(msg);
+    }
+}
+exports.assert = assert;
+/**
+ * assert that value cannot exist = type `never`. throw runtime error if it does.
+ */
+function assertNever(value, msg) {
+    throw new Error(msg !== null && msg !== void 0 ? msg : 'Unexpected object: ' + value);
+}
+exports.assertNever = assertNever;
+const FLOAT32_MAX = 3.4028234663852886e+38, FLOAT32_MIN = -3.4028234663852886e+38, UINT32_MAX = 0xFFFFFFFF, INT32_MAX = 0X7FFFFFFF, INT32_MIN = -0X80000000;
+function assertInt32(arg) {
+    if (typeof arg !== "number")
+        throw new Error('invalid int 32: ' + typeof arg);
+    if (!Number.isInteger(arg) || arg > INT32_MAX || arg < INT32_MIN)
+        throw new Error('invalid int 32: ' + arg);
+}
+exports.assertInt32 = assertInt32;
+function assertUInt32(arg) {
+    if (typeof arg !== "number")
+        throw new Error('invalid uint 32: ' + typeof arg);
+    if (!Number.isInteger(arg) || arg > UINT32_MAX || arg < 0)
+        throw new Error('invalid uint 32: ' + arg);
+}
+exports.assertUInt32 = assertUInt32;
+function assertFloat32(arg) {
+    if (typeof arg !== "number")
+        throw new Error('invalid float 32: ' + typeof arg);
+    if (!Number.isFinite(arg))
+        return;
+    if (arg > FLOAT32_MAX || arg < FLOAT32_MIN)
+        throw new Error('invalid float 32: ' + arg);
+}
+exports.assertFloat32 = assertFloat32;
+
+
+/***/ }),
+
+/***/ 5553:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.base64encode = exports.base64decode = void 0;
+// lookup table from base64 character to byte
+let encTable = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.split('');
+// lookup table from base64 character *code* to byte because lookup by number is fast
+let decTable = [];
+for (let i = 0; i < encTable.length; i++)
+    decTable[encTable[i].charCodeAt(0)] = i;
+// support base64url variants
+decTable["-".charCodeAt(0)] = encTable.indexOf("+");
+decTable["_".charCodeAt(0)] = encTable.indexOf("/");
+/**
+ * Decodes a base64 string to a byte array.
+ *
+ * - ignores white-space, including line breaks and tabs
+ * - allows inner padding (can decode concatenated base64 strings)
+ * - does not require padding
+ * - understands base64url encoding:
+ *   "-" instead of "+",
+ *   "_" instead of "/",
+ *   no padding
+ */
+function base64decode(base64Str) {
+    // estimate byte size, not accounting for inner padding and whitespace
+    let es = base64Str.length * 3 / 4;
+    // if (es % 3 !== 0)
+    // throw new Error('invalid base64 string');
+    if (base64Str[base64Str.length - 2] == '=')
+        es -= 2;
+    else if (base64Str[base64Str.length - 1] == '=')
+        es -= 1;
+    let bytes = new Uint8Array(es), bytePos = 0, // position in byte array
+    groupPos = 0, // position in base64 group
+    b, // current byte
+    p = 0 // previous byte
+    ;
+    for (let i = 0; i < base64Str.length; i++) {
+        b = decTable[base64Str.charCodeAt(i)];
+        if (b === undefined) {
+            // noinspection FallThroughInSwitchStatementJS
+            switch (base64Str[i]) {
+                case '=':
+                    groupPos = 0; // reset state when padding found
+                case '\n':
+                case '\r':
+                case '\t':
+                case ' ':
+                    continue; // skip white-space, and padding
+                default:
+                    throw Error(`invalid base64 string.`);
+            }
+        }
+        switch (groupPos) {
+            case 0:
+                p = b;
+                groupPos = 1;
+                break;
+            case 1:
+                bytes[bytePos++] = p << 2 | (b & 48) >> 4;
+                p = b;
+                groupPos = 2;
+                break;
+            case 2:
+                bytes[bytePos++] = (p & 15) << 4 | (b & 60) >> 2;
+                p = b;
+                groupPos = 3;
+                break;
+            case 3:
+                bytes[bytePos++] = (p & 3) << 6 | b;
+                groupPos = 0;
+                break;
+        }
+    }
+    if (groupPos == 1)
+        throw Error(`invalid base64 string.`);
+    return bytes.subarray(0, bytePos);
+}
+exports.base64decode = base64decode;
+/**
+ * Encodes a byte array to a base64 string.
+ * Adds padding at the end.
+ * Does not insert newlines.
+ */
+function base64encode(bytes) {
+    let base64 = '', groupPos = 0, // position in base64 group
+    b, // current byte
+    p = 0; // carry over from previous byte
+    for (let i = 0; i < bytes.length; i++) {
+        b = bytes[i];
+        switch (groupPos) {
+            case 0:
+                base64 += encTable[b >> 2];
+                p = (b & 3) << 4;
+                groupPos = 1;
+                break;
+            case 1:
+                base64 += encTable[p | b >> 4];
+                p = (b & 15) << 2;
+                groupPos = 2;
+                break;
+            case 2:
+                base64 += encTable[p | b >> 6];
+                base64 += encTable[b & 63];
+                groupPos = 0;
+                break;
+        }
+    }
+    // padding required?
+    if (groupPos) {
+        base64 += encTable[p];
+        base64 += '=';
+        if (groupPos == 1)
+            base64 += '=';
+    }
+    return base64;
+}
+exports.base64encode = base64encode;
+
+
+/***/ }),
+
+/***/ 12:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.WireType = exports.mergeBinaryOptions = exports.UnknownFieldHandler = void 0;
+/**
+ * This handler implements the default behaviour for unknown fields.
+ * When reading data, unknown fields are stored on the message, in a
+ * symbol property.
+ * When writing data, the symbol property is queried and unknown fields
+ * are serialized into the output again.
+ */
+var UnknownFieldHandler;
+(function (UnknownFieldHandler) {
+    /**
+     * The symbol used to store unknown fields for a message.
+     * The property must conform to `UnknownFieldContainer`.
+     */
+    UnknownFieldHandler.symbol = Symbol.for("protobuf-ts/unknown");
+    /**
+     * Store an unknown field during binary read directly on the message.
+     * This method is compatible with `BinaryReadOptions.readUnknownField`.
+     */
+    UnknownFieldHandler.onRead = (typeName, message, fieldNo, wireType, data) => {
+        let container = is(message) ? message[UnknownFieldHandler.symbol] : message[UnknownFieldHandler.symbol] = [];
+        container.push({ no: fieldNo, wireType, data });
+    };
+    /**
+     * Write unknown fields stored for the message to the writer.
+     * This method is compatible with `BinaryWriteOptions.writeUnknownFields`.
+     */
+    UnknownFieldHandler.onWrite = (typeName, message, writer) => {
+        for (let { no, wireType, data } of UnknownFieldHandler.list(message))
+            writer.tag(no, wireType).raw(data);
+    };
+    /**
+     * List unknown fields stored for the message.
+     * Note that there may be multiples fields with the same number.
+     */
+    UnknownFieldHandler.list = (message, fieldNo) => {
+        if (is(message)) {
+            let all = message[UnknownFieldHandler.symbol];
+            return fieldNo ? all.filter(uf => uf.no == fieldNo) : all;
+        }
+        return [];
+    };
+    /**
+     * Returns the last unknown field by field number.
+     */
+    UnknownFieldHandler.last = (message, fieldNo) => UnknownFieldHandler.list(message, fieldNo).slice(-1)[0];
+    const is = (message) => message && Array.isArray(message[UnknownFieldHandler.symbol]);
+})(UnknownFieldHandler = exports.UnknownFieldHandler || (exports.UnknownFieldHandler = {}));
+/**
+ * Merges binary write or read options. Later values override earlier values.
+ */
+function mergeBinaryOptions(a, b) {
+    return Object.assign(Object.assign({}, a), b);
+}
+exports.mergeBinaryOptions = mergeBinaryOptions;
+/**
+ * Protobuf binary format wire types.
+ *
+ * A wire type provides just enough information to find the length of the
+ * following value.
+ *
+ * See https://developers.google.com/protocol-buffers/docs/encoding#structure
+ */
+var WireType;
+(function (WireType) {
+    /**
+     * Used for int32, int64, uint32, uint64, sint32, sint64, bool, enum
+     */
+    WireType[WireType["Varint"] = 0] = "Varint";
+    /**
+     * Used for fixed64, sfixed64, double.
+     * Always 8 bytes with little-endian byte order.
+     */
+    WireType[WireType["Bit64"] = 1] = "Bit64";
+    /**
+     * Used for string, bytes, embedded messages, packed repeated fields
+     *
+     * Only repeated numeric types (types which use the varint, 32-bit,
+     * or 64-bit wire types) can be packed. In proto3, such fields are
+     * packed by default.
+     */
+    WireType[WireType["LengthDelimited"] = 2] = "LengthDelimited";
+    /**
+     * Used for groups
+     * @deprecated
+     */
+    WireType[WireType["StartGroup"] = 3] = "StartGroup";
+    /**
+     * Used for groups
+     * @deprecated
+     */
+    WireType[WireType["EndGroup"] = 4] = "EndGroup";
+    /**
+     * Used for fixed32, sfixed32, float.
+     * Always 4 bytes with little-endian byte order.
+     */
+    WireType[WireType["Bit32"] = 5] = "Bit32";
+})(WireType = exports.WireType || (exports.WireType = {}));
+
+
+/***/ }),
+
+/***/ 549:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.BinaryReader = exports.binaryReadOptions = void 0;
+const binary_format_contract_1 = __nccwpck_require__(12);
+const pb_long_1 = __nccwpck_require__(2486);
+const goog_varint_1 = __nccwpck_require__(6778);
+const defaultsRead = {
+    readUnknownField: true,
+    readerFactory: bytes => new BinaryReader(bytes),
+};
+/**
+ * Make options for reading binary data form partial options.
+ */
+function binaryReadOptions(options) {
+    return options ? Object.assign(Object.assign({}, defaultsRead), options) : defaultsRead;
+}
+exports.binaryReadOptions = binaryReadOptions;
+class BinaryReader {
+    constructor(buf, textDecoder) {
+        this.varint64 = goog_varint_1.varint64read; // dirty cast for `this`
+        /**
+         * Read a `uint32` field, an unsigned 32 bit varint.
+         */
+        this.uint32 = goog_varint_1.varint32read; // dirty cast for `this` and access to protected `buf`
+        this.buf = buf;
+        this.len = buf.length;
+        this.pos = 0;
+        this.view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        this.textDecoder = textDecoder !== null && textDecoder !== void 0 ? textDecoder : new TextDecoder("utf-8", {
+            fatal: true,
+            ignoreBOM: true,
+        });
+    }
+    /**
+     * Reads a tag - field number and wire type.
+     */
+    tag() {
+        let tag = this.uint32(), fieldNo = tag >>> 3, wireType = tag & 7;
+        if (fieldNo <= 0 || wireType < 0 || wireType > 5)
+            throw new Error("illegal tag: field no " + fieldNo + " wire type " + wireType);
+        return [fieldNo, wireType];
+    }
+    /**
+     * Skip one element on the wire and return the skipped data.
+     * Supports WireType.StartGroup since v2.0.0-alpha.23.
+     */
+    skip(wireType) {
+        let start = this.pos;
+        // noinspection FallThroughInSwitchStatementJS
+        switch (wireType) {
+            case binary_format_contract_1.WireType.Varint:
+                while (this.buf[this.pos++] & 0x80) {
+                    // ignore
+                }
+                break;
+            case binary_format_contract_1.WireType.Bit64:
+                this.pos += 4;
+            case binary_format_contract_1.WireType.Bit32:
+                this.pos += 4;
+                break;
+            case binary_format_contract_1.WireType.LengthDelimited:
+                let len = this.uint32();
+                this.pos += len;
+                break;
+            case binary_format_contract_1.WireType.StartGroup:
+                // From descriptor.proto: Group type is deprecated, not supported in proto3.
+                // But we must still be able to parse and treat as unknown.
+                let t;
+                while ((t = this.tag()[1]) !== binary_format_contract_1.WireType.EndGroup) {
+                    this.skip(t);
+                }
+                break;
+            default:
+                throw new Error("cant skip wire type " + wireType);
+        }
+        this.assertBounds();
+        return this.buf.subarray(start, this.pos);
+    }
+    /**
+     * Throws error if position in byte array is out of range.
+     */
+    assertBounds() {
+        if (this.pos > this.len)
+            throw new RangeError("premature EOF");
+    }
+    /**
+     * Read a `int32` field, a signed 32 bit varint.
+     */
+    int32() {
+        return this.uint32() | 0;
+    }
+    /**
+     * Read a `sint32` field, a signed, zigzag-encoded 32-bit varint.
+     */
+    sint32() {
+        let zze = this.uint32();
+        // decode zigzag
+        return (zze >>> 1) ^ -(zze & 1);
+    }
+    /**
+     * Read a `int64` field, a signed 64-bit varint.
+     */
+    int64() {
+        return new pb_long_1.PbLong(...this.varint64());
+    }
+    /**
+     * Read a `uint64` field, an unsigned 64-bit varint.
+     */
+    uint64() {
+        return new pb_long_1.PbULong(...this.varint64());
+    }
+    /**
+     * Read a `sint64` field, a signed, zig-zag-encoded 64-bit varint.
+     */
+    sint64() {
+        let [lo, hi] = this.varint64();
+        // decode zig zag
+        let s = -(lo & 1);
+        lo = ((lo >>> 1 | (hi & 1) << 31) ^ s);
+        hi = (hi >>> 1 ^ s);
+        return new pb_long_1.PbLong(lo, hi);
+    }
+    /**
+     * Read a `bool` field, a variant.
+     */
+    bool() {
+        let [lo, hi] = this.varint64();
+        return lo !== 0 || hi !== 0;
+    }
+    /**
+     * Read a `fixed32` field, an unsigned, fixed-length 32-bit integer.
+     */
+    fixed32() {
+        return this.view.getUint32((this.pos += 4) - 4, true);
+    }
+    /**
+     * Read a `sfixed32` field, a signed, fixed-length 32-bit integer.
+     */
+    sfixed32() {
+        return this.view.getInt32((this.pos += 4) - 4, true);
+    }
+    /**
+     * Read a `fixed64` field, an unsigned, fixed-length 64 bit integer.
+     */
+    fixed64() {
+        return new pb_long_1.PbULong(this.sfixed32(), this.sfixed32());
+    }
+    /**
+     * Read a `fixed64` field, a signed, fixed-length 64-bit integer.
+     */
+    sfixed64() {
+        return new pb_long_1.PbLong(this.sfixed32(), this.sfixed32());
+    }
+    /**
+     * Read a `float` field, 32-bit floating point number.
+     */
+    float() {
+        return this.view.getFloat32((this.pos += 4) - 4, true);
+    }
+    /**
+     * Read a `double` field, a 64-bit floating point number.
+     */
+    double() {
+        return this.view.getFloat64((this.pos += 8) - 8, true);
+    }
+    /**
+     * Read a `bytes` field, length-delimited arbitrary data.
+     */
+    bytes() {
+        let len = this.uint32();
+        let start = this.pos;
+        this.pos += len;
+        this.assertBounds();
+        return this.buf.subarray(start, start + len);
+    }
+    /**
+     * Read a `string` field, length-delimited data converted to UTF-8 text.
+     */
+    string() {
+        return this.textDecoder.decode(this.bytes());
+    }
+}
+exports.BinaryReader = BinaryReader;
+
+
+/***/ }),
+
+/***/ 4927:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.BinaryWriter = exports.binaryWriteOptions = void 0;
+const pb_long_1 = __nccwpck_require__(2486);
+const goog_varint_1 = __nccwpck_require__(6778);
+const assert_1 = __nccwpck_require__(1651);
+const defaultsWrite = {
+    writeUnknownFields: true,
+    writerFactory: () => new BinaryWriter(),
+};
+/**
+ * Make options for writing binary data form partial options.
+ */
+function binaryWriteOptions(options) {
+    return options ? Object.assign(Object.assign({}, defaultsWrite), options) : defaultsWrite;
+}
+exports.binaryWriteOptions = binaryWriteOptions;
+class BinaryWriter {
+    constructor(textEncoder) {
+        /**
+         * Previous fork states.
+         */
+        this.stack = [];
+        this.textEncoder = textEncoder !== null && textEncoder !== void 0 ? textEncoder : new TextEncoder();
+        this.chunks = [];
+        this.buf = [];
+    }
+    /**
+     * Return all bytes written and reset this writer.
+     */
+    finish() {
+        this.chunks.push(new Uint8Array(this.buf)); // flush the buffer
+        let len = 0;
+        for (let i = 0; i < this.chunks.length; i++)
+            len += this.chunks[i].length;
+        let bytes = new Uint8Array(len);
+        let offset = 0;
+        for (let i = 0; i < this.chunks.length; i++) {
+            bytes.set(this.chunks[i], offset);
+            offset += this.chunks[i].length;
+        }
+        this.chunks = [];
+        return bytes;
+    }
+    /**
+     * Start a new fork for length-delimited data like a message
+     * or a packed repeated field.
+     *
+     * Must be joined later with `join()`.
+     */
+    fork() {
+        this.stack.push({ chunks: this.chunks, buf: this.buf });
+        this.chunks = [];
+        this.buf = [];
+        return this;
+    }
+    /**
+     * Join the last fork. Write its length and bytes, then
+     * return to the previous state.
+     */
+    join() {
+        // get chunk of fork
+        let chunk = this.finish();
+        // restore previous state
+        let prev = this.stack.pop();
+        if (!prev)
+            throw new Error('invalid state, fork stack empty');
+        this.chunks = prev.chunks;
+        this.buf = prev.buf;
+        // write length of chunk as varint
+        this.uint32(chunk.byteLength);
+        return this.raw(chunk);
+    }
+    /**
+     * Writes a tag (field number and wire type).
+     *
+     * Equivalent to `uint32( (fieldNo << 3 | type) >>> 0 )`.
+     *
+     * Generated code should compute the tag ahead of time and call `uint32()`.
+     */
+    tag(fieldNo, type) {
+        return this.uint32((fieldNo << 3 | type) >>> 0);
+    }
+    /**
+     * Write a chunk of raw bytes.
+     */
+    raw(chunk) {
+        if (this.buf.length) {
+            this.chunks.push(new Uint8Array(this.buf));
+            this.buf = [];
+        }
+        this.chunks.push(chunk);
+        return this;
+    }
+    /**
+     * Write a `uint32` value, an unsigned 32 bit varint.
+     */
+    uint32(value) {
+        assert_1.assertUInt32(value);
+        // write value as varint 32, inlined for speed
+        while (value > 0x7f) {
+            this.buf.push((value & 0x7f) | 0x80);
+            value = value >>> 7;
+        }
+        this.buf.push(value);
+        return this;
+    }
+    /**
+     * Write a `int32` value, a signed 32 bit varint.
+     */
+    int32(value) {
+        assert_1.assertInt32(value);
+        goog_varint_1.varint32write(value, this.buf);
+        return this;
+    }
+    /**
+     * Write a `bool` value, a variant.
+     */
+    bool(value) {
+        this.buf.push(value ? 1 : 0);
+        return this;
+    }
+    /**
+     * Write a `bytes` value, length-delimited arbitrary data.
+     */
+    bytes(value) {
+        this.uint32(value.byteLength); // write length of chunk as varint
+        return this.raw(value);
+    }
+    /**
+     * Write a `string` value, length-delimited data converted to UTF-8 text.
+     */
+    string(value) {
+        let chunk = this.textEncoder.encode(value);
+        this.uint32(chunk.byteLength); // write length of chunk as varint
+        return this.raw(chunk);
+    }
+    /**
+     * Write a `float` value, 32-bit floating point number.
+     */
+    float(value) {
+        assert_1.assertFloat32(value);
+        let chunk = new Uint8Array(4);
+        new DataView(chunk.buffer).setFloat32(0, value, true);
+        return this.raw(chunk);
+    }
+    /**
+     * Write a `double` value, a 64-bit floating point number.
+     */
+    double(value) {
+        let chunk = new Uint8Array(8);
+        new DataView(chunk.buffer).setFloat64(0, value, true);
+        return this.raw(chunk);
+    }
+    /**
+     * Write a `fixed32` value, an unsigned, fixed-length 32-bit integer.
+     */
+    fixed32(value) {
+        assert_1.assertUInt32(value);
+        let chunk = new Uint8Array(4);
+        new DataView(chunk.buffer).setUint32(0, value, true);
+        return this.raw(chunk);
+    }
+    /**
+     * Write a `sfixed32` value, a signed, fixed-length 32-bit integer.
+     */
+    sfixed32(value) {
+        assert_1.assertInt32(value);
+        let chunk = new Uint8Array(4);
+        new DataView(chunk.buffer).setInt32(0, value, true);
+        return this.raw(chunk);
+    }
+    /**
+     * Write a `sint32` value, a signed, zigzag-encoded 32-bit varint.
+     */
+    sint32(value) {
+        assert_1.assertInt32(value);
+        // zigzag encode
+        value = ((value << 1) ^ (value >> 31)) >>> 0;
+        goog_varint_1.varint32write(value, this.buf);
+        return this;
+    }
+    /**
+     * Write a `fixed64` value, a signed, fixed-length 64-bit integer.
+     */
+    sfixed64(value) {
+        let chunk = new Uint8Array(8);
+        let view = new DataView(chunk.buffer);
+        let long = pb_long_1.PbLong.from(value);
+        view.setInt32(0, long.lo, true);
+        view.setInt32(4, long.hi, true);
+        return this.raw(chunk);
+    }
+    /**
+     * Write a `fixed64` value, an unsigned, fixed-length 64 bit integer.
+     */
+    fixed64(value) {
+        let chunk = new Uint8Array(8);
+        let view = new DataView(chunk.buffer);
+        let long = pb_long_1.PbULong.from(value);
+        view.setInt32(0, long.lo, true);
+        view.setInt32(4, long.hi, true);
+        return this.raw(chunk);
+    }
+    /**
+     * Write a `int64` value, a signed 64-bit varint.
+     */
+    int64(value) {
+        let long = pb_long_1.PbLong.from(value);
+        goog_varint_1.varint64write(long.lo, long.hi, this.buf);
+        return this;
+    }
+    /**
+     * Write a `sint64` value, a signed, zig-zag-encoded 64-bit varint.
+     */
+    sint64(value) {
+        let long = pb_long_1.PbLong.from(value), 
+        // zigzag encode
+        sign = long.hi >> 31, lo = (long.lo << 1) ^ sign, hi = ((long.hi << 1) | (long.lo >>> 31)) ^ sign;
+        goog_varint_1.varint64write(lo, hi, this.buf);
+        return this;
+    }
+    /**
+     * Write a `uint64` value, an unsigned 64-bit varint.
+     */
+    uint64(value) {
+        let long = pb_long_1.PbULong.from(value);
+        goog_varint_1.varint64write(long.lo, long.hi, this.buf);
+        return this;
+    }
+}
+exports.BinaryWriter = BinaryWriter;
+
+
+/***/ }),
+
+/***/ 374:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.listEnumNumbers = exports.listEnumNames = exports.listEnumValues = exports.isEnumObject = void 0;
+/**
+ * Is this a lookup object generated by Typescript, for a Typescript enum
+ * generated by protobuf-ts?
+ *
+ * - No `const enum` (enum must not be inlined, we need reverse mapping).
+ * - No string enum (we need int32 for protobuf).
+ * - Must have a value for 0 (otherwise, we would need to support custom default values).
+ */
+function isEnumObject(arg) {
+    if (typeof arg != 'object' || arg === null) {
+        return false;
+    }
+    if (!arg.hasOwnProperty(0)) {
+        return false;
+    }
+    for (let k of Object.keys(arg)) {
+        let num = parseInt(k);
+        if (!Number.isNaN(num)) {
+            // is there a name for the number?
+            let nam = arg[num];
+            if (nam === undefined)
+                return false;
+            // does the name resolve back to the number?
+            if (arg[nam] !== num)
+                return false;
+        }
+        else {
+            // is there a number for the name?
+            let num = arg[k];
+            if (num === undefined)
+                return false;
+            // is it a string enum?
+            if (typeof num !== 'number')
+                return false;
+            // do we know the number?
+            if (arg[num] === undefined)
+                return false;
+        }
+    }
+    return true;
+}
+exports.isEnumObject = isEnumObject;
+/**
+ * Lists all values of a Typescript enum, as an array of objects with a "name"
+ * property and a "number" property.
+ *
+ * Note that it is possible that a number appears more than once, because it is
+ * possible to have aliases in an enum.
+ *
+ * Throws if the enum does not adhere to the rules of enums generated by
+ * protobuf-ts. See `isEnumObject()`.
+ */
+function listEnumValues(enumObject) {
+    if (!isEnumObject(enumObject))
+        throw new Error("not a typescript enum object");
+    let values = [];
+    for (let [name, number] of Object.entries(enumObject))
+        if (typeof number == "number")
+            values.push({ name, number });
+    return values;
+}
+exports.listEnumValues = listEnumValues;
+/**
+ * Lists the names of a Typescript enum.
+ *
+ * Throws if the enum does not adhere to the rules of enums generated by
+ * protobuf-ts. See `isEnumObject()`.
+ */
+function listEnumNames(enumObject) {
+    return listEnumValues(enumObject).map(val => val.name);
+}
+exports.listEnumNames = listEnumNames;
+/**
+ * Lists the numbers of a Typescript enum.
+ *
+ * Throws if the enum does not adhere to the rules of enums generated by
+ * protobuf-ts. See `isEnumObject()`.
+ */
+function listEnumNumbers(enumObject) {
+    return listEnumValues(enumObject)
+        .map(val => val.number)
+        .filter((num, index, arr) => arr.indexOf(num) == index);
+}
+exports.listEnumNumbers = listEnumNumbers;
+
+
+/***/ }),
+
+/***/ 6778:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+// Copyright 2008 Google Inc.  All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+// * Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+// * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+// * Neither the name of Google Inc. nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// Code generated by the Protocol Buffer compiler is owned by the owner
+// of the input file used when generating it.  This code is not
+// standalone and requires a support library to be linked with it.  This
+// support library is itself covered by the above license.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.varint32read = exports.varint32write = exports.int64toString = exports.int64fromString = exports.varint64write = exports.varint64read = void 0;
+/**
+ * Read a 64 bit varint as two JS numbers.
+ *
+ * Returns tuple:
+ * [0]: low bits
+ * [0]: high bits
+ *
+ * Copyright 2008 Google Inc.  All rights reserved.
+ *
+ * See https://github.com/protocolbuffers/protobuf/blob/8a71927d74a4ce34efe2d8769fda198f52d20d12/js/experimental/runtime/kernel/buffer_decoder.js#L175
+ */
+function varint64read() {
+    let lowBits = 0;
+    let highBits = 0;
+    for (let shift = 0; shift < 28; shift += 7) {
+        let b = this.buf[this.pos++];
+        lowBits |= (b & 0x7F) << shift;
+        if ((b & 0x80) == 0) {
+            this.assertBounds();
+            return [lowBits, highBits];
+        }
+    }
+    let middleByte = this.buf[this.pos++];
+    // last four bits of the first 32 bit number
+    lowBits |= (middleByte & 0x0F) << 28;
+    // 3 upper bits are part of the next 32 bit number
+    highBits = (middleByte & 0x70) >> 4;
+    if ((middleByte & 0x80) == 0) {
+        this.assertBounds();
+        return [lowBits, highBits];
+    }
+    for (let shift = 3; shift <= 31; shift += 7) {
+        let b = this.buf[this.pos++];
+        highBits |= (b & 0x7F) << shift;
+        if ((b & 0x80) == 0) {
+            this.assertBounds();
+            return [lowBits, highBits];
+        }
+    }
+    throw new Error('invalid varint');
+}
+exports.varint64read = varint64read;
+/**
+ * Write a 64 bit varint, given as two JS numbers, to the given bytes array.
+ *
+ * Copyright 2008 Google Inc.  All rights reserved.
+ *
+ * See https://github.com/protocolbuffers/protobuf/blob/8a71927d74a4ce34efe2d8769fda198f52d20d12/js/experimental/runtime/kernel/writer.js#L344
+ */
+function varint64write(lo, hi, bytes) {
+    for (let i = 0; i < 28; i = i + 7) {
+        const shift = lo >>> i;
+        const hasNext = !((shift >>> 7) == 0 && hi == 0);
+        const byte = (hasNext ? shift | 0x80 : shift) & 0xFF;
+        bytes.push(byte);
+        if (!hasNext) {
+            return;
+        }
+    }
+    const splitBits = ((lo >>> 28) & 0x0F) | ((hi & 0x07) << 4);
+    const hasMoreBits = !((hi >> 3) == 0);
+    bytes.push((hasMoreBits ? splitBits | 0x80 : splitBits) & 0xFF);
+    if (!hasMoreBits) {
+        return;
+    }
+    for (let i = 3; i < 31; i = i + 7) {
+        const shift = hi >>> i;
+        const hasNext = !((shift >>> 7) == 0);
+        const byte = (hasNext ? shift | 0x80 : shift) & 0xFF;
+        bytes.push(byte);
+        if (!hasNext) {
+            return;
+        }
+    }
+    bytes.push((hi >>> 31) & 0x01);
+}
+exports.varint64write = varint64write;
+// constants for binary math
+const TWO_PWR_32_DBL = (1 << 16) * (1 << 16);
+/**
+ * Parse decimal string of 64 bit integer value as two JS numbers.
+ *
+ * Returns tuple:
+ * [0]: minus sign?
+ * [1]: low bits
+ * [2]: high bits
+ *
+ * Copyright 2008 Google Inc.
+ */
+function int64fromString(dec) {
+    // Check for minus sign.
+    let minus = dec[0] == '-';
+    if (minus)
+        dec = dec.slice(1);
+    // Work 6 decimal digits at a time, acting like we're converting base 1e6
+    // digits to binary. This is safe to do with floating point math because
+    // Number.isSafeInteger(ALL_32_BITS * 1e6) == true.
+    const base = 1e6;
+    let lowBits = 0;
+    let highBits = 0;
+    function add1e6digit(begin, end) {
+        // Note: Number('') is 0.
+        const digit1e6 = Number(dec.slice(begin, end));
+        highBits *= base;
+        lowBits = lowBits * base + digit1e6;
+        // Carry bits from lowBits to highBits
+        if (lowBits >= TWO_PWR_32_DBL) {
+            highBits = highBits + ((lowBits / TWO_PWR_32_DBL) | 0);
+            lowBits = lowBits % TWO_PWR_32_DBL;
+        }
+    }
+    add1e6digit(-24, -18);
+    add1e6digit(-18, -12);
+    add1e6digit(-12, -6);
+    add1e6digit(-6);
+    return [minus, lowBits, highBits];
+}
+exports.int64fromString = int64fromString;
+/**
+ * Format 64 bit integer value (as two JS numbers) to decimal string.
+ *
+ * Copyright 2008 Google Inc.
+ */
+function int64toString(bitsLow, bitsHigh) {
+    // Skip the expensive conversion if the number is small enough to use the
+    // built-in conversions.
+    if ((bitsHigh >>> 0) <= 0x1FFFFF) {
+        return '' + (TWO_PWR_32_DBL * bitsHigh + (bitsLow >>> 0));
+    }
+    // What this code is doing is essentially converting the input number from
+    // base-2 to base-1e7, which allows us to represent the 64-bit range with
+    // only 3 (very large) digits. Those digits are then trivial to convert to
+    // a base-10 string.
+    // The magic numbers used here are -
+    // 2^24 = 16777216 = (1,6777216) in base-1e7.
+    // 2^48 = 281474976710656 = (2,8147497,6710656) in base-1e7.
+    // Split 32:32 representation into 16:24:24 representation so our
+    // intermediate digits don't overflow.
+    let low = bitsLow & 0xFFFFFF;
+    let mid = (((bitsLow >>> 24) | (bitsHigh << 8)) >>> 0) & 0xFFFFFF;
+    let high = (bitsHigh >> 16) & 0xFFFF;
+    // Assemble our three base-1e7 digits, ignoring carries. The maximum
+    // value in a digit at this step is representable as a 48-bit integer, which
+    // can be stored in a 64-bit floating point number.
+    let digitA = low + (mid * 6777216) + (high * 6710656);
+    let digitB = mid + (high * 8147497);
+    let digitC = (high * 2);
+    // Apply carries from A to B and from B to C.
+    let base = 10000000;
+    if (digitA >= base) {
+        digitB += Math.floor(digitA / base);
+        digitA %= base;
+    }
+    if (digitB >= base) {
+        digitC += Math.floor(digitB / base);
+        digitB %= base;
+    }
+    // Convert base-1e7 digits to base-10, with optional leading zeroes.
+    function decimalFrom1e7(digit1e7, needLeadingZeros) {
+        let partial = digit1e7 ? String(digit1e7) : '';
+        if (needLeadingZeros) {
+            return '0000000'.slice(partial.length) + partial;
+        }
+        return partial;
+    }
+    return decimalFrom1e7(digitC, /*needLeadingZeros=*/ 0) +
+        decimalFrom1e7(digitB, /*needLeadingZeros=*/ digitC) +
+        // If the final 1e7 digit didn't need leading zeros, we would have
+        // returned via the trivial code path at the top.
+        decimalFrom1e7(digitA, /*needLeadingZeros=*/ 1);
+}
+exports.int64toString = int64toString;
+/**
+ * Write a 32 bit varint, signed or unsigned. Same as `varint64write(0, value, bytes)`
+ *
+ * Copyright 2008 Google Inc.  All rights reserved.
+ *
+ * See https://github.com/protocolbuffers/protobuf/blob/1b18833f4f2a2f681f4e4a25cdf3b0a43115ec26/js/binary/encoder.js#L144
+ */
+function varint32write(value, bytes) {
+    if (value >= 0) {
+        // write value as varint 32
+        while (value > 0x7f) {
+            bytes.push((value & 0x7f) | 0x80);
+            value = value >>> 7;
+        }
+        bytes.push(value);
+    }
+    else {
+        for (let i = 0; i < 9; i++) {
+            bytes.push(value & 127 | 128);
+            value = value >> 7;
+        }
+        bytes.push(1);
+    }
+}
+exports.varint32write = varint32write;
+/**
+ * Read an unsigned 32 bit varint.
+ *
+ * See https://github.com/protocolbuffers/protobuf/blob/8a71927d74a4ce34efe2d8769fda198f52d20d12/js/experimental/runtime/kernel/buffer_decoder.js#L220
+ */
+function varint32read() {
+    let b = this.buf[this.pos++];
+    let result = b & 0x7F;
+    if ((b & 0x80) == 0) {
+        this.assertBounds();
+        return result;
+    }
+    b = this.buf[this.pos++];
+    result |= (b & 0x7F) << 7;
+    if ((b & 0x80) == 0) {
+        this.assertBounds();
+        return result;
+    }
+    b = this.buf[this.pos++];
+    result |= (b & 0x7F) << 14;
+    if ((b & 0x80) == 0) {
+        this.assertBounds();
+        return result;
+    }
+    b = this.buf[this.pos++];
+    result |= (b & 0x7F) << 21;
+    if ((b & 0x80) == 0) {
+        this.assertBounds();
+        return result;
+    }
+    // Extract only last 4 bits
+    b = this.buf[this.pos++];
+    result |= (b & 0x0F) << 28;
+    for (let readBytes = 5; ((b & 0x80) !== 0) && readBytes < 10; readBytes++)
+        b = this.buf[this.pos++];
+    if ((b & 0x80) != 0)
+        throw new Error('invalid varint');
+    this.assertBounds();
+    // Result can have 32 bits, convert it to unsigned
+    return result >>> 0;
+}
+exports.varint32read = varint32read;
+
+
+/***/ }),
+
+/***/ 7509:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+// Public API of the protobuf-ts runtime.
+// Note: we do not use `export * from ...` to help tree shakers,
+// webpack verbose output hints that this should be useful
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+// Convenience JSON typings and corresponding type guards
+var json_typings_1 = __nccwpck_require__(2840);
+Object.defineProperty(exports, "typeofJsonValue", ({ enumerable: true, get: function () { return json_typings_1.typeofJsonValue; } }));
+Object.defineProperty(exports, "isJsonObject", ({ enumerable: true, get: function () { return json_typings_1.isJsonObject; } }));
+// Base 64 encoding
+var base64_1 = __nccwpck_require__(5553);
+Object.defineProperty(exports, "base64decode", ({ enumerable: true, get: function () { return base64_1.base64decode; } }));
+Object.defineProperty(exports, "base64encode", ({ enumerable: true, get: function () { return base64_1.base64encode; } }));
+// UTF8 encoding
+var protobufjs_utf8_1 = __nccwpck_require__(8319);
+Object.defineProperty(exports, "utf8read", ({ enumerable: true, get: function () { return protobufjs_utf8_1.utf8read; } }));
+// Binary format contracts, options for reading and writing, for example
+var binary_format_contract_1 = __nccwpck_require__(12);
+Object.defineProperty(exports, "WireType", ({ enumerable: true, get: function () { return binary_format_contract_1.WireType; } }));
+Object.defineProperty(exports, "mergeBinaryOptions", ({ enumerable: true, get: function () { return binary_format_contract_1.mergeBinaryOptions; } }));
+Object.defineProperty(exports, "UnknownFieldHandler", ({ enumerable: true, get: function () { return binary_format_contract_1.UnknownFieldHandler; } }));
+// Standard IBinaryReader implementation
+var binary_reader_1 = __nccwpck_require__(549);
+Object.defineProperty(exports, "BinaryReader", ({ enumerable: true, get: function () { return binary_reader_1.BinaryReader; } }));
+Object.defineProperty(exports, "binaryReadOptions", ({ enumerable: true, get: function () { return binary_reader_1.binaryReadOptions; } }));
+// Standard IBinaryWriter implementation
+var binary_writer_1 = __nccwpck_require__(4927);
+Object.defineProperty(exports, "BinaryWriter", ({ enumerable: true, get: function () { return binary_writer_1.BinaryWriter; } }));
+Object.defineProperty(exports, "binaryWriteOptions", ({ enumerable: true, get: function () { return binary_writer_1.binaryWriteOptions; } }));
+// Int64 and UInt64 implementations required for the binary format
+var pb_long_1 = __nccwpck_require__(2486);
+Object.defineProperty(exports, "PbLong", ({ enumerable: true, get: function () { return pb_long_1.PbLong; } }));
+Object.defineProperty(exports, "PbULong", ({ enumerable: true, get: function () { return pb_long_1.PbULong; } }));
+// JSON format contracts, options for reading and writing, for example
+var json_format_contract_1 = __nccwpck_require__(7627);
+Object.defineProperty(exports, "jsonReadOptions", ({ enumerable: true, get: function () { return json_format_contract_1.jsonReadOptions; } }));
+Object.defineProperty(exports, "jsonWriteOptions", ({ enumerable: true, get: function () { return json_format_contract_1.jsonWriteOptions; } }));
+Object.defineProperty(exports, "mergeJsonOptions", ({ enumerable: true, get: function () { return json_format_contract_1.mergeJsonOptions; } }));
+// Message type contract
+var message_type_contract_1 = __nccwpck_require__(3757);
+Object.defineProperty(exports, "MESSAGE_TYPE", ({ enumerable: true, get: function () { return message_type_contract_1.MESSAGE_TYPE; } }));
+// Message type implementation via reflection
+var message_type_1 = __nccwpck_require__(5130);
+Object.defineProperty(exports, "MessageType", ({ enumerable: true, get: function () { return message_type_1.MessageType; } }));
+// Reflection info, generated by the plugin, exposed to the user, used by reflection ops
+var reflection_info_1 = __nccwpck_require__(4746);
+Object.defineProperty(exports, "ScalarType", ({ enumerable: true, get: function () { return reflection_info_1.ScalarType; } }));
+Object.defineProperty(exports, "LongType", ({ enumerable: true, get: function () { return reflection_info_1.LongType; } }));
+Object.defineProperty(exports, "RepeatType", ({ enumerable: true, get: function () { return reflection_info_1.RepeatType; } }));
+Object.defineProperty(exports, "normalizeFieldInfo", ({ enumerable: true, get: function () { return reflection_info_1.normalizeFieldInfo; } }));
+Object.defineProperty(exports, "readFieldOptions", ({ enumerable: true, get: function () { return reflection_info_1.readFieldOptions; } }));
+Object.defineProperty(exports, "readFieldOption", ({ enumerable: true, get: function () { return reflection_info_1.readFieldOption; } }));
+Object.defineProperty(exports, "readMessageOption", ({ enumerable: true, get: function () { return reflection_info_1.readMessageOption; } }));
+// Message operations via reflection
+var reflection_type_check_1 = __nccwpck_require__(652);
+Object.defineProperty(exports, "ReflectionTypeCheck", ({ enumerable: true, get: function () { return reflection_type_check_1.ReflectionTypeCheck; } }));
+var reflection_create_1 = __nccwpck_require__(3144);
+Object.defineProperty(exports, "reflectionCreate", ({ enumerable: true, get: function () { return reflection_create_1.reflectionCreate; } }));
+var reflection_scalar_default_1 = __nccwpck_require__(6435);
+Object.defineProperty(exports, "reflectionScalarDefault", ({ enumerable: true, get: function () { return reflection_scalar_default_1.reflectionScalarDefault; } }));
+var reflection_merge_partial_1 = __nccwpck_require__(6359);
+Object.defineProperty(exports, "reflectionMergePartial", ({ enumerable: true, get: function () { return reflection_merge_partial_1.reflectionMergePartial; } }));
+var reflection_equals_1 = __nccwpck_require__(4970);
+Object.defineProperty(exports, "reflectionEquals", ({ enumerable: true, get: function () { return reflection_equals_1.reflectionEquals; } }));
+var reflection_binary_reader_1 = __nccwpck_require__(5599);
+Object.defineProperty(exports, "ReflectionBinaryReader", ({ enumerable: true, get: function () { return reflection_binary_reader_1.ReflectionBinaryReader; } }));
+var reflection_binary_writer_1 = __nccwpck_require__(1334);
+Object.defineProperty(exports, "ReflectionBinaryWriter", ({ enumerable: true, get: function () { return reflection_binary_writer_1.ReflectionBinaryWriter; } }));
+var reflection_json_reader_1 = __nccwpck_require__(5094);
+Object.defineProperty(exports, "ReflectionJsonReader", ({ enumerable: true, get: function () { return reflection_json_reader_1.ReflectionJsonReader; } }));
+var reflection_json_writer_1 = __nccwpck_require__(4395);
+Object.defineProperty(exports, "ReflectionJsonWriter", ({ enumerable: true, get: function () { return reflection_json_writer_1.ReflectionJsonWriter; } }));
+var reflection_contains_message_type_1 = __nccwpck_require__(4043);
+Object.defineProperty(exports, "containsMessageType", ({ enumerable: true, get: function () { return reflection_contains_message_type_1.containsMessageType; } }));
+// Oneof helpers
+var oneof_1 = __nccwpck_require__(9927);
+Object.defineProperty(exports, "isOneofGroup", ({ enumerable: true, get: function () { return oneof_1.isOneofGroup; } }));
+Object.defineProperty(exports, "setOneofValue", ({ enumerable: true, get: function () { return oneof_1.setOneofValue; } }));
+Object.defineProperty(exports, "getOneofValue", ({ enumerable: true, get: function () { return oneof_1.getOneofValue; } }));
+Object.defineProperty(exports, "clearOneofValue", ({ enumerable: true, get: function () { return oneof_1.clearOneofValue; } }));
+Object.defineProperty(exports, "getSelectedOneofValue", ({ enumerable: true, get: function () { return oneof_1.getSelectedOneofValue; } }));
+// Enum object type guard and reflection util, may be interesting to the user.
+var enum_object_1 = __nccwpck_require__(374);
+Object.defineProperty(exports, "listEnumValues", ({ enumerable: true, get: function () { return enum_object_1.listEnumValues; } }));
+Object.defineProperty(exports, "listEnumNames", ({ enumerable: true, get: function () { return enum_object_1.listEnumNames; } }));
+Object.defineProperty(exports, "listEnumNumbers", ({ enumerable: true, get: function () { return enum_object_1.listEnumNumbers; } }));
+Object.defineProperty(exports, "isEnumObject", ({ enumerable: true, get: function () { return enum_object_1.isEnumObject; } }));
+// lowerCamelCase() is exported for plugin, rpc-runtime and other rpc packages
+var lower_camel_case_1 = __nccwpck_require__(6127);
+Object.defineProperty(exports, "lowerCamelCase", ({ enumerable: true, get: function () { return lower_camel_case_1.lowerCamelCase; } }));
+// assertion functions are exported for plugin, may also be useful to user
+var assert_1 = __nccwpck_require__(1651);
+Object.defineProperty(exports, "assert", ({ enumerable: true, get: function () { return assert_1.assert; } }));
+Object.defineProperty(exports, "assertNever", ({ enumerable: true, get: function () { return assert_1.assertNever; } }));
+Object.defineProperty(exports, "assertInt32", ({ enumerable: true, get: function () { return assert_1.assertInt32; } }));
+Object.defineProperty(exports, "assertUInt32", ({ enumerable: true, get: function () { return assert_1.assertUInt32; } }));
+Object.defineProperty(exports, "assertFloat32", ({ enumerable: true, get: function () { return assert_1.assertFloat32; } }));
+
+
+/***/ }),
+
+/***/ 7627:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.mergeJsonOptions = exports.jsonWriteOptions = exports.jsonReadOptions = void 0;
+const defaultsWrite = {
+    emitDefaultValues: false,
+    enumAsInteger: false,
+    useProtoFieldName: false,
+    prettySpaces: 0,
+}, defaultsRead = {
+    ignoreUnknownFields: false,
+};
+/**
+ * Make options for reading JSON data from partial options.
+ */
+function jsonReadOptions(options) {
+    return options ? Object.assign(Object.assign({}, defaultsRead), options) : defaultsRead;
+}
+exports.jsonReadOptions = jsonReadOptions;
+/**
+ * Make options for writing JSON data from partial options.
+ */
+function jsonWriteOptions(options) {
+    return options ? Object.assign(Object.assign({}, defaultsWrite), options) : defaultsWrite;
+}
+exports.jsonWriteOptions = jsonWriteOptions;
+/**
+ * Merges JSON write or read options. Later values override earlier values. Type registries are merged.
+ */
+function mergeJsonOptions(a, b) {
+    var _a, _b;
+    let c = Object.assign(Object.assign({}, a), b);
+    c.typeRegistry = [...((_a = a === null || a === void 0 ? void 0 : a.typeRegistry) !== null && _a !== void 0 ? _a : []), ...((_b = b === null || b === void 0 ? void 0 : b.typeRegistry) !== null && _b !== void 0 ? _b : [])];
+    return c;
+}
+exports.mergeJsonOptions = mergeJsonOptions;
+
+
+/***/ }),
+
+/***/ 2840:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.isJsonObject = exports.typeofJsonValue = void 0;
+/**
+ * Get the type of a JSON value.
+ * Distinguishes between array, null and object.
+ */
+function typeofJsonValue(value) {
+    let t = typeof value;
+    if (t == "object") {
+        if (Array.isArray(value))
+            return "array";
+        if (value === null)
+            return "null";
+    }
+    return t;
+}
+exports.typeofJsonValue = typeofJsonValue;
+/**
+ * Is this a JSON object (instead of an array or null)?
+ */
+function isJsonObject(value) {
+    return value !== null && typeof value == "object" && !Array.isArray(value);
+}
+exports.isJsonObject = isJsonObject;
+
+
+/***/ }),
+
+/***/ 6127:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.lowerCamelCase = void 0;
+/**
+ * Converts snake_case to lowerCamelCase.
+ *
+ * Should behave like protoc:
+ * https://github.com/protocolbuffers/protobuf/blob/e8ae137c96444ea313485ed1118c5e43b2099cf1/src/google/protobuf/compiler/java/java_helpers.cc#L118
+ */
+function lowerCamelCase(snakeCase) {
+    let capNext = false;
+    const sb = [];
+    for (let i = 0; i < snakeCase.length; i++) {
+        let next = snakeCase.charAt(i);
+        if (next == '_') {
+            capNext = true;
+        }
+        else if (/\d/.test(next)) {
+            sb.push(next);
+            capNext = true;
+        }
+        else if (capNext) {
+            sb.push(next.toUpperCase());
+            capNext = false;
+        }
+        else if (i == 0) {
+            sb.push(next.toLowerCase());
+        }
+        else {
+            sb.push(next);
+        }
+    }
+    return sb.join('');
+}
+exports.lowerCamelCase = lowerCamelCase;
+
+
+/***/ }),
+
+/***/ 3757:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.MESSAGE_TYPE = void 0;
+/**
+ * The symbol used as a key on message objects to store the message type.
+ *
+ * Note that this is an experimental feature - it is here to stay, but
+ * implementation details may change without notice.
+ */
+exports.MESSAGE_TYPE = Symbol.for("protobuf-ts/message-type");
+
+
+/***/ }),
+
+/***/ 5130:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.MessageType = void 0;
+const message_type_contract_1 = __nccwpck_require__(3757);
+const reflection_info_1 = __nccwpck_require__(4746);
+const reflection_type_check_1 = __nccwpck_require__(652);
+const reflection_json_reader_1 = __nccwpck_require__(5094);
+const reflection_json_writer_1 = __nccwpck_require__(4395);
+const reflection_binary_reader_1 = __nccwpck_require__(5599);
+const reflection_binary_writer_1 = __nccwpck_require__(1334);
+const reflection_create_1 = __nccwpck_require__(3144);
+const reflection_merge_partial_1 = __nccwpck_require__(6359);
+const json_typings_1 = __nccwpck_require__(2840);
+const json_format_contract_1 = __nccwpck_require__(7627);
+const reflection_equals_1 = __nccwpck_require__(4970);
+const binary_writer_1 = __nccwpck_require__(4927);
+const binary_reader_1 = __nccwpck_require__(549);
+const baseDescriptors = Object.getOwnPropertyDescriptors(Object.getPrototypeOf({}));
+/**
+ * This standard message type provides reflection-based
+ * operations to work with a message.
+ */
+class MessageType {
+    constructor(name, fields, options) {
+        this.defaultCheckDepth = 16;
+        this.typeName = name;
+        this.fields = fields.map(reflection_info_1.normalizeFieldInfo);
+        this.options = options !== null && options !== void 0 ? options : {};
+        this.messagePrototype = Object.create(null, Object.assign(Object.assign({}, baseDescriptors), { [message_type_contract_1.MESSAGE_TYPE]: { value: this } }));
+        this.refTypeCheck = new reflection_type_check_1.ReflectionTypeCheck(this);
+        this.refJsonReader = new reflection_json_reader_1.ReflectionJsonReader(this);
+        this.refJsonWriter = new reflection_json_writer_1.ReflectionJsonWriter(this);
+        this.refBinReader = new reflection_binary_reader_1.ReflectionBinaryReader(this);
+        this.refBinWriter = new reflection_binary_writer_1.ReflectionBinaryWriter(this);
+    }
+    create(value) {
+        let message = reflection_create_1.reflectionCreate(this);
+        if (value !== undefined) {
+            reflection_merge_partial_1.reflectionMergePartial(this, message, value);
+        }
+        return message;
+    }
+    /**
+     * Clone the message.
+     *
+     * Unknown fields are discarded.
+     */
+    clone(message) {
+        let copy = this.create();
+        reflection_merge_partial_1.reflectionMergePartial(this, copy, message);
+        return copy;
+    }
+    /**
+     * Determines whether two message of the same type have the same field values.
+     * Checks for deep equality, traversing repeated fields, oneof groups, maps
+     * and messages recursively.
+     * Will also return true if both messages are `undefined`.
+     */
+    equals(a, b) {
+        return reflection_equals_1.reflectionEquals(this, a, b);
+    }
+    /**
+     * Is the given value assignable to our message type
+     * and contains no [excess properties](https://www.typescriptlang.org/docs/handbook/interfaces.html#excess-property-checks)?
+     */
+    is(arg, depth = this.defaultCheckDepth) {
+        return this.refTypeCheck.is(arg, depth, false);
+    }
+    /**
+     * Is the given value assignable to our message type,
+     * regardless of [excess properties](https://www.typescriptlang.org/docs/handbook/interfaces.html#excess-property-checks)?
+     */
+    isAssignable(arg, depth = this.defaultCheckDepth) {
+        return this.refTypeCheck.is(arg, depth, true);
+    }
+    /**
+     * Copy partial data into the target message.
+     */
+    mergePartial(target, source) {
+        reflection_merge_partial_1.reflectionMergePartial(this, target, source);
+    }
+    /**
+     * Create a new message from binary format.
+     */
+    fromBinary(data, options) {
+        let opt = binary_reader_1.binaryReadOptions(options);
+        return this.internalBinaryRead(opt.readerFactory(data), data.byteLength, opt);
+    }
+    /**
+     * Read a new message from a JSON value.
+     */
+    fromJson(json, options) {
+        return this.internalJsonRead(json, json_format_contract_1.jsonReadOptions(options));
+    }
+    /**
+     * Read a new message from a JSON string.
+     * This is equivalent to `T.fromJson(JSON.parse(json))`.
+     */
+    fromJsonString(json, options) {
+        let value = JSON.parse(json);
+        return this.fromJson(value, options);
+    }
+    /**
+     * Write the message to canonical JSON value.
+     */
+    toJson(message, options) {
+        return this.internalJsonWrite(message, json_format_contract_1.jsonWriteOptions(options));
+    }
+    /**
+     * Convert the message to canonical JSON string.
+     * This is equivalent to `JSON.stringify(T.toJson(t))`
+     */
+    toJsonString(message, options) {
+        var _a;
+        let value = this.toJson(message, options);
+        return JSON.stringify(value, null, (_a = options === null || options === void 0 ? void 0 : options.prettySpaces) !== null && _a !== void 0 ? _a : 0);
+    }
+    /**
+     * Write the message to binary format.
+     */
+    toBinary(message, options) {
+        let opt = binary_writer_1.binaryWriteOptions(options);
+        return this.internalBinaryWrite(message, opt.writerFactory(), opt).finish();
+    }
+    /**
+     * This is an internal method. If you just want to read a message from
+     * JSON, use `fromJson()` or `fromJsonString()`.
+     *
+     * Reads JSON value and merges the fields into the target
+     * according to protobuf rules. If the target is omitted,
+     * a new instance is created first.
+     */
+    internalJsonRead(json, options, target) {
+        if (json !== null && typeof json == "object" && !Array.isArray(json)) {
+            let message = target !== null && target !== void 0 ? target : this.create();
+            this.refJsonReader.read(json, message, options);
+            return message;
+        }
+        throw new Error(`Unable to parse message ${this.typeName} from JSON ${json_typings_1.typeofJsonValue(json)}.`);
+    }
+    /**
+     * This is an internal method. If you just want to write a message
+     * to JSON, use `toJson()` or `toJsonString().
+     *
+     * Writes JSON value and returns it.
+     */
+    internalJsonWrite(message, options) {
+        return this.refJsonWriter.write(message, options);
+    }
+    /**
+     * This is an internal method. If you just want to write a message
+     * in binary format, use `toBinary()`.
+     *
+     * Serializes the message in binary format and appends it to the given
+     * writer. Returns passed writer.
+     */
+    internalBinaryWrite(message, writer, options) {
+        this.refBinWriter.write(message, writer, options);
+        return writer;
+    }
+    /**
+     * This is an internal method. If you just want to read a message from
+     * binary data, use `fromBinary()`.
+     *
+     * Reads data from binary format and merges the fields into
+     * the target according to protobuf rules. If the target is
+     * omitted, a new instance is created first.
+     */
+    internalBinaryRead(reader, length, options, target) {
+        let message = target !== null && target !== void 0 ? target : this.create();
+        this.refBinReader.read(reader, message, options, length);
+        return message;
+    }
+}
+exports.MessageType = MessageType;
+
+
+/***/ }),
+
+/***/ 9927:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.getSelectedOneofValue = exports.clearOneofValue = exports.setUnknownOneofValue = exports.setOneofValue = exports.getOneofValue = exports.isOneofGroup = void 0;
+/**
+ * Is the given value a valid oneof group?
+ *
+ * We represent protobuf `oneof` as algebraic data types (ADT) in generated
+ * code. But when working with messages of unknown type, the ADT does not
+ * help us.
+ *
+ * This type guard checks if the given object adheres to the ADT rules, which
+ * are as follows:
+ *
+ * 1) Must be an object.
+ *
+ * 2) Must have a "oneofKind" discriminator property.
+ *
+ * 3) If "oneofKind" is `undefined`, no member field is selected. The object
+ * must not have any other properties.
+ *
+ * 4) If "oneofKind" is a `string`, the member field with this name is
+ * selected.
+ *
+ * 5) If a member field is selected, the object must have a second property
+ * with this name. The property must not be `undefined`.
+ *
+ * 6) No extra properties are allowed. The object has either one property
+ * (no selection) or two properties (selection).
+ *
+ */
+function isOneofGroup(any) {
+    if (typeof any != 'object' || any === null || !any.hasOwnProperty('oneofKind')) {
+        return false;
+    }
+    switch (typeof any.oneofKind) {
+        case "string":
+            if (any[any.oneofKind] === undefined)
+                return false;
+            return Object.keys(any).length == 2;
+        case "undefined":
+            return Object.keys(any).length == 1;
+        default:
+            return false;
+    }
+}
+exports.isOneofGroup = isOneofGroup;
+/**
+ * Returns the value of the given field in a oneof group.
+ */
+function getOneofValue(oneof, kind) {
+    return oneof[kind];
+}
+exports.getOneofValue = getOneofValue;
+function setOneofValue(oneof, kind, value) {
+    if (oneof.oneofKind !== undefined) {
+        delete oneof[oneof.oneofKind];
+    }
+    oneof.oneofKind = kind;
+    if (value !== undefined) {
+        oneof[kind] = value;
+    }
+}
+exports.setOneofValue = setOneofValue;
+function setUnknownOneofValue(oneof, kind, value) {
+    if (oneof.oneofKind !== undefined) {
+        delete oneof[oneof.oneofKind];
+    }
+    oneof.oneofKind = kind;
+    if (value !== undefined && kind !== undefined) {
+        oneof[kind] = value;
+    }
+}
+exports.setUnknownOneofValue = setUnknownOneofValue;
+/**
+ * Removes the selected field in a oneof group.
+ *
+ * Note that the recommended way to modify a oneof group is to set
+ * a new object:
+ *
+ * ```ts
+ * message.result = { oneofKind: undefined };
+ * ```
+ */
+function clearOneofValue(oneof) {
+    if (oneof.oneofKind !== undefined) {
+        delete oneof[oneof.oneofKind];
+    }
+    oneof.oneofKind = undefined;
+}
+exports.clearOneofValue = clearOneofValue;
+/**
+ * Returns the selected value of the given oneof group.
+ *
+ * Not that the recommended way to access a oneof group is to check
+ * the "oneofKind" property and let TypeScript narrow down the union
+ * type for you:
+ *
+ * ```ts
+ * if (message.result.oneofKind === "error") {
+ *   message.result.error; // string
+ * }
+ * ```
+ *
+ * In the rare case you just need the value, and do not care about
+ * which protobuf field is selected, you can use this function
+ * for convenience.
+ */
+function getSelectedOneofValue(oneof) {
+    if (oneof.oneofKind === undefined) {
+        return undefined;
+    }
+    return oneof[oneof.oneofKind];
+}
+exports.getSelectedOneofValue = getSelectedOneofValue;
+
+
+/***/ }),
+
+/***/ 2486:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.PbLong = exports.PbULong = exports.detectBi = void 0;
+const goog_varint_1 = __nccwpck_require__(6778);
+let BI;
+function detectBi() {
+    const dv = new DataView(new ArrayBuffer(8));
+    const ok = globalThis.BigInt !== undefined
+        && typeof dv.getBigInt64 === "function"
+        && typeof dv.getBigUint64 === "function"
+        && typeof dv.setBigInt64 === "function"
+        && typeof dv.setBigUint64 === "function";
+    BI = ok ? {
+        MIN: BigInt("-9223372036854775808"),
+        MAX: BigInt("9223372036854775807"),
+        UMIN: BigInt("0"),
+        UMAX: BigInt("18446744073709551615"),
+        C: BigInt,
+        V: dv,
+    } : undefined;
+}
+exports.detectBi = detectBi;
+detectBi();
+function assertBi(bi) {
+    if (!bi)
+        throw new Error("BigInt unavailable, see https://github.com/timostamm/protobuf-ts/blob/v1.0.8/MANUAL.md#bigint-support");
+}
+// used to validate from(string) input (when bigint is unavailable)
+const RE_DECIMAL_STR = /^-?[0-9]+$/;
+// constants for binary math
+const TWO_PWR_32_DBL = 0x100000000;
+const HALF_2_PWR_32 = 0x080000000;
+// base class for PbLong and PbULong provides shared code
+class SharedPbLong {
+    /**
+     * Create a new instance with the given bits.
+     */
+    constructor(lo, hi) {
+        this.lo = lo | 0;
+        this.hi = hi | 0;
+    }
+    /**
+     * Is this instance equal to 0?
+     */
+    isZero() {
+        return this.lo == 0 && this.hi == 0;
+    }
+    /**
+     * Convert to a native number.
+     */
+    toNumber() {
+        let result = this.hi * TWO_PWR_32_DBL + (this.lo >>> 0);
+        if (!Number.isSafeInteger(result))
+            throw new Error("cannot convert to safe number");
+        return result;
+    }
+}
+/**
+ * 64-bit unsigned integer as two 32-bit values.
+ * Converts between `string`, `number` and `bigint` representations.
+ */
+class PbULong extends SharedPbLong {
+    /**
+     * Create instance from a `string`, `number` or `bigint`.
+     */
+    static from(value) {
+        if (BI)
+            // noinspection FallThroughInSwitchStatementJS
+            switch (typeof value) {
+                case "string":
+                    if (value == "0")
+                        return this.ZERO;
+                    if (value == "")
+                        throw new Error('string is no integer');
+                    value = BI.C(value);
+                case "number":
+                    if (value === 0)
+                        return this.ZERO;
+                    value = BI.C(value);
+                case "bigint":
+                    if (!value)
+                        return this.ZERO;
+                    if (value < BI.UMIN)
+                        throw new Error('signed value for ulong');
+                    if (value > BI.UMAX)
+                        throw new Error('ulong too large');
+                    BI.V.setBigUint64(0, value, true);
+                    return new PbULong(BI.V.getInt32(0, true), BI.V.getInt32(4, true));
+            }
+        else
+            switch (typeof value) {
+                case "string":
+                    if (value == "0")
+                        return this.ZERO;
+                    value = value.trim();
+                    if (!RE_DECIMAL_STR.test(value))
+                        throw new Error('string is no integer');
+                    let [minus, lo, hi] = goog_varint_1.int64fromString(value);
+                    if (minus)
+                        throw new Error('signed value for ulong');
+                    return new PbULong(lo, hi);
+                case "number":
+                    if (value == 0)
+                        return this.ZERO;
+                    if (!Number.isSafeInteger(value))
+                        throw new Error('number is no integer');
+                    if (value < 0)
+                        throw new Error('signed value for ulong');
+                    return new PbULong(value, value / TWO_PWR_32_DBL);
+            }
+        throw new Error('unknown value ' + typeof value);
+    }
+    /**
+     * Convert to decimal string.
+     */
+    toString() {
+        return BI ? this.toBigInt().toString() : goog_varint_1.int64toString(this.lo, this.hi);
+    }
+    /**
+     * Convert to native bigint.
+     */
+    toBigInt() {
+        assertBi(BI);
+        BI.V.setInt32(0, this.lo, true);
+        BI.V.setInt32(4, this.hi, true);
+        return BI.V.getBigUint64(0, true);
+    }
+}
+exports.PbULong = PbULong;
+/**
+ * ulong 0 singleton.
+ */
+PbULong.ZERO = new PbULong(0, 0);
+/**
+ * 64-bit signed integer as two 32-bit values.
+ * Converts between `string`, `number` and `bigint` representations.
+ */
+class PbLong extends SharedPbLong {
+    /**
+     * Create instance from a `string`, `number` or `bigint`.
+     */
+    static from(value) {
+        if (BI)
+            // noinspection FallThroughInSwitchStatementJS
+            switch (typeof value) {
+                case "string":
+                    if (value == "0")
+                        return this.ZERO;
+                    if (value == "")
+                        throw new Error('string is no integer');
+                    value = BI.C(value);
+                case "number":
+                    if (value === 0)
+                        return this.ZERO;
+                    value = BI.C(value);
+                case "bigint":
+                    if (!value)
+                        return this.ZERO;
+                    if (value < BI.MIN)
+                        throw new Error('signed long too small');
+                    if (value > BI.MAX)
+                        throw new Error('signed long too large');
+                    BI.V.setBigInt64(0, value, true);
+                    return new PbLong(BI.V.getInt32(0, true), BI.V.getInt32(4, true));
+            }
+        else
+            switch (typeof value) {
+                case "string":
+                    if (value == "0")
+                        return this.ZERO;
+                    value = value.trim();
+                    if (!RE_DECIMAL_STR.test(value))
+                        throw new Error('string is no integer');
+                    let [minus, lo, hi] = goog_varint_1.int64fromString(value);
+                    if (minus) {
+                        if (hi > HALF_2_PWR_32 || (hi == HALF_2_PWR_32 && lo != 0))
+                            throw new Error('signed long too small');
+                    }
+                    else if (hi >= HALF_2_PWR_32)
+                        throw new Error('signed long too large');
+                    let pbl = new PbLong(lo, hi);
+                    return minus ? pbl.negate() : pbl;
+                case "number":
+                    if (value == 0)
+                        return this.ZERO;
+                    if (!Number.isSafeInteger(value))
+                        throw new Error('number is no integer');
+                    return value > 0
+                        ? new PbLong(value, value / TWO_PWR_32_DBL)
+                        : new PbLong(-value, -value / TWO_PWR_32_DBL).negate();
+            }
+        throw new Error('unknown value ' + typeof value);
+    }
+    /**
+     * Do we have a minus sign?
+     */
+    isNegative() {
+        return (this.hi & HALF_2_PWR_32) !== 0;
+    }
+    /**
+     * Negate two's complement.
+     * Invert all the bits and add one to the result.
+     */
+    negate() {
+        let hi = ~this.hi, lo = this.lo;
+        if (lo)
+            lo = ~lo + 1;
+        else
+            hi += 1;
+        return new PbLong(lo, hi);
+    }
+    /**
+     * Convert to decimal string.
+     */
+    toString() {
+        if (BI)
+            return this.toBigInt().toString();
+        if (this.isNegative()) {
+            let n = this.negate();
+            return '-' + goog_varint_1.int64toString(n.lo, n.hi);
+        }
+        return goog_varint_1.int64toString(this.lo, this.hi);
+    }
+    /**
+     * Convert to native bigint.
+     */
+    toBigInt() {
+        assertBi(BI);
+        BI.V.setInt32(0, this.lo, true);
+        BI.V.setInt32(4, this.hi, true);
+        return BI.V.getBigInt64(0, true);
+    }
+}
+exports.PbLong = PbLong;
+/**
+ * long 0 singleton.
+ */
+PbLong.ZERO = new PbLong(0, 0);
+
+
+/***/ }),
+
+/***/ 8319:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+// Copyright (c) 2016, Daniel Wirtz  All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+// * Redistributions of source code must retain the above copyright
+//   notice, this list of conditions and the following disclaimer.
+// * Redistributions in binary form must reproduce the above copyright
+//   notice, this list of conditions and the following disclaimer in the
+//   documentation and/or other materials provided with the distribution.
+// * Neither the name of its author, nor the names of its contributors
+//   may be used to endorse or promote products derived from this software
+//   without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.utf8read = void 0;
+const fromCharCodes = (chunk) => String.fromCharCode.apply(String, chunk);
+/**
+ * @deprecated This function will no longer be exported with the next major
+ * release, since protobuf-ts has switch to TextDecoder API. If you need this
+ * function, please migrate to @protobufjs/utf8. For context, see
+ * https://github.com/timostamm/protobuf-ts/issues/184
+ *
+ * Reads UTF8 bytes as a string.
+ *
+ * See [protobufjs / utf8](https://github.com/protobufjs/protobuf.js/blob/9893e35b854621cce64af4bf6be2cff4fb892796/lib/utf8/index.js#L40)
+ *
+ * Copyright (c) 2016, Daniel Wirtz
+ */
+function utf8read(bytes) {
+    if (bytes.length < 1)
+        return "";
+    let pos = 0, // position in bytes
+    parts = [], chunk = [], i = 0, // char offset
+    t; // temporary
+    let len = bytes.length;
+    while (pos < len) {
+        t = bytes[pos++];
+        if (t < 128)
+            chunk[i++] = t;
+        else if (t > 191 && t < 224)
+            chunk[i++] = (t & 31) << 6 | bytes[pos++] & 63;
+        else if (t > 239 && t < 365) {
+            t = ((t & 7) << 18 | (bytes[pos++] & 63) << 12 | (bytes[pos++] & 63) << 6 | bytes[pos++] & 63) - 0x10000;
+            chunk[i++] = 0xD800 + (t >> 10);
+            chunk[i++] = 0xDC00 + (t & 1023);
+        }
+        else
+            chunk[i++] = (t & 15) << 12 | (bytes[pos++] & 63) << 6 | bytes[pos++] & 63;
+        if (i > 8191) {
+            parts.push(fromCharCodes(chunk));
+            i = 0;
+        }
+    }
+    if (parts.length) {
+        if (i)
+            parts.push(fromCharCodes(chunk.slice(0, i)));
+        return parts.join("");
+    }
+    return fromCharCodes(chunk.slice(0, i));
+}
+exports.utf8read = utf8read;
+
+
+/***/ }),
+
+/***/ 5599:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ReflectionBinaryReader = void 0;
+const binary_format_contract_1 = __nccwpck_require__(12);
+const reflection_info_1 = __nccwpck_require__(4746);
+const reflection_long_convert_1 = __nccwpck_require__(5920);
+const reflection_scalar_default_1 = __nccwpck_require__(6435);
+/**
+ * Reads proto3 messages in binary format using reflection information.
+ *
+ * https://developers.google.com/protocol-buffers/docs/encoding
+ */
+class ReflectionBinaryReader {
+    constructor(info) {
+        this.info = info;
+    }
+    prepare() {
+        var _a;
+        if (!this.fieldNoToField) {
+            const fieldsInput = (_a = this.info.fields) !== null && _a !== void 0 ? _a : [];
+            this.fieldNoToField = new Map(fieldsInput.map(field => [field.no, field]));
+        }
+    }
+    /**
+     * Reads a message from binary format into the target message.
+     *
+     * Repeated fields are appended. Map entries are added, overwriting
+     * existing keys.
+     *
+     * If a message field is already present, it will be merged with the
+     * new data.
+     */
+    read(reader, message, options, length) {
+        this.prepare();
+        const end = length === undefined ? reader.len : reader.pos + length;
+        while (reader.pos < end) {
+            // read the tag and find the field
+            const [fieldNo, wireType] = reader.tag(), field = this.fieldNoToField.get(fieldNo);
+            if (!field) {
+                let u = options.readUnknownField;
+                if (u == "throw")
+                    throw new Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.info.typeName}`);
+                let d = reader.skip(wireType);
+                if (u !== false)
+                    (u === true ? binary_format_contract_1.UnknownFieldHandler.onRead : u)(this.info.typeName, message, fieldNo, wireType, d);
+                continue;
+            }
+            // target object for the field we are reading
+            let target = message, repeated = field.repeat, localName = field.localName;
+            // if field is member of oneof ADT, use ADT as target
+            if (field.oneof) {
+                target = target[field.oneof];
+                // if other oneof member selected, set new ADT
+                if (target.oneofKind !== localName)
+                    target = message[field.oneof] = {
+                        oneofKind: localName
+                    };
+            }
+            // we have handled oneof above, we just have read the value into `target[localName]`
+            switch (field.kind) {
+                case "scalar":
+                case "enum":
+                    let T = field.kind == "enum" ? reflection_info_1.ScalarType.INT32 : field.T;
+                    let L = field.kind == "scalar" ? field.L : undefined;
+                    if (repeated) {
+                        let arr = target[localName]; // safe to assume presence of array, oneof cannot contain repeated values
+                        if (wireType == binary_format_contract_1.WireType.LengthDelimited && T != reflection_info_1.ScalarType.STRING && T != reflection_info_1.ScalarType.BYTES) {
+                            let e = reader.uint32() + reader.pos;
+                            while (reader.pos < e)
+                                arr.push(this.scalar(reader, T, L));
+                        }
+                        else
+                            arr.push(this.scalar(reader, T, L));
+                    }
+                    else
+                        target[localName] = this.scalar(reader, T, L);
+                    break;
+                case "message":
+                    if (repeated) {
+                        let arr = target[localName]; // safe to assume presence of array, oneof cannot contain repeated values
+                        let msg = field.T().internalBinaryRead(reader, reader.uint32(), options);
+                        arr.push(msg);
+                    }
+                    else
+                        target[localName] = field.T().internalBinaryRead(reader, reader.uint32(), options, target[localName]);
+                    break;
+                case "map":
+                    let [mapKey, mapVal] = this.mapEntry(field, reader, options);
+                    // safe to assume presence of map object, oneof cannot contain repeated values
+                    target[localName][mapKey] = mapVal;
+                    break;
+            }
+        }
+    }
+    /**
+     * Read a map field, expecting key field = 1, value field = 2
+     */
+    mapEntry(field, reader, options) {
+        let length = reader.uint32();
+        let end = reader.pos + length;
+        let key = undefined; // javascript only allows number or string for object properties
+        let val = undefined;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case 1:
+                    if (field.K == reflection_info_1.ScalarType.BOOL)
+                        key = reader.bool().toString();
+                    else
+                        // long types are read as string, number types are okay as number
+                        key = this.scalar(reader, field.K, reflection_info_1.LongType.STRING);
+                    break;
+                case 2:
+                    switch (field.V.kind) {
+                        case "scalar":
+                            val = this.scalar(reader, field.V.T, field.V.L);
+                            break;
+                        case "enum":
+                            val = reader.int32();
+                            break;
+                        case "message":
+                            val = field.V.T().internalBinaryRead(reader, reader.uint32(), options);
+                            break;
+                    }
+                    break;
+                default:
+                    throw new Error(`Unknown field ${fieldNo} (wire type ${wireType}) in map entry for ${this.info.typeName}#${field.name}`);
+            }
+        }
+        if (key === undefined) {
+            let keyRaw = reflection_scalar_default_1.reflectionScalarDefault(field.K);
+            key = field.K == reflection_info_1.ScalarType.BOOL ? keyRaw.toString() : keyRaw;
+        }
+        if (val === undefined)
+            switch (field.V.kind) {
+                case "scalar":
+                    val = reflection_scalar_default_1.reflectionScalarDefault(field.V.T, field.V.L);
+                    break;
+                case "enum":
+                    val = 0;
+                    break;
+                case "message":
+                    val = field.V.T().create();
+                    break;
+            }
+        return [key, val];
+    }
+    scalar(reader, type, longType) {
+        switch (type) {
+            case reflection_info_1.ScalarType.INT32:
+                return reader.int32();
+            case reflection_info_1.ScalarType.STRING:
+                return reader.string();
+            case reflection_info_1.ScalarType.BOOL:
+                return reader.bool();
+            case reflection_info_1.ScalarType.DOUBLE:
+                return reader.double();
+            case reflection_info_1.ScalarType.FLOAT:
+                return reader.float();
+            case reflection_info_1.ScalarType.INT64:
+                return reflection_long_convert_1.reflectionLongConvert(reader.int64(), longType);
+            case reflection_info_1.ScalarType.UINT64:
+                return reflection_long_convert_1.reflectionLongConvert(reader.uint64(), longType);
+            case reflection_info_1.ScalarType.FIXED64:
+                return reflection_long_convert_1.reflectionLongConvert(reader.fixed64(), longType);
+            case reflection_info_1.ScalarType.FIXED32:
+                return reader.fixed32();
+            case reflection_info_1.ScalarType.BYTES:
+                return reader.bytes();
+            case reflection_info_1.ScalarType.UINT32:
+                return reader.uint32();
+            case reflection_info_1.ScalarType.SFIXED32:
+                return reader.sfixed32();
+            case reflection_info_1.ScalarType.SFIXED64:
+                return reflection_long_convert_1.reflectionLongConvert(reader.sfixed64(), longType);
+            case reflection_info_1.ScalarType.SINT32:
+                return reader.sint32();
+            case reflection_info_1.ScalarType.SINT64:
+                return reflection_long_convert_1.reflectionLongConvert(reader.sint64(), longType);
+        }
+    }
+}
+exports.ReflectionBinaryReader = ReflectionBinaryReader;
+
+
+/***/ }),
+
+/***/ 1334:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ReflectionBinaryWriter = void 0;
+const binary_format_contract_1 = __nccwpck_require__(12);
+const reflection_info_1 = __nccwpck_require__(4746);
+const assert_1 = __nccwpck_require__(1651);
+const pb_long_1 = __nccwpck_require__(2486);
+/**
+ * Writes proto3 messages in binary format using reflection information.
+ *
+ * https://developers.google.com/protocol-buffers/docs/encoding
+ */
+class ReflectionBinaryWriter {
+    constructor(info) {
+        this.info = info;
+    }
+    prepare() {
+        if (!this.fields) {
+            const fieldsInput = this.info.fields ? this.info.fields.concat() : [];
+            this.fields = fieldsInput.sort((a, b) => a.no - b.no);
+        }
+    }
+    /**
+     * Writes the message to binary format.
+     */
+    write(message, writer, options) {
+        this.prepare();
+        for (const field of this.fields) {
+            let value, // this will be our field value, whether it is member of a oneof or not
+            emitDefault, // whether we emit the default value (only true for oneof members)
+            repeated = field.repeat, localName = field.localName;
+            // handle oneof ADT
+            if (field.oneof) {
+                const group = message[field.oneof];
+                if (group.oneofKind !== localName)
+                    continue; // if field is not selected, skip
+                value = group[localName];
+                emitDefault = true;
+            }
+            else {
+                value = message[localName];
+                emitDefault = false;
+            }
+            // we have handled oneof above. we just have to honor `emitDefault`.
+            switch (field.kind) {
+                case "scalar":
+                case "enum":
+                    let T = field.kind == "enum" ? reflection_info_1.ScalarType.INT32 : field.T;
+                    if (repeated) {
+                        assert_1.assert(Array.isArray(value));
+                        if (repeated == reflection_info_1.RepeatType.PACKED)
+                            this.packed(writer, T, field.no, value);
+                        else
+                            for (const item of value)
+                                this.scalar(writer, T, field.no, item, true);
+                    }
+                    else if (value === undefined)
+                        assert_1.assert(field.opt);
+                    else
+                        this.scalar(writer, T, field.no, value, emitDefault || field.opt);
+                    break;
+                case "message":
+                    if (repeated) {
+                        assert_1.assert(Array.isArray(value));
+                        for (const item of value)
+                            this.message(writer, options, field.T(), field.no, item);
+                    }
+                    else {
+                        this.message(writer, options, field.T(), field.no, value);
+                    }
+                    break;
+                case "map":
+                    assert_1.assert(typeof value == 'object' && value !== null);
+                    for (const [key, val] of Object.entries(value))
+                        this.mapEntry(writer, options, field, key, val);
+                    break;
+            }
+        }
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u === true ? binary_format_contract_1.UnknownFieldHandler.onWrite : u)(this.info.typeName, message, writer);
+    }
+    mapEntry(writer, options, field, key, value) {
+        writer.tag(field.no, binary_format_contract_1.WireType.LengthDelimited);
+        writer.fork();
+        // javascript only allows number or string for object properties
+        // we convert from our representation to the protobuf type
+        let keyValue = key;
+        switch (field.K) {
+            case reflection_info_1.ScalarType.INT32:
+            case reflection_info_1.ScalarType.FIXED32:
+            case reflection_info_1.ScalarType.UINT32:
+            case reflection_info_1.ScalarType.SFIXED32:
+            case reflection_info_1.ScalarType.SINT32:
+                keyValue = Number.parseInt(key);
+                break;
+            case reflection_info_1.ScalarType.BOOL:
+                assert_1.assert(key == 'true' || key == 'false');
+                keyValue = key == 'true';
+                break;
+        }
+        // write key, expecting key field number = 1
+        this.scalar(writer, field.K, 1, keyValue, true);
+        // write value, expecting value field number = 2
+        switch (field.V.kind) {
+            case 'scalar':
+                this.scalar(writer, field.V.T, 2, value, true);
+                break;
+            case 'enum':
+                this.scalar(writer, reflection_info_1.ScalarType.INT32, 2, value, true);
+                break;
+            case 'message':
+                this.message(writer, options, field.V.T(), 2, value);
+                break;
+        }
+        writer.join();
+    }
+    message(writer, options, handler, fieldNo, value) {
+        if (value === undefined)
+            return;
+        handler.internalBinaryWrite(value, writer.tag(fieldNo, binary_format_contract_1.WireType.LengthDelimited).fork(), options);
+        writer.join();
+    }
+    /**
+     * Write a single scalar value.
+     */
+    scalar(writer, type, fieldNo, value, emitDefault) {
+        let [wireType, method, isDefault] = this.scalarInfo(type, value);
+        if (!isDefault || emitDefault) {
+            writer.tag(fieldNo, wireType);
+            writer[method](value);
+        }
+    }
+    /**
+     * Write an array of scalar values in packed format.
+     */
+    packed(writer, type, fieldNo, value) {
+        if (!value.length)
+            return;
+        assert_1.assert(type !== reflection_info_1.ScalarType.BYTES && type !== reflection_info_1.ScalarType.STRING);
+        // write tag
+        writer.tag(fieldNo, binary_format_contract_1.WireType.LengthDelimited);
+        // begin length-delimited
+        writer.fork();
+        // write values without tags
+        let [, method,] = this.scalarInfo(type);
+        for (let i = 0; i < value.length; i++)
+            writer[method](value[i]);
+        // end length delimited
+        writer.join();
+    }
+    /**
+     * Get information for writing a scalar value.
+     *
+     * Returns tuple:
+     * [0]: appropriate WireType
+     * [1]: name of the appropriate method of IBinaryWriter
+     * [2]: whether the given value is a default value
+     *
+     * If argument `value` is omitted, [2] is always false.
+     */
+    scalarInfo(type, value) {
+        let t = binary_format_contract_1.WireType.Varint;
+        let m;
+        let i = value === undefined;
+        let d = value === 0;
+        switch (type) {
+            case reflection_info_1.ScalarType.INT32:
+                m = "int32";
+                break;
+            case reflection_info_1.ScalarType.STRING:
+                d = i || !value.length;
+                t = binary_format_contract_1.WireType.LengthDelimited;
+                m = "string";
+                break;
+            case reflection_info_1.ScalarType.BOOL:
+                d = value === false;
+                m = "bool";
+                break;
+            case reflection_info_1.ScalarType.UINT32:
+                m = "uint32";
+                break;
+            case reflection_info_1.ScalarType.DOUBLE:
+                t = binary_format_contract_1.WireType.Bit64;
+                m = "double";
+                break;
+            case reflection_info_1.ScalarType.FLOAT:
+                t = binary_format_contract_1.WireType.Bit32;
+                m = "float";
+                break;
+            case reflection_info_1.ScalarType.INT64:
+                d = i || pb_long_1.PbLong.from(value).isZero();
+                m = "int64";
+                break;
+            case reflection_info_1.ScalarType.UINT64:
+                d = i || pb_long_1.PbULong.from(value).isZero();
+                m = "uint64";
+                break;
+            case reflection_info_1.ScalarType.FIXED64:
+                d = i || pb_long_1.PbULong.from(value).isZero();
+                t = binary_format_contract_1.WireType.Bit64;
+                m = "fixed64";
+                break;
+            case reflection_info_1.ScalarType.BYTES:
+                d = i || !value.byteLength;
+                t = binary_format_contract_1.WireType.LengthDelimited;
+                m = "bytes";
+                break;
+            case reflection_info_1.ScalarType.FIXED32:
+                t = binary_format_contract_1.WireType.Bit32;
+                m = "fixed32";
+                break;
+            case reflection_info_1.ScalarType.SFIXED32:
+                t = binary_format_contract_1.WireType.Bit32;
+                m = "sfixed32";
+                break;
+            case reflection_info_1.ScalarType.SFIXED64:
+                d = i || pb_long_1.PbLong.from(value).isZero();
+                t = binary_format_contract_1.WireType.Bit64;
+                m = "sfixed64";
+                break;
+            case reflection_info_1.ScalarType.SINT32:
+                m = "sint32";
+                break;
+            case reflection_info_1.ScalarType.SINT64:
+                d = i || pb_long_1.PbLong.from(value).isZero();
+                m = "sint64";
+                break;
+        }
+        return [t, m, i || d];
+    }
+}
+exports.ReflectionBinaryWriter = ReflectionBinaryWriter;
+
+
+/***/ }),
+
+/***/ 4043:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.containsMessageType = void 0;
+const message_type_contract_1 = __nccwpck_require__(3757);
+/**
+ * Check if the provided object is a proto message.
+ *
+ * Note that this is an experimental feature - it is here to stay, but
+ * implementation details may change without notice.
+ */
+function containsMessageType(msg) {
+    return msg[message_type_contract_1.MESSAGE_TYPE] != null;
+}
+exports.containsMessageType = containsMessageType;
+
+
+/***/ }),
+
+/***/ 3144:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.reflectionCreate = void 0;
+const reflection_scalar_default_1 = __nccwpck_require__(6435);
+const message_type_contract_1 = __nccwpck_require__(3757);
+/**
+ * Creates an instance of the generic message, using the field
+ * information.
+ */
+function reflectionCreate(type) {
+    /**
+     * This ternary can be removed in the next major version.
+     * The `Object.create()` code path utilizes a new `messagePrototype`
+     * property on the `IMessageType` which has this same `MESSAGE_TYPE`
+     * non-enumerable property on it. Doing it this way means that we only
+     * pay the cost of `Object.defineProperty()` once per `IMessageType`
+     * class of once per "instance". The falsy code path is only provided
+     * for backwards compatibility in cases where the runtime library is
+     * updated without also updating the generated code.
+     */
+    const msg = type.messagePrototype
+        ? Object.create(type.messagePrototype)
+        : Object.defineProperty({}, message_type_contract_1.MESSAGE_TYPE, { value: type });
+    for (let field of type.fields) {
+        let name = field.localName;
+        if (field.opt)
+            continue;
+        if (field.oneof)
+            msg[field.oneof] = { oneofKind: undefined };
+        else if (field.repeat)
+            msg[name] = [];
+        else
+            switch (field.kind) {
+                case "scalar":
+                    msg[name] = reflection_scalar_default_1.reflectionScalarDefault(field.T, field.L);
+                    break;
+                case "enum":
+                    // we require 0 to be default value for all enums
+                    msg[name] = 0;
+                    break;
+                case "map":
+                    msg[name] = {};
+                    break;
+            }
+    }
+    return msg;
+}
+exports.reflectionCreate = reflectionCreate;
+
+
+/***/ }),
+
+/***/ 4970:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.reflectionEquals = void 0;
+const reflection_info_1 = __nccwpck_require__(4746);
+/**
+ * Determines whether two message of the same type have the same field values.
+ * Checks for deep equality, traversing repeated fields, oneof groups, maps
+ * and messages recursively.
+ * Will also return true if both messages are `undefined`.
+ */
+function reflectionEquals(info, a, b) {
+    if (a === b)
+        return true;
+    if (!a || !b)
+        return false;
+    for (let field of info.fields) {
+        let localName = field.localName;
+        let val_a = field.oneof ? a[field.oneof][localName] : a[localName];
+        let val_b = field.oneof ? b[field.oneof][localName] : b[localName];
+        switch (field.kind) {
+            case "enum":
+            case "scalar":
+                let t = field.kind == "enum" ? reflection_info_1.ScalarType.INT32 : field.T;
+                if (!(field.repeat
+                    ? repeatedPrimitiveEq(t, val_a, val_b)
+                    : primitiveEq(t, val_a, val_b)))
+                    return false;
+                break;
+            case "map":
+                if (!(field.V.kind == "message"
+                    ? repeatedMsgEq(field.V.T(), objectValues(val_a), objectValues(val_b))
+                    : repeatedPrimitiveEq(field.V.kind == "enum" ? reflection_info_1.ScalarType.INT32 : field.V.T, objectValues(val_a), objectValues(val_b))))
+                    return false;
+                break;
+            case "message":
+                let T = field.T();
+                if (!(field.repeat
+                    ? repeatedMsgEq(T, val_a, val_b)
+                    : T.equals(val_a, val_b)))
+                    return false;
+                break;
+        }
+    }
+    return true;
+}
+exports.reflectionEquals = reflectionEquals;
+const objectValues = Object.values;
+function primitiveEq(type, a, b) {
+    if (a === b)
+        return true;
+    if (type !== reflection_info_1.ScalarType.BYTES)
+        return false;
+    let ba = a;
+    let bb = b;
+    if (ba.length !== bb.length)
+        return false;
+    for (let i = 0; i < ba.length; i++)
+        if (ba[i] != bb[i])
+            return false;
+    return true;
+}
+function repeatedPrimitiveEq(type, a, b) {
+    if (a.length !== b.length)
+        return false;
+    for (let i = 0; i < a.length; i++)
+        if (!primitiveEq(type, a[i], b[i]))
+            return false;
+    return true;
+}
+function repeatedMsgEq(type, a, b) {
+    if (a.length !== b.length)
+        return false;
+    for (let i = 0; i < a.length; i++)
+        if (!type.equals(a[i], b[i]))
+            return false;
+    return true;
+}
+
+
+/***/ }),
+
+/***/ 4746:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.readMessageOption = exports.readFieldOption = exports.readFieldOptions = exports.normalizeFieldInfo = exports.RepeatType = exports.LongType = exports.ScalarType = void 0;
+const lower_camel_case_1 = __nccwpck_require__(6127);
+/**
+ * Scalar value types. This is a subset of field types declared by protobuf
+ * enum google.protobuf.FieldDescriptorProto.Type The types GROUP and MESSAGE
+ * are omitted, but the numerical values are identical.
+ */
+var ScalarType;
+(function (ScalarType) {
+    // 0 is reserved for errors.
+    // Order is weird for historical reasons.
+    ScalarType[ScalarType["DOUBLE"] = 1] = "DOUBLE";
+    ScalarType[ScalarType["FLOAT"] = 2] = "FLOAT";
+    // Not ZigZag encoded.  Negative numbers take 10 bytes.  Use TYPE_SINT64 if
+    // negative values are likely.
+    ScalarType[ScalarType["INT64"] = 3] = "INT64";
+    ScalarType[ScalarType["UINT64"] = 4] = "UINT64";
+    // Not ZigZag encoded.  Negative numbers take 10 bytes.  Use TYPE_SINT32 if
+    // negative values are likely.
+    ScalarType[ScalarType["INT32"] = 5] = "INT32";
+    ScalarType[ScalarType["FIXED64"] = 6] = "FIXED64";
+    ScalarType[ScalarType["FIXED32"] = 7] = "FIXED32";
+    ScalarType[ScalarType["BOOL"] = 8] = "BOOL";
+    ScalarType[ScalarType["STRING"] = 9] = "STRING";
+    // Tag-delimited aggregate.
+    // Group type is deprecated and not supported in proto3. However, Proto3
+    // implementations should still be able to parse the group wire format and
+    // treat group fields as unknown fields.
+    // TYPE_GROUP = 10,
+    // TYPE_MESSAGE = 11,  // Length-delimited aggregate.
+    // New in version 2.
+    ScalarType[ScalarType["BYTES"] = 12] = "BYTES";
+    ScalarType[ScalarType["UINT32"] = 13] = "UINT32";
+    // TYPE_ENUM = 14,
+    ScalarType[ScalarType["SFIXED32"] = 15] = "SFIXED32";
+    ScalarType[ScalarType["SFIXED64"] = 16] = "SFIXED64";
+    ScalarType[ScalarType["SINT32"] = 17] = "SINT32";
+    ScalarType[ScalarType["SINT64"] = 18] = "SINT64";
+})(ScalarType = exports.ScalarType || (exports.ScalarType = {}));
+/**
+ * JavaScript representation of 64 bit integral types. Equivalent to the
+ * field option "jstype".
+ *
+ * By default, protobuf-ts represents 64 bit types as `bigint`.
+ *
+ * You can change the default behaviour by enabling the plugin parameter
+ * `long_type_string`, which will represent 64 bit types as `string`.
+ *
+ * Alternatively, you can change the behaviour for individual fields
+ * with the field option "jstype":
+ *
+ * ```protobuf
+ * uint64 my_field = 1 [jstype = JS_STRING];
+ * uint64 other_field = 2 [jstype = JS_NUMBER];
+ * ```
+ */
+var LongType;
+(function (LongType) {
+    /**
+     * Use JavaScript `bigint`.
+     *
+     * Field option `[jstype = JS_NORMAL]`.
+     */
+    LongType[LongType["BIGINT"] = 0] = "BIGINT";
+    /**
+     * Use JavaScript `string`.
+     *
+     * Field option `[jstype = JS_STRING]`.
+     */
+    LongType[LongType["STRING"] = 1] = "STRING";
+    /**
+     * Use JavaScript `number`.
+     *
+     * Large values will loose precision.
+     *
+     * Field option `[jstype = JS_NUMBER]`.
+     */
+    LongType[LongType["NUMBER"] = 2] = "NUMBER";
+})(LongType = exports.LongType || (exports.LongType = {}));
+/**
+ * Protobuf 2.1.0 introduced packed repeated fields.
+ * Setting the field option `[packed = true]` enables packing.
+ *
+ * In proto3, all repeated fields are packed by default.
+ * Setting the field option `[packed = false]` disables packing.
+ *
+ * Packed repeated fields are encoded with a single tag,
+ * then a length-delimiter, then the element values.
+ *
+ * Unpacked repeated fields are encoded with a tag and
+ * value for each element.
+ *
+ * `bytes` and `string` cannot be packed.
+ */
+var RepeatType;
+(function (RepeatType) {
+    /**
+     * The field is not repeated.
+     */
+    RepeatType[RepeatType["NO"] = 0] = "NO";
+    /**
+     * The field is repeated and should be packed.
+     * Invalid for `bytes` and `string`, they cannot be packed.
+     */
+    RepeatType[RepeatType["PACKED"] = 1] = "PACKED";
+    /**
+     * The field is repeated but should not be packed.
+     * The only valid repeat type for repeated `bytes` and `string`.
+     */
+    RepeatType[RepeatType["UNPACKED"] = 2] = "UNPACKED";
+})(RepeatType = exports.RepeatType || (exports.RepeatType = {}));
+/**
+ * Turns PartialFieldInfo into FieldInfo.
+ */
+function normalizeFieldInfo(field) {
+    var _a, _b, _c, _d;
+    field.localName = (_a = field.localName) !== null && _a !== void 0 ? _a : lower_camel_case_1.lowerCamelCase(field.name);
+    field.jsonName = (_b = field.jsonName) !== null && _b !== void 0 ? _b : lower_camel_case_1.lowerCamelCase(field.name);
+    field.repeat = (_c = field.repeat) !== null && _c !== void 0 ? _c : RepeatType.NO;
+    field.opt = (_d = field.opt) !== null && _d !== void 0 ? _d : (field.repeat ? false : field.oneof ? false : field.kind == "message");
+    return field;
+}
+exports.normalizeFieldInfo = normalizeFieldInfo;
+/**
+ * Read custom field options from a generated message type.
+ *
+ * @deprecated use readFieldOption()
+ */
+function readFieldOptions(messageType, fieldName, extensionName, extensionType) {
+    var _a;
+    const options = (_a = messageType.fields.find((m, i) => m.localName == fieldName || i == fieldName)) === null || _a === void 0 ? void 0 : _a.options;
+    return options && options[extensionName] ? extensionType.fromJson(options[extensionName]) : undefined;
+}
+exports.readFieldOptions = readFieldOptions;
+function readFieldOption(messageType, fieldName, extensionName, extensionType) {
+    var _a;
+    const options = (_a = messageType.fields.find((m, i) => m.localName == fieldName || i == fieldName)) === null || _a === void 0 ? void 0 : _a.options;
+    if (!options) {
+        return undefined;
+    }
+    const optionVal = options[extensionName];
+    if (optionVal === undefined) {
+        return optionVal;
+    }
+    return extensionType ? extensionType.fromJson(optionVal) : optionVal;
+}
+exports.readFieldOption = readFieldOption;
+function readMessageOption(messageType, extensionName, extensionType) {
+    const options = messageType.options;
+    const optionVal = options[extensionName];
+    if (optionVal === undefined) {
+        return optionVal;
+    }
+    return extensionType ? extensionType.fromJson(optionVal) : optionVal;
+}
+exports.readMessageOption = readMessageOption;
+
+
+/***/ }),
+
+/***/ 5094:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ReflectionJsonReader = void 0;
+const json_typings_1 = __nccwpck_require__(2840);
+const base64_1 = __nccwpck_require__(5553);
+const reflection_info_1 = __nccwpck_require__(4746);
+const pb_long_1 = __nccwpck_require__(2486);
+const assert_1 = __nccwpck_require__(1651);
+const reflection_long_convert_1 = __nccwpck_require__(5920);
+/**
+ * Reads proto3 messages in canonical JSON format using reflection information.
+ *
+ * https://developers.google.com/protocol-buffers/docs/proto3#json
+ */
+class ReflectionJsonReader {
+    constructor(info) {
+        this.info = info;
+    }
+    prepare() {
+        var _a;
+        if (this.fMap === undefined) {
+            this.fMap = {};
+            const fieldsInput = (_a = this.info.fields) !== null && _a !== void 0 ? _a : [];
+            for (const field of fieldsInput) {
+                this.fMap[field.name] = field;
+                this.fMap[field.jsonName] = field;
+                this.fMap[field.localName] = field;
+            }
+        }
+    }
+    // Cannot parse JSON <type of jsonValue> for <type name>#<fieldName>.
+    assert(condition, fieldName, jsonValue) {
+        if (!condition) {
+            let what = json_typings_1.typeofJsonValue(jsonValue);
+            if (what == "number" || what == "boolean")
+                what = jsonValue.toString();
+            throw new Error(`Cannot parse JSON ${what} for ${this.info.typeName}#${fieldName}`);
+        }
+    }
+    /**
+     * Reads a message from canonical JSON format into the target message.
+     *
+     * Repeated fields are appended. Map entries are added, overwriting
+     * existing keys.
+     *
+     * If a message field is already present, it will be merged with the
+     * new data.
+     */
+    read(input, message, options) {
+        this.prepare();
+        const oneofsHandled = [];
+        for (const [jsonKey, jsonValue] of Object.entries(input)) {
+            const field = this.fMap[jsonKey];
+            if (!field) {
+                if (!options.ignoreUnknownFields)
+                    throw new Error(`Found unknown field while reading ${this.info.typeName} from JSON format. JSON key: ${jsonKey}`);
+                continue;
+            }
+            const localName = field.localName;
+            // handle oneof ADT
+            let target; // this will be the target for the field value, whether it is member of a oneof or not
+            if (field.oneof) {
+                if (jsonValue === null && (field.kind !== 'enum' || field.T()[0] !== 'google.protobuf.NullValue')) {
+                    continue;
+                }
+                // since json objects are unordered by specification, it is not possible to take the last of multiple oneofs
+                if (oneofsHandled.includes(field.oneof))
+                    throw new Error(`Multiple members of the oneof group "${field.oneof}" of ${this.info.typeName} are present in JSON.`);
+                oneofsHandled.push(field.oneof);
+                target = message[field.oneof] = {
+                    oneofKind: localName
+                };
+            }
+            else {
+                target = message;
+            }
+            // we have handled oneof above. we just have read the value into `target`.
+            if (field.kind == 'map') {
+                if (jsonValue === null) {
+                    continue;
+                }
+                // check input
+                this.assert(json_typings_1.isJsonObject(jsonValue), field.name, jsonValue);
+                // our target to put map entries into
+                const fieldObj = target[localName];
+                // read entries
+                for (const [jsonObjKey, jsonObjValue] of Object.entries(jsonValue)) {
+                    this.assert(jsonObjValue !== null, field.name + " map value", null);
+                    // read value
+                    let val;
+                    switch (field.V.kind) {
+                        case "message":
+                            val = field.V.T().internalJsonRead(jsonObjValue, options);
+                            break;
+                        case "enum":
+                            val = this.enum(field.V.T(), jsonObjValue, field.name, options.ignoreUnknownFields);
+                            if (val === false)
+                                continue;
+                            break;
+                        case "scalar":
+                            val = this.scalar(jsonObjValue, field.V.T, field.V.L, field.name);
+                            break;
+                    }
+                    this.assert(val !== undefined, field.name + " map value", jsonObjValue);
+                    // read key
+                    let key = jsonObjKey;
+                    if (field.K == reflection_info_1.ScalarType.BOOL)
+                        key = key == "true" ? true : key == "false" ? false : key;
+                    key = this.scalar(key, field.K, reflection_info_1.LongType.STRING, field.name).toString();
+                    fieldObj[key] = val;
+                }
+            }
+            else if (field.repeat) {
+                if (jsonValue === null)
+                    continue;
+                // check input
+                this.assert(Array.isArray(jsonValue), field.name, jsonValue);
+                // our target to put array entries into
+                const fieldArr = target[localName];
+                // read array entries
+                for (const jsonItem of jsonValue) {
+                    this.assert(jsonItem !== null, field.name, null);
+                    let val;
+                    switch (field.kind) {
+                        case "message":
+                            val = field.T().internalJsonRead(jsonItem, options);
+                            break;
+                        case "enum":
+                            val = this.enum(field.T(), jsonItem, field.name, options.ignoreUnknownFields);
+                            if (val === false)
+                                continue;
+                            break;
+                        case "scalar":
+                            val = this.scalar(jsonItem, field.T, field.L, field.name);
+                            break;
+                    }
+                    this.assert(val !== undefined, field.name, jsonValue);
+                    fieldArr.push(val);
+                }
+            }
+            else {
+                switch (field.kind) {
+                    case "message":
+                        if (jsonValue === null && field.T().typeName != 'google.protobuf.Value') {
+                            this.assert(field.oneof === undefined, field.name + " (oneof member)", null);
+                            continue;
+                        }
+                        target[localName] = field.T().internalJsonRead(jsonValue, options, target[localName]);
+                        break;
+                    case "enum":
+                        if (jsonValue === null)
+                            continue;
+                        let val = this.enum(field.T(), jsonValue, field.name, options.ignoreUnknownFields);
+                        if (val === false)
+                            continue;
+                        target[localName] = val;
+                        break;
+                    case "scalar":
+                        if (jsonValue === null)
+                            continue;
+                        target[localName] = this.scalar(jsonValue, field.T, field.L, field.name);
+                        break;
+                }
+            }
+        }
+    }
+    /**
+     * Returns `false` for unrecognized string representations.
+     *
+     * google.protobuf.NullValue accepts only JSON `null` (or the old `"NULL_VALUE"`).
+     */
+    enum(type, json, fieldName, ignoreUnknownFields) {
+        if (type[0] == 'google.protobuf.NullValue')
+            assert_1.assert(json === null || json === "NULL_VALUE", `Unable to parse field ${this.info.typeName}#${fieldName}, enum ${type[0]} only accepts null.`);
+        if (json === null)
+            // we require 0 to be default value for all enums
+            return 0;
+        switch (typeof json) {
+            case "number":
+                assert_1.assert(Number.isInteger(json), `Unable to parse field ${this.info.typeName}#${fieldName}, enum can only be integral number, got ${json}.`);
+                return json;
+            case "string":
+                let localEnumName = json;
+                if (type[2] && json.substring(0, type[2].length) === type[2])
+                    // lookup without the shared prefix
+                    localEnumName = json.substring(type[2].length);
+                let enumNumber = type[1][localEnumName];
+                if (typeof enumNumber === 'undefined' && ignoreUnknownFields) {
+                    return false;
+                }
+                assert_1.assert(typeof enumNumber == "number", `Unable to parse field ${this.info.typeName}#${fieldName}, enum ${type[0]} has no value for "${json}".`);
+                return enumNumber;
+        }
+        assert_1.assert(false, `Unable to parse field ${this.info.typeName}#${fieldName}, cannot parse enum value from ${typeof json}".`);
+    }
+    scalar(json, type, longType, fieldName) {
+        let e;
+        try {
+            switch (type) {
+                // float, double: JSON value will be a number or one of the special string values "NaN", "Infinity", and "-Infinity".
+                // Either numbers or strings are accepted. Exponent notation is also accepted.
+                case reflection_info_1.ScalarType.DOUBLE:
+                case reflection_info_1.ScalarType.FLOAT:
+                    if (json === null)
+                        return .0;
+                    if (json === "NaN")
+                        return Number.NaN;
+                    if (json === "Infinity")
+                        return Number.POSITIVE_INFINITY;
+                    if (json === "-Infinity")
+                        return Number.NEGATIVE_INFINITY;
+                    if (json === "") {
+                        e = "empty string";
+                        break;
+                    }
+                    if (typeof json == "string" && json.trim().length !== json.length) {
+                        e = "extra whitespace";
+                        break;
+                    }
+                    if (typeof json != "string" && typeof json != "number") {
+                        break;
+                    }
+                    let float = Number(json);
+                    if (Number.isNaN(float)) {
+                        e = "not a number";
+                        break;
+                    }
+                    if (!Number.isFinite(float)) {
+                        // infinity and -infinity are handled by string representation above, so this is an error
+                        e = "too large or small";
+                        break;
+                    }
+                    if (type == reflection_info_1.ScalarType.FLOAT)
+                        assert_1.assertFloat32(float);
+                    return float;
+                // int32, fixed32, uint32: JSON value will be a decimal number. Either numbers or strings are accepted.
+                case reflection_info_1.ScalarType.INT32:
+                case reflection_info_1.ScalarType.FIXED32:
+                case reflection_info_1.ScalarType.SFIXED32:
+                case reflection_info_1.ScalarType.SINT32:
+                case reflection_info_1.ScalarType.UINT32:
+                    if (json === null)
+                        return 0;
+                    let int32;
+                    if (typeof json == "number")
+                        int32 = json;
+                    else if (json === "")
+                        e = "empty string";
+                    else if (typeof json == "string") {
+                        if (json.trim().length !== json.length)
+                            e = "extra whitespace";
+                        else
+                            int32 = Number(json);
+                    }
+                    if (int32 === undefined)
+                        break;
+                    if (type == reflection_info_1.ScalarType.UINT32)
+                        assert_1.assertUInt32(int32);
+                    else
+                        assert_1.assertInt32(int32);
+                    return int32;
+                // int64, fixed64, uint64: JSON value will be a decimal string. Either numbers or strings are accepted.
+                case reflection_info_1.ScalarType.INT64:
+                case reflection_info_1.ScalarType.SFIXED64:
+                case reflection_info_1.ScalarType.SINT64:
+                    if (json === null)
+                        return reflection_long_convert_1.reflectionLongConvert(pb_long_1.PbLong.ZERO, longType);
+                    if (typeof json != "number" && typeof json != "string")
+                        break;
+                    return reflection_long_convert_1.reflectionLongConvert(pb_long_1.PbLong.from(json), longType);
+                case reflection_info_1.ScalarType.FIXED64:
+                case reflection_info_1.ScalarType.UINT64:
+                    if (json === null)
+                        return reflection_long_convert_1.reflectionLongConvert(pb_long_1.PbULong.ZERO, longType);
+                    if (typeof json != "number" && typeof json != "string")
+                        break;
+                    return reflection_long_convert_1.reflectionLongConvert(pb_long_1.PbULong.from(json), longType);
+                // bool:
+                case reflection_info_1.ScalarType.BOOL:
+                    if (json === null)
+                        return false;
+                    if (typeof json !== "boolean")
+                        break;
+                    return json;
+                // string:
+                case reflection_info_1.ScalarType.STRING:
+                    if (json === null)
+                        return "";
+                    if (typeof json !== "string") {
+                        e = "extra whitespace";
+                        break;
+                    }
+                    try {
+                        encodeURIComponent(json);
+                    }
+                    catch (e) {
+                        e = "invalid UTF8";
+                        break;
+                    }
+                    return json;
+                // bytes: JSON value will be the data encoded as a string using standard base64 encoding with paddings.
+                // Either standard or URL-safe base64 encoding with/without paddings are accepted.
+                case reflection_info_1.ScalarType.BYTES:
+                    if (json === null || json === "")
+                        return new Uint8Array(0);
+                    if (typeof json !== 'string')
+                        break;
+                    return base64_1.base64decode(json);
+            }
+        }
+        catch (error) {
+            e = error.message;
+        }
+        this.assert(false, fieldName + (e ? " - " + e : ""), json);
+    }
+}
+exports.ReflectionJsonReader = ReflectionJsonReader;
+
+
+/***/ }),
+
+/***/ 4395:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ReflectionJsonWriter = void 0;
+const base64_1 = __nccwpck_require__(5553);
+const pb_long_1 = __nccwpck_require__(2486);
+const reflection_info_1 = __nccwpck_require__(4746);
+const assert_1 = __nccwpck_require__(1651);
+/**
+ * Writes proto3 messages in canonical JSON format using reflection
+ * information.
+ *
+ * https://developers.google.com/protocol-buffers/docs/proto3#json
+ */
+class ReflectionJsonWriter {
+    constructor(info) {
+        var _a;
+        this.fields = (_a = info.fields) !== null && _a !== void 0 ? _a : [];
+    }
+    /**
+     * Converts the message to a JSON object, based on the field descriptors.
+     */
+    write(message, options) {
+        const json = {}, source = message;
+        for (const field of this.fields) {
+            // field is not part of a oneof, simply write as is
+            if (!field.oneof) {
+                let jsonValue = this.field(field, source[field.localName], options);
+                if (jsonValue !== undefined)
+                    json[options.useProtoFieldName ? field.name : field.jsonName] = jsonValue;
+                continue;
+            }
+            // field is part of a oneof
+            const group = source[field.oneof];
+            if (group.oneofKind !== field.localName)
+                continue; // not selected, skip
+            const opt = field.kind == 'scalar' || field.kind == 'enum'
+                ? Object.assign(Object.assign({}, options), { emitDefaultValues: true }) : options;
+            let jsonValue = this.field(field, group[field.localName], opt);
+            assert_1.assert(jsonValue !== undefined);
+            json[options.useProtoFieldName ? field.name : field.jsonName] = jsonValue;
+        }
+        return json;
+    }
+    field(field, value, options) {
+        let jsonValue = undefined;
+        if (field.kind == 'map') {
+            assert_1.assert(typeof value == "object" && value !== null);
+            const jsonObj = {};
+            switch (field.V.kind) {
+                case "scalar":
+                    for (const [entryKey, entryValue] of Object.entries(value)) {
+                        const val = this.scalar(field.V.T, entryValue, field.name, false, true);
+                        assert_1.assert(val !== undefined);
+                        jsonObj[entryKey.toString()] = val; // JSON standard allows only (double quoted) string as property key
+                    }
+                    break;
+                case "message":
+                    const messageType = field.V.T();
+                    for (const [entryKey, entryValue] of Object.entries(value)) {
+                        const val = this.message(messageType, entryValue, field.name, options);
+                        assert_1.assert(val !== undefined);
+                        jsonObj[entryKey.toString()] = val; // JSON standard allows only (double quoted) string as property key
+                    }
+                    break;
+                case "enum":
+                    const enumInfo = field.V.T();
+                    for (const [entryKey, entryValue] of Object.entries(value)) {
+                        assert_1.assert(entryValue === undefined || typeof entryValue == 'number');
+                        const val = this.enum(enumInfo, entryValue, field.name, false, true, options.enumAsInteger);
+                        assert_1.assert(val !== undefined);
+                        jsonObj[entryKey.toString()] = val; // JSON standard allows only (double quoted) string as property key
+                    }
+                    break;
+            }
+            if (options.emitDefaultValues || Object.keys(jsonObj).length > 0)
+                jsonValue = jsonObj;
+        }
+        else if (field.repeat) {
+            assert_1.assert(Array.isArray(value));
+            const jsonArr = [];
+            switch (field.kind) {
+                case "scalar":
+                    for (let i = 0; i < value.length; i++) {
+                        const val = this.scalar(field.T, value[i], field.name, field.opt, true);
+                        assert_1.assert(val !== undefined);
+                        jsonArr.push(val);
+                    }
+                    break;
+                case "enum":
+                    const enumInfo = field.T();
+                    for (let i = 0; i < value.length; i++) {
+                        assert_1.assert(value[i] === undefined || typeof value[i] == 'number');
+                        const val = this.enum(enumInfo, value[i], field.name, field.opt, true, options.enumAsInteger);
+                        assert_1.assert(val !== undefined);
+                        jsonArr.push(val);
+                    }
+                    break;
+                case "message":
+                    const messageType = field.T();
+                    for (let i = 0; i < value.length; i++) {
+                        const val = this.message(messageType, value[i], field.name, options);
+                        assert_1.assert(val !== undefined);
+                        jsonArr.push(val);
+                    }
+                    break;
+            }
+            // add converted array to json output
+            if (options.emitDefaultValues || jsonArr.length > 0 || options.emitDefaultValues)
+                jsonValue = jsonArr;
+        }
+        else {
+            switch (field.kind) {
+                case "scalar":
+                    jsonValue = this.scalar(field.T, value, field.name, field.opt, options.emitDefaultValues);
+                    break;
+                case "enum":
+                    jsonValue = this.enum(field.T(), value, field.name, field.opt, options.emitDefaultValues, options.enumAsInteger);
+                    break;
+                case "message":
+                    jsonValue = this.message(field.T(), value, field.name, options);
+                    break;
+            }
+        }
+        return jsonValue;
+    }
+    /**
+     * Returns `null` as the default for google.protobuf.NullValue.
+     */
+    enum(type, value, fieldName, optional, emitDefaultValues, enumAsInteger) {
+        if (type[0] == 'google.protobuf.NullValue')
+            return !emitDefaultValues && !optional ? undefined : null;
+        if (value === undefined) {
+            assert_1.assert(optional);
+            return undefined;
+        }
+        if (value === 0 && !emitDefaultValues && !optional)
+            // we require 0 to be default value for all enums
+            return undefined;
+        assert_1.assert(typeof value == 'number');
+        assert_1.assert(Number.isInteger(value));
+        if (enumAsInteger || !type[1].hasOwnProperty(value))
+            // if we don't now the enum value, just return the number
+            return value;
+        if (type[2])
+            // restore the dropped prefix
+            return type[2] + type[1][value];
+        return type[1][value];
+    }
+    message(type, value, fieldName, options) {
+        if (value === undefined)
+            return options.emitDefaultValues ? null : undefined;
+        return type.internalJsonWrite(value, options);
+    }
+    scalar(type, value, fieldName, optional, emitDefaultValues) {
+        if (value === undefined) {
+            assert_1.assert(optional);
+            return undefined;
+        }
+        const ed = emitDefaultValues || optional;
+        // noinspection FallThroughInSwitchStatementJS
+        switch (type) {
+            // int32, fixed32, uint32: JSON value will be a decimal number. Either numbers or strings are accepted.
+            case reflection_info_1.ScalarType.INT32:
+            case reflection_info_1.ScalarType.SFIXED32:
+            case reflection_info_1.ScalarType.SINT32:
+                if (value === 0)
+                    return ed ? 0 : undefined;
+                assert_1.assertInt32(value);
+                return value;
+            case reflection_info_1.ScalarType.FIXED32:
+            case reflection_info_1.ScalarType.UINT32:
+                if (value === 0)
+                    return ed ? 0 : undefined;
+                assert_1.assertUInt32(value);
+                return value;
+            // float, double: JSON value will be a number or one of the special string values "NaN", "Infinity", and "-Infinity".
+            // Either numbers or strings are accepted. Exponent notation is also accepted.
+            case reflection_info_1.ScalarType.FLOAT:
+                assert_1.assertFloat32(value);
+            case reflection_info_1.ScalarType.DOUBLE:
+                if (value === 0)
+                    return ed ? 0 : undefined;
+                assert_1.assert(typeof value == 'number');
+                if (Number.isNaN(value))
+                    return 'NaN';
+                if (value === Number.POSITIVE_INFINITY)
+                    return 'Infinity';
+                if (value === Number.NEGATIVE_INFINITY)
+                    return '-Infinity';
+                return value;
+            // string:
+            case reflection_info_1.ScalarType.STRING:
+                if (value === "")
+                    return ed ? '' : undefined;
+                assert_1.assert(typeof value == 'string');
+                return value;
+            // bool:
+            case reflection_info_1.ScalarType.BOOL:
+                if (value === false)
+                    return ed ? false : undefined;
+                assert_1.assert(typeof value == 'boolean');
+                return value;
+            // JSON value will be a decimal string. Either numbers or strings are accepted.
+            case reflection_info_1.ScalarType.UINT64:
+            case reflection_info_1.ScalarType.FIXED64:
+                assert_1.assert(typeof value == 'number' || typeof value == 'string' || typeof value == 'bigint');
+                let ulong = pb_long_1.PbULong.from(value);
+                if (ulong.isZero() && !ed)
+                    return undefined;
+                return ulong.toString();
+            // JSON value will be a decimal string. Either numbers or strings are accepted.
+            case reflection_info_1.ScalarType.INT64:
+            case reflection_info_1.ScalarType.SFIXED64:
+            case reflection_info_1.ScalarType.SINT64:
+                assert_1.assert(typeof value == 'number' || typeof value == 'string' || typeof value == 'bigint');
+                let long = pb_long_1.PbLong.from(value);
+                if (long.isZero() && !ed)
+                    return undefined;
+                return long.toString();
+            // bytes: JSON value will be the data encoded as a string using standard base64 encoding with paddings.
+            // Either standard or URL-safe base64 encoding with/without paddings are accepted.
+            case reflection_info_1.ScalarType.BYTES:
+                assert_1.assert(value instanceof Uint8Array);
+                if (!value.byteLength)
+                    return ed ? "" : undefined;
+                return base64_1.base64encode(value);
+        }
+    }
+}
+exports.ReflectionJsonWriter = ReflectionJsonWriter;
+
+
+/***/ }),
+
+/***/ 5920:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.reflectionLongConvert = void 0;
+const reflection_info_1 = __nccwpck_require__(4746);
+/**
+ * Utility method to convert a PbLong or PbUlong to a JavaScript
+ * representation during runtime.
+ *
+ * Works with generated field information, `undefined` is equivalent
+ * to `STRING`.
+ */
+function reflectionLongConvert(long, type) {
+    switch (type) {
+        case reflection_info_1.LongType.BIGINT:
+            return long.toBigInt();
+        case reflection_info_1.LongType.NUMBER:
+            return long.toNumber();
+        default:
+            // case undefined:
+            // case LongType.STRING:
+            return long.toString();
+    }
+}
+exports.reflectionLongConvert = reflectionLongConvert;
+
+
+/***/ }),
+
+/***/ 6359:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.reflectionMergePartial = void 0;
+/**
+ * Copy partial data into the target message.
+ *
+ * If a singular scalar or enum field is present in the source, it
+ * replaces the field in the target.
+ *
+ * If a singular message field is present in the source, it is merged
+ * with the target field by calling mergePartial() of the responsible
+ * message type.
+ *
+ * If a repeated field is present in the source, its values replace
+ * all values in the target array, removing extraneous values.
+ * Repeated message fields are copied, not merged.
+ *
+ * If a map field is present in the source, entries are added to the
+ * target map, replacing entries with the same key. Entries that only
+ * exist in the target remain. Entries with message values are copied,
+ * not merged.
+ *
+ * Note that this function differs from protobuf merge semantics,
+ * which appends repeated fields.
+ */
+function reflectionMergePartial(info, target, source) {
+    let fieldValue, // the field value we are working with
+    input = source, output; // where we want our field value to go
+    for (let field of info.fields) {
+        let name = field.localName;
+        if (field.oneof) {
+            const group = input[field.oneof]; // this is the oneof`s group in the source
+            if ((group === null || group === void 0 ? void 0 : group.oneofKind) == undefined) { // the user is free to omit
+                continue; // we skip this field, and all other members too
+            }
+            fieldValue = group[name]; // our value comes from the the oneof group of the source
+            output = target[field.oneof]; // and our output is the oneof group of the target
+            output.oneofKind = group.oneofKind; // always update discriminator
+            if (fieldValue == undefined) {
+                delete output[name]; // remove any existing value
+                continue; // skip further work on field
+            }
+        }
+        else {
+            fieldValue = input[name]; // we are using the source directly
+            output = target; // we want our field value to go directly into the target
+            if (fieldValue == undefined) {
+                continue; // skip further work on field, existing value is used as is
+            }
+        }
+        if (field.repeat)
+            output[name].length = fieldValue.length; // resize target array to match source array
+        // now we just work with `fieldValue` and `output` to merge the value
+        switch (field.kind) {
+            case "scalar":
+            case "enum":
+                if (field.repeat)
+                    for (let i = 0; i < fieldValue.length; i++)
+                        output[name][i] = fieldValue[i]; // not a reference type
+                else
+                    output[name] = fieldValue; // not a reference type
+                break;
+            case "message":
+                let T = field.T();
+                if (field.repeat)
+                    for (let i = 0; i < fieldValue.length; i++)
+                        output[name][i] = T.create(fieldValue[i]);
+                else if (output[name] === undefined)
+                    output[name] = T.create(fieldValue); // nothing to merge with
+                else
+                    T.mergePartial(output[name], fieldValue);
+                break;
+            case "map":
+                // Map and repeated fields are simply overwritten, not appended or merged
+                switch (field.V.kind) {
+                    case "scalar":
+                    case "enum":
+                        Object.assign(output[name], fieldValue); // elements are not reference types
+                        break;
+                    case "message":
+                        let T = field.V.T();
+                        for (let k of Object.keys(fieldValue))
+                            output[name][k] = T.create(fieldValue[k]);
+                        break;
+                }
+                break;
+        }
+    }
+}
+exports.reflectionMergePartial = reflectionMergePartial;
+
+
+/***/ }),
+
+/***/ 6435:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.reflectionScalarDefault = void 0;
+const reflection_info_1 = __nccwpck_require__(4746);
+const reflection_long_convert_1 = __nccwpck_require__(5920);
+const pb_long_1 = __nccwpck_require__(2486);
+/**
+ * Creates the default value for a scalar type.
+ */
+function reflectionScalarDefault(type, longType = reflection_info_1.LongType.STRING) {
+    switch (type) {
+        case reflection_info_1.ScalarType.BOOL:
+            return false;
+        case reflection_info_1.ScalarType.UINT64:
+        case reflection_info_1.ScalarType.FIXED64:
+            return reflection_long_convert_1.reflectionLongConvert(pb_long_1.PbULong.ZERO, longType);
+        case reflection_info_1.ScalarType.INT64:
+        case reflection_info_1.ScalarType.SFIXED64:
+        case reflection_info_1.ScalarType.SINT64:
+            return reflection_long_convert_1.reflectionLongConvert(pb_long_1.PbLong.ZERO, longType);
+        case reflection_info_1.ScalarType.DOUBLE:
+        case reflection_info_1.ScalarType.FLOAT:
+            return 0.0;
+        case reflection_info_1.ScalarType.BYTES:
+            return new Uint8Array(0);
+        case reflection_info_1.ScalarType.STRING:
+            return "";
+        default:
+            // case ScalarType.INT32:
+            // case ScalarType.UINT32:
+            // case ScalarType.SINT32:
+            // case ScalarType.FIXED32:
+            // case ScalarType.SFIXED32:
+            return 0;
+    }
+}
+exports.reflectionScalarDefault = reflectionScalarDefault;
+
+
+/***/ }),
+
+/***/ 652:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ReflectionTypeCheck = void 0;
+const reflection_info_1 = __nccwpck_require__(4746);
+const oneof_1 = __nccwpck_require__(9927);
+// noinspection JSMethodCanBeStatic
+class ReflectionTypeCheck {
+    constructor(info) {
+        var _a;
+        this.fields = (_a = info.fields) !== null && _a !== void 0 ? _a : [];
+    }
+    prepare() {
+        if (this.data)
+            return;
+        const req = [], known = [], oneofs = [];
+        for (let field of this.fields) {
+            if (field.oneof) {
+                if (!oneofs.includes(field.oneof)) {
+                    oneofs.push(field.oneof);
+                    req.push(field.oneof);
+                    known.push(field.oneof);
+                }
+            }
+            else {
+                known.push(field.localName);
+                switch (field.kind) {
+                    case "scalar":
+                    case "enum":
+                        if (!field.opt || field.repeat)
+                            req.push(field.localName);
+                        break;
+                    case "message":
+                        if (field.repeat)
+                            req.push(field.localName);
+                        break;
+                    case "map":
+                        req.push(field.localName);
+                        break;
+                }
+            }
+        }
+        this.data = { req, known, oneofs: Object.values(oneofs) };
+    }
+    /**
+     * Is the argument a valid message as specified by the
+     * reflection information?
+     *
+     * Checks all field types recursively. The `depth`
+     * specifies how deep into the structure the check will be.
+     *
+     * With a depth of 0, only the presence of fields
+     * is checked.
+     *
+     * With a depth of 1 or more, the field types are checked.
+     *
+     * With a depth of 2 or more, the members of map, repeated
+     * and message fields are checked.
+     *
+     * Message fields will be checked recursively with depth - 1.
+     *
+     * The number of map entries / repeated values being checked
+     * is < depth.
+     */
+    is(message, depth, allowExcessProperties = false) {
+        if (depth < 0)
+            return true;
+        if (message === null || message === undefined || typeof message != 'object')
+            return false;
+        this.prepare();
+        let keys = Object.keys(message), data = this.data;
+        // if a required field is missing in arg, this cannot be a T
+        if (keys.length < data.req.length || data.req.some(n => !keys.includes(n)))
+            return false;
+        if (!allowExcessProperties) {
+            // if the arg contains a key we dont know, this is not a literal T
+            if (keys.some(k => !data.known.includes(k)))
+                return false;
+        }
+        // "With a depth of 0, only the presence and absence of fields is checked."
+        // "With a depth of 1 or more, the field types are checked."
+        if (depth < 1) {
+            return true;
+        }
+        // check oneof group
+        for (const name of data.oneofs) {
+            const group = message[name];
+            if (!oneof_1.isOneofGroup(group))
+                return false;
+            if (group.oneofKind === undefined)
+                continue;
+            const field = this.fields.find(f => f.localName === group.oneofKind);
+            if (!field)
+                return false; // we found no field, but have a kind, something is wrong
+            if (!this.field(group[group.oneofKind], field, allowExcessProperties, depth))
+                return false;
+        }
+        // check types
+        for (const field of this.fields) {
+            if (field.oneof !== undefined)
+                continue;
+            if (!this.field(message[field.localName], field, allowExcessProperties, depth))
+                return false;
+        }
+        return true;
+    }
+    field(arg, field, allowExcessProperties, depth) {
+        let repeated = field.repeat;
+        switch (field.kind) {
+            case "scalar":
+                if (arg === undefined)
+                    return field.opt;
+                if (repeated)
+                    return this.scalars(arg, field.T, depth, field.L);
+                return this.scalar(arg, field.T, field.L);
+            case "enum":
+                if (arg === undefined)
+                    return field.opt;
+                if (repeated)
+                    return this.scalars(arg, reflection_info_1.ScalarType.INT32, depth);
+                return this.scalar(arg, reflection_info_1.ScalarType.INT32);
+            case "message":
+                if (arg === undefined)
+                    return true;
+                if (repeated)
+                    return this.messages(arg, field.T(), allowExcessProperties, depth);
+                return this.message(arg, field.T(), allowExcessProperties, depth);
+            case "map":
+                if (typeof arg != 'object' || arg === null)
+                    return false;
+                if (depth < 2)
+                    return true;
+                if (!this.mapKeys(arg, field.K, depth))
+                    return false;
+                switch (field.V.kind) {
+                    case "scalar":
+                        return this.scalars(Object.values(arg), field.V.T, depth, field.V.L);
+                    case "enum":
+                        return this.scalars(Object.values(arg), reflection_info_1.ScalarType.INT32, depth);
+                    case "message":
+                        return this.messages(Object.values(arg), field.V.T(), allowExcessProperties, depth);
+                }
+                break;
+        }
+        return true;
+    }
+    message(arg, type, allowExcessProperties, depth) {
+        if (allowExcessProperties) {
+            return type.isAssignable(arg, depth);
+        }
+        return type.is(arg, depth);
+    }
+    messages(arg, type, allowExcessProperties, depth) {
+        if (!Array.isArray(arg))
+            return false;
+        if (depth < 2)
+            return true;
+        if (allowExcessProperties) {
+            for (let i = 0; i < arg.length && i < depth; i++)
+                if (!type.isAssignable(arg[i], depth - 1))
+                    return false;
+        }
+        else {
+            for (let i = 0; i < arg.length && i < depth; i++)
+                if (!type.is(arg[i], depth - 1))
+                    return false;
+        }
+        return true;
+    }
+    scalar(arg, type, longType) {
+        let argType = typeof arg;
+        switch (type) {
+            case reflection_info_1.ScalarType.UINT64:
+            case reflection_info_1.ScalarType.FIXED64:
+            case reflection_info_1.ScalarType.INT64:
+            case reflection_info_1.ScalarType.SFIXED64:
+            case reflection_info_1.ScalarType.SINT64:
+                switch (longType) {
+                    case reflection_info_1.LongType.BIGINT:
+                        return argType == "bigint";
+                    case reflection_info_1.LongType.NUMBER:
+                        return argType == "number" && !isNaN(arg);
+                    default:
+                        return argType == "string";
+                }
+            case reflection_info_1.ScalarType.BOOL:
+                return argType == 'boolean';
+            case reflection_info_1.ScalarType.STRING:
+                return argType == 'string';
+            case reflection_info_1.ScalarType.BYTES:
+                return arg instanceof Uint8Array;
+            case reflection_info_1.ScalarType.DOUBLE:
+            case reflection_info_1.ScalarType.FLOAT:
+                return argType == 'number' && !isNaN(arg);
+            default:
+                // case ScalarType.UINT32:
+                // case ScalarType.FIXED32:
+                // case ScalarType.INT32:
+                // case ScalarType.SINT32:
+                // case ScalarType.SFIXED32:
+                return argType == 'number' && Number.isInteger(arg);
+        }
+    }
+    scalars(arg, type, depth, longType) {
+        if (!Array.isArray(arg))
+            return false;
+        if (depth < 2)
+            return true;
+        if (Array.isArray(arg))
+            for (let i = 0; i < arg.length && i < depth; i++)
+                if (!this.scalar(arg[i], type, longType))
+                    return false;
+        return true;
+    }
+    mapKeys(map, type, depth) {
+        let keys = Object.keys(map);
+        switch (type) {
+            case reflection_info_1.ScalarType.INT32:
+            case reflection_info_1.ScalarType.FIXED32:
+            case reflection_info_1.ScalarType.SFIXED32:
+            case reflection_info_1.ScalarType.SINT32:
+            case reflection_info_1.ScalarType.UINT32:
+                return this.scalars(keys.slice(0, depth).map(k => parseInt(k)), type, depth);
+            case reflection_info_1.ScalarType.BOOL:
+                return this.scalars(keys.slice(0, depth).map(k => k == 'true' ? true : k == 'false' ? false : k), type, depth);
+            default:
+                return this.scalars(keys, type, depth, reflection_info_1.LongType.STRING);
+        }
+    }
+}
+exports.ReflectionTypeCheck = ReflectionTypeCheck;
+
+
+/***/ }),
+
+/***/ 699:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -34857,7 +41463,7 @@ exports.req = req;
 
 /***/ }),
 
-/***/ 8247:
+/***/ 6814:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -34892,7 +41498,7 @@ exports.Agent = void 0;
 const net = __importStar(__nccwpck_require__(1808));
 const http = __importStar(__nccwpck_require__(3685));
 const https_1 = __nccwpck_require__(5687);
-__exportStar(__nccwpck_require__(2035), exports);
+__exportStar(__nccwpck_require__(699), exports);
 const INTERNAL = Symbol('AgentBaseInternalState');
 class Agent extends http.Agent {
     constructor(opts) {
@@ -34995,8 +41601,13 @@ class Agent extends http.Agent {
             .then((socket) => {
             this.decrementSockets(name, fakeSocket);
             if (socket instanceof http.Agent) {
-                // @ts-expect-error `addRequest()` isn't defined in `@types/node`
-                return socket.addRequest(req, connectOpts);
+                try {
+                    // @ts-expect-error `addRequest()` isn't defined in `@types/node`
+                    return socket.addRequest(req, connectOpts);
+                }
+                catch (err) {
+                    return cb(err);
+                }
             }
             this[INTERNAL].currentSocket = socket;
             // @ts-expect-error `createSocket()` isn't defined in `@types/node`
@@ -35516,7 +42127,7 @@ var isArray = Array.isArray || function (xs) {
 
 /***/ }),
 
-/***/ 9280:
+/***/ 3748:
 /***/ ((module, exports, __nccwpck_require__) => {
 
 /* eslint-env browser */
@@ -35650,6 +42261,7 @@ function useColors() {
 
 	// Is webkit? http://stackoverflow.com/a/16459606/376773
 	// document is undefined in react-native: https://github.com/facebook/react-native/pull/1632
+	// eslint-disable-next-line no-return-assign
 	return (typeof document !== 'undefined' && document.documentElement && document.documentElement.style && document.documentElement.style.WebkitAppearance) ||
 		// Is firebug? http://stackoverflow.com/a/398120/376773
 		(typeof window !== 'undefined' && window.console && (window.console.firebug || (window.console.exception && window.console.table))) ||
@@ -35775,7 +42387,7 @@ function localstorage() {
 	}
 }
 
-module.exports = __nccwpck_require__(85)(exports);
+module.exports = __nccwpck_require__(7424)(exports);
 
 const {formatters} = module.exports;
 
@@ -35794,7 +42406,7 @@ formatters.j = function (v) {
 
 /***/ }),
 
-/***/ 85:
+/***/ 7424:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -35810,7 +42422,7 @@ function setup(env) {
 	createDebug.disable = disable;
 	createDebug.enable = enable;
 	createDebug.enabled = enabled;
-	createDebug.humanize = __nccwpck_require__(5717);
+	createDebug.humanize = __nccwpck_require__(158);
 	createDebug.destroy = destroy;
 
 	Object.keys(env).forEach(key => {
@@ -35965,24 +42577,62 @@ function setup(env) {
 		createDebug.names = [];
 		createDebug.skips = [];
 
-		let i;
-		const split = (typeof namespaces === 'string' ? namespaces : '').split(/[\s,]+/);
-		const len = split.length;
+		const split = (typeof namespaces === 'string' ? namespaces : '')
+			.trim()
+			.replace(' ', ',')
+			.split(',')
+			.filter(Boolean);
 
-		for (i = 0; i < len; i++) {
-			if (!split[i]) {
-				// ignore empty strings
-				continue;
-			}
-
-			namespaces = split[i].replace(/\*/g, '.*?');
-
-			if (namespaces[0] === '-') {
-				createDebug.skips.push(new RegExp('^' + namespaces.slice(1) + '$'));
+		for (const ns of split) {
+			if (ns[0] === '-') {
+				createDebug.skips.push(ns.slice(1));
 			} else {
-				createDebug.names.push(new RegExp('^' + namespaces + '$'));
+				createDebug.names.push(ns);
 			}
 		}
+	}
+
+	/**
+	 * Checks if the given string matches a namespace template, honoring
+	 * asterisks as wildcards.
+	 *
+	 * @param {String} search
+	 * @param {String} template
+	 * @return {Boolean}
+	 */
+	function matchesTemplate(search, template) {
+		let searchIndex = 0;
+		let templateIndex = 0;
+		let starIndex = -1;
+		let matchIndex = 0;
+
+		while (searchIndex < search.length) {
+			if (templateIndex < template.length && (template[templateIndex] === search[searchIndex] || template[templateIndex] === '*')) {
+				// Match character or proceed with wildcard
+				if (template[templateIndex] === '*') {
+					starIndex = templateIndex;
+					matchIndex = searchIndex;
+					templateIndex++; // Skip the '*'
+				} else {
+					searchIndex++;
+					templateIndex++;
+				}
+			} else if (starIndex !== -1) { // eslint-disable-line no-negated-condition
+				// Backtrack to the last '*' and try to match more characters
+				templateIndex = starIndex + 1;
+				matchIndex++;
+				searchIndex = matchIndex;
+			} else {
+				return false; // No match
+			}
+		}
+
+		// Handle trailing '*' in template
+		while (templateIndex < template.length && template[templateIndex] === '*') {
+			templateIndex++;
+		}
+
+		return templateIndex === template.length;
 	}
 
 	/**
@@ -35993,8 +42643,8 @@ function setup(env) {
 	*/
 	function disable() {
 		const namespaces = [
-			...createDebug.names.map(toNamespace),
-			...createDebug.skips.map(toNamespace).map(namespace => '-' + namespace)
+			...createDebug.names,
+			...createDebug.skips.map(namespace => '-' + namespace)
 		].join(',');
 		createDebug.enable('');
 		return namespaces;
@@ -36008,39 +42658,19 @@ function setup(env) {
 	* @api public
 	*/
 	function enabled(name) {
-		if (name[name.length - 1] === '*') {
-			return true;
-		}
-
-		let i;
-		let len;
-
-		for (i = 0, len = createDebug.skips.length; i < len; i++) {
-			if (createDebug.skips[i].test(name)) {
+		for (const skip of createDebug.skips) {
+			if (matchesTemplate(name, skip)) {
 				return false;
 			}
 		}
 
-		for (i = 0, len = createDebug.names.length; i < len; i++) {
-			if (createDebug.names[i].test(name)) {
+		for (const ns of createDebug.names) {
+			if (matchesTemplate(name, ns)) {
 				return true;
 			}
 		}
 
 		return false;
-	}
-
-	/**
-	* Convert regexp to namespace
-	*
-	* @param {RegExp} regxep
-	* @return {String} namespace
-	* @api private
-	*/
-	function toNamespace(regexp) {
-		return regexp.toString()
-			.substring(2, regexp.toString().length - 2)
-			.replace(/\.\*\?$/, '*');
 	}
 
 	/**
@@ -36075,7 +42705,7 @@ module.exports = setup;
 
 /***/ }),
 
-/***/ 4684:
+/***/ 646:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 /**
@@ -36084,15 +42714,15 @@ module.exports = setup;
  */
 
 if (typeof process === 'undefined' || process.type === 'renderer' || process.browser === true || process.__nwjs) {
-	module.exports = __nccwpck_require__(9280);
+	module.exports = __nccwpck_require__(3748);
 } else {
-	module.exports = __nccwpck_require__(1240);
+	module.exports = __nccwpck_require__(2336);
 }
 
 
 /***/ }),
 
-/***/ 1240:
+/***/ 2336:
 /***/ ((module, exports, __nccwpck_require__) => {
 
 /**
@@ -36334,7 +42964,7 @@ function init(debug) {
 	}
 }
 
-module.exports = __nccwpck_require__(85)(exports);
+module.exports = __nccwpck_require__(7424)(exports);
 
 const {formatters} = module.exports;
 
@@ -36389,2000 +43019,6 @@ exports.Deprecation = Deprecation;
 
 /***/ }),
 
-/***/ 3601:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-
-
-const validator = __nccwpck_require__(8128);
-const XMLParser = __nccwpck_require__(897);
-const XMLBuilder = __nccwpck_require__(6762);
-
-module.exports = {
-  XMLParser: XMLParser,
-  XMLValidator: validator,
-  XMLBuilder: XMLBuilder
-}
-
-/***/ }),
-
-/***/ 3480:
-/***/ ((__unused_webpack_module, exports) => {
-
-
-
-const nameStartChar = ':A-Za-z_\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F\\u2C00-\\u2FEF\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD';
-const nameChar = nameStartChar + '\\-.\\d\\u00B7\\u0300-\\u036F\\u203F-\\u2040';
-const nameRegexp = '[' + nameStartChar + '][' + nameChar + ']*'
-const regexName = new RegExp('^' + nameRegexp + '$');
-
-const getAllMatches = function(string, regex) {
-  const matches = [];
-  let match = regex.exec(string);
-  while (match) {
-    const allmatches = [];
-    allmatches.startIndex = regex.lastIndex - match[0].length;
-    const len = match.length;
-    for (let index = 0; index < len; index++) {
-      allmatches.push(match[index]);
-    }
-    matches.push(allmatches);
-    match = regex.exec(string);
-  }
-  return matches;
-};
-
-const isName = function(string) {
-  const match = regexName.exec(string);
-  return !(match === null || typeof match === 'undefined');
-};
-
-exports.isExist = function(v) {
-  return typeof v !== 'undefined';
-};
-
-exports.isEmptyObject = function(obj) {
-  return Object.keys(obj).length === 0;
-};
-
-/**
- * Copy all the properties of a into b.
- * @param {*} target
- * @param {*} a
- */
-exports.merge = function(target, a, arrayMode) {
-  if (a) {
-    const keys = Object.keys(a); // will return an array of own properties
-    const len = keys.length; //don't make it inline
-    for (let i = 0; i < len; i++) {
-      if (arrayMode === 'strict') {
-        target[keys[i]] = [ a[keys[i]] ];
-      } else {
-        target[keys[i]] = a[keys[i]];
-      }
-    }
-  }
-};
-/* exports.merge =function (b,a){
-  return Object.assign(b,a);
-} */
-
-exports.getValue = function(v) {
-  if (exports.isExist(v)) {
-    return v;
-  } else {
-    return '';
-  }
-};
-
-// const fakeCall = function(a) {return a;};
-// const fakeCallNoReturn = function() {};
-
-exports.isName = isName;
-exports.getAllMatches = getAllMatches;
-exports.nameRegexp = nameRegexp;
-
-
-/***/ }),
-
-/***/ 8128:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-const util = __nccwpck_require__(3480);
-
-const defaultOptions = {
-  allowBooleanAttributes: false, //A tag can have attributes without any value
-  unpairedTags: []
-};
-
-//const tagsPattern = new RegExp("<\\/?([\\w:\\-_\.]+)\\s*\/?>","g");
-exports.validate = function (xmlData, options) {
-  options = Object.assign({}, defaultOptions, options);
-
-  //xmlData = xmlData.replace(/(\r\n|\n|\r)/gm,"");//make it single line
-  //xmlData = xmlData.replace(/(^\s*<\?xml.*?\?>)/g,"");//Remove XML starting tag
-  //xmlData = xmlData.replace(/(<!DOCTYPE[\s\w\"\.\/\-\:]+(\[.*\])*\s*>)/g,"");//Remove DOCTYPE
-  const tags = [];
-  let tagFound = false;
-
-  //indicates that the root tag has been closed (aka. depth 0 has been reached)
-  let reachedRoot = false;
-
-  if (xmlData[0] === '\ufeff') {
-    // check for byte order mark (BOM)
-    xmlData = xmlData.substr(1);
-  }
-  
-  for (let i = 0; i < xmlData.length; i++) {
-
-    if (xmlData[i] === '<' && xmlData[i+1] === '?') {
-      i+=2;
-      i = readPI(xmlData,i);
-      if (i.err) return i;
-    }else if (xmlData[i] === '<') {
-      //starting of tag
-      //read until you reach to '>' avoiding any '>' in attribute value
-      let tagStartPos = i;
-      i++;
-      
-      if (xmlData[i] === '!') {
-        i = readCommentAndCDATA(xmlData, i);
-        continue;
-      } else {
-        let closingTag = false;
-        if (xmlData[i] === '/') {
-          //closing tag
-          closingTag = true;
-          i++;
-        }
-        //read tagname
-        let tagName = '';
-        for (; i < xmlData.length &&
-          xmlData[i] !== '>' &&
-          xmlData[i] !== ' ' &&
-          xmlData[i] !== '\t' &&
-          xmlData[i] !== '\n' &&
-          xmlData[i] !== '\r'; i++
-        ) {
-          tagName += xmlData[i];
-        }
-        tagName = tagName.trim();
-        //console.log(tagName);
-
-        if (tagName[tagName.length - 1] === '/') {
-          //self closing tag without attributes
-          tagName = tagName.substring(0, tagName.length - 1);
-          //continue;
-          i--;
-        }
-        if (!validateTagName(tagName)) {
-          let msg;
-          if (tagName.trim().length === 0) {
-            msg = "Invalid space after '<'.";
-          } else {
-            msg = "Tag '"+tagName+"' is an invalid name.";
-          }
-          return getErrorObject('InvalidTag', msg, getLineNumberForPosition(xmlData, i));
-        }
-
-        const result = readAttributeStr(xmlData, i);
-        if (result === false) {
-          return getErrorObject('InvalidAttr', "Attributes for '"+tagName+"' have open quote.", getLineNumberForPosition(xmlData, i));
-        }
-        let attrStr = result.value;
-        i = result.index;
-
-        if (attrStr[attrStr.length - 1] === '/') {
-          //self closing tag
-          const attrStrStart = i - attrStr.length;
-          attrStr = attrStr.substring(0, attrStr.length - 1);
-          const isValid = validateAttributeString(attrStr, options);
-          if (isValid === true) {
-            tagFound = true;
-            //continue; //text may presents after self closing tag
-          } else {
-            //the result from the nested function returns the position of the error within the attribute
-            //in order to get the 'true' error line, we need to calculate the position where the attribute begins (i - attrStr.length) and then add the position within the attribute
-            //this gives us the absolute index in the entire xml, which we can use to find the line at last
-            return getErrorObject(isValid.err.code, isValid.err.msg, getLineNumberForPosition(xmlData, attrStrStart + isValid.err.line));
-          }
-        } else if (closingTag) {
-          if (!result.tagClosed) {
-            return getErrorObject('InvalidTag', "Closing tag '"+tagName+"' doesn't have proper closing.", getLineNumberForPosition(xmlData, i));
-          } else if (attrStr.trim().length > 0) {
-            return getErrorObject('InvalidTag', "Closing tag '"+tagName+"' can't have attributes or invalid starting.", getLineNumberForPosition(xmlData, tagStartPos));
-          } else if (tags.length === 0) {
-            return getErrorObject('InvalidTag', "Closing tag '"+tagName+"' has not been opened.", getLineNumberForPosition(xmlData, tagStartPos));
-          } else {
-            const otg = tags.pop();
-            if (tagName !== otg.tagName) {
-              let openPos = getLineNumberForPosition(xmlData, otg.tagStartPos);
-              return getErrorObject('InvalidTag',
-                "Expected closing tag '"+otg.tagName+"' (opened in line "+openPos.line+", col "+openPos.col+") instead of closing tag '"+tagName+"'.",
-                getLineNumberForPosition(xmlData, tagStartPos));
-            }
-
-            //when there are no more tags, we reached the root level.
-            if (tags.length == 0) {
-              reachedRoot = true;
-            }
-          }
-        } else {
-          const isValid = validateAttributeString(attrStr, options);
-          if (isValid !== true) {
-            //the result from the nested function returns the position of the error within the attribute
-            //in order to get the 'true' error line, we need to calculate the position where the attribute begins (i - attrStr.length) and then add the position within the attribute
-            //this gives us the absolute index in the entire xml, which we can use to find the line at last
-            return getErrorObject(isValid.err.code, isValid.err.msg, getLineNumberForPosition(xmlData, i - attrStr.length + isValid.err.line));
-          }
-
-          //if the root level has been reached before ...
-          if (reachedRoot === true) {
-            return getErrorObject('InvalidXml', 'Multiple possible root nodes found.', getLineNumberForPosition(xmlData, i));
-          } else if(options.unpairedTags.indexOf(tagName) !== -1){
-            //don't push into stack
-          } else {
-            tags.push({tagName, tagStartPos});
-          }
-          tagFound = true;
-        }
-
-        //skip tag text value
-        //It may include comments and CDATA value
-        for (i++; i < xmlData.length; i++) {
-          if (xmlData[i] === '<') {
-            if (xmlData[i + 1] === '!') {
-              //comment or CADATA
-              i++;
-              i = readCommentAndCDATA(xmlData, i);
-              continue;
-            } else if (xmlData[i+1] === '?') {
-              i = readPI(xmlData, ++i);
-              if (i.err) return i;
-            } else{
-              break;
-            }
-          } else if (xmlData[i] === '&') {
-            const afterAmp = validateAmpersand(xmlData, i);
-            if (afterAmp == -1)
-              return getErrorObject('InvalidChar', "char '&' is not expected.", getLineNumberForPosition(xmlData, i));
-            i = afterAmp;
-          }else{
-            if (reachedRoot === true && !isWhiteSpace(xmlData[i])) {
-              return getErrorObject('InvalidXml', "Extra text at the end", getLineNumberForPosition(xmlData, i));
-            }
-          }
-        } //end of reading tag text value
-        if (xmlData[i] === '<') {
-          i--;
-        }
-      }
-    } else {
-      if ( isWhiteSpace(xmlData[i])) {
-        continue;
-      }
-      return getErrorObject('InvalidChar', "char '"+xmlData[i]+"' is not expected.", getLineNumberForPosition(xmlData, i));
-    }
-  }
-
-  if (!tagFound) {
-    return getErrorObject('InvalidXml', 'Start tag expected.', 1);
-  }else if (tags.length == 1) {
-      return getErrorObject('InvalidTag', "Unclosed tag '"+tags[0].tagName+"'.", getLineNumberForPosition(xmlData, tags[0].tagStartPos));
-  }else if (tags.length > 0) {
-      return getErrorObject('InvalidXml', "Invalid '"+
-          JSON.stringify(tags.map(t => t.tagName), null, 4).replace(/\r?\n/g, '')+
-          "' found.", {line: 1, col: 1});
-  }
-
-  return true;
-};
-
-function isWhiteSpace(char){
-  return char === ' ' || char === '\t' || char === '\n'  || char === '\r';
-}
-/**
- * Read Processing insstructions and skip
- * @param {*} xmlData
- * @param {*} i
- */
-function readPI(xmlData, i) {
-  const start = i;
-  for (; i < xmlData.length; i++) {
-    if (xmlData[i] == '?' || xmlData[i] == ' ') {
-      //tagname
-      const tagname = xmlData.substr(start, i - start);
-      if (i > 5 && tagname === 'xml') {
-        return getErrorObject('InvalidXml', 'XML declaration allowed only at the start of the document.', getLineNumberForPosition(xmlData, i));
-      } else if (xmlData[i] == '?' && xmlData[i + 1] == '>') {
-        //check if valid attribut string
-        i++;
-        break;
-      } else {
-        continue;
-      }
-    }
-  }
-  return i;
-}
-
-function readCommentAndCDATA(xmlData, i) {
-  if (xmlData.length > i + 5 && xmlData[i + 1] === '-' && xmlData[i + 2] === '-') {
-    //comment
-    for (i += 3; i < xmlData.length; i++) {
-      if (xmlData[i] === '-' && xmlData[i + 1] === '-' && xmlData[i + 2] === '>') {
-        i += 2;
-        break;
-      }
-    }
-  } else if (
-    xmlData.length > i + 8 &&
-    xmlData[i + 1] === 'D' &&
-    xmlData[i + 2] === 'O' &&
-    xmlData[i + 3] === 'C' &&
-    xmlData[i + 4] === 'T' &&
-    xmlData[i + 5] === 'Y' &&
-    xmlData[i + 6] === 'P' &&
-    xmlData[i + 7] === 'E'
-  ) {
-    let angleBracketsCount = 1;
-    for (i += 8; i < xmlData.length; i++) {
-      if (xmlData[i] === '<') {
-        angleBracketsCount++;
-      } else if (xmlData[i] === '>') {
-        angleBracketsCount--;
-        if (angleBracketsCount === 0) {
-          break;
-        }
-      }
-    }
-  } else if (
-    xmlData.length > i + 9 &&
-    xmlData[i + 1] === '[' &&
-    xmlData[i + 2] === 'C' &&
-    xmlData[i + 3] === 'D' &&
-    xmlData[i + 4] === 'A' &&
-    xmlData[i + 5] === 'T' &&
-    xmlData[i + 6] === 'A' &&
-    xmlData[i + 7] === '['
-  ) {
-    for (i += 8; i < xmlData.length; i++) {
-      if (xmlData[i] === ']' && xmlData[i + 1] === ']' && xmlData[i + 2] === '>') {
-        i += 2;
-        break;
-      }
-    }
-  }
-
-  return i;
-}
-
-const doubleQuote = '"';
-const singleQuote = "'";
-
-/**
- * Keep reading xmlData until '<' is found outside the attribute value.
- * @param {string} xmlData
- * @param {number} i
- */
-function readAttributeStr(xmlData, i) {
-  let attrStr = '';
-  let startChar = '';
-  let tagClosed = false;
-  for (; i < xmlData.length; i++) {
-    if (xmlData[i] === doubleQuote || xmlData[i] === singleQuote) {
-      if (startChar === '') {
-        startChar = xmlData[i];
-      } else if (startChar !== xmlData[i]) {
-        //if vaue is enclosed with double quote then single quotes are allowed inside the value and vice versa
-      } else {
-        startChar = '';
-      }
-    } else if (xmlData[i] === '>') {
-      if (startChar === '') {
-        tagClosed = true;
-        break;
-      }
-    }
-    attrStr += xmlData[i];
-  }
-  if (startChar !== '') {
-    return false;
-  }
-
-  return {
-    value: attrStr,
-    index: i,
-    tagClosed: tagClosed
-  };
-}
-
-/**
- * Select all the attributes whether valid or invalid.
- */
-const validAttrStrRegxp = new RegExp('(\\s*)([^\\s=]+)(\\s*=)?(\\s*([\'"])(([\\s\\S])*?)\\5)?', 'g');
-
-//attr, ="sd", a="amit's", a="sd"b="saf", ab  cd=""
-
-function validateAttributeString(attrStr, options) {
-  //console.log("start:"+attrStr+":end");
-
-  //if(attrStr.trim().length === 0) return true; //empty string
-
-  const matches = util.getAllMatches(attrStr, validAttrStrRegxp);
-  const attrNames = {};
-
-  for (let i = 0; i < matches.length; i++) {
-    if (matches[i][1].length === 0) {
-      //nospace before attribute name: a="sd"b="saf"
-      return getErrorObject('InvalidAttr', "Attribute '"+matches[i][2]+"' has no space in starting.", getPositionFromMatch(matches[i]))
-    } else if (matches[i][3] !== undefined && matches[i][4] === undefined) {
-      return getErrorObject('InvalidAttr', "Attribute '"+matches[i][2]+"' is without value.", getPositionFromMatch(matches[i]));
-    } else if (matches[i][3] === undefined && !options.allowBooleanAttributes) {
-      //independent attribute: ab
-      return getErrorObject('InvalidAttr', "boolean attribute '"+matches[i][2]+"' is not allowed.", getPositionFromMatch(matches[i]));
-    }
-    /* else if(matches[i][6] === undefined){//attribute without value: ab=
-                    return { err: { code:"InvalidAttr",msg:"attribute " + matches[i][2] + " has no value assigned."}};
-                } */
-    const attrName = matches[i][2];
-    if (!validateAttrName(attrName)) {
-      return getErrorObject('InvalidAttr', "Attribute '"+attrName+"' is an invalid name.", getPositionFromMatch(matches[i]));
-    }
-    if (!attrNames.hasOwnProperty(attrName)) {
-      //check for duplicate attribute.
-      attrNames[attrName] = 1;
-    } else {
-      return getErrorObject('InvalidAttr', "Attribute '"+attrName+"' is repeated.", getPositionFromMatch(matches[i]));
-    }
-  }
-
-  return true;
-}
-
-function validateNumberAmpersand(xmlData, i) {
-  let re = /\d/;
-  if (xmlData[i] === 'x') {
-    i++;
-    re = /[\da-fA-F]/;
-  }
-  for (; i < xmlData.length; i++) {
-    if (xmlData[i] === ';')
-      return i;
-    if (!xmlData[i].match(re))
-      break;
-  }
-  return -1;
-}
-
-function validateAmpersand(xmlData, i) {
-  // https://www.w3.org/TR/xml/#dt-charref
-  i++;
-  if (xmlData[i] === ';')
-    return -1;
-  if (xmlData[i] === '#') {
-    i++;
-    return validateNumberAmpersand(xmlData, i);
-  }
-  let count = 0;
-  for (; i < xmlData.length; i++, count++) {
-    if (xmlData[i].match(/\w/) && count < 20)
-      continue;
-    if (xmlData[i] === ';')
-      break;
-    return -1;
-  }
-  return i;
-}
-
-function getErrorObject(code, message, lineNumber) {
-  return {
-    err: {
-      code: code,
-      msg: message,
-      line: lineNumber.line || lineNumber,
-      col: lineNumber.col,
-    },
-  };
-}
-
-function validateAttrName(attrName) {
-  return util.isName(attrName);
-}
-
-// const startsWithXML = /^xml/i;
-
-function validateTagName(tagname) {
-  return util.isName(tagname) /* && !tagname.match(startsWithXML) */;
-}
-
-//this function returns the line number for the character at the given index
-function getLineNumberForPosition(xmlData, index) {
-  const lines = xmlData.substring(0, index).split(/\r?\n/);
-  return {
-    line: lines.length,
-
-    // column number is last line's length + 1, because column numbering starts at 1:
-    col: lines[lines.length - 1].length + 1
-  };
-}
-
-//this function returns the position of the first character of match within attrStr
-function getPositionFromMatch(match) {
-  return match.startIndex + match[1].length;
-}
-
-
-/***/ }),
-
-/***/ 6762:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-
-//parse Empty Node as self closing node
-const buildFromOrderedJs = __nccwpck_require__(9603);
-
-const defaultOptions = {
-  attributeNamePrefix: '@_',
-  attributesGroupName: false,
-  textNodeName: '#text',
-  ignoreAttributes: true,
-  cdataPropName: false,
-  format: false,
-  indentBy: '  ',
-  suppressEmptyNode: false,
-  suppressUnpairedNode: true,
-  suppressBooleanAttributes: true,
-  tagValueProcessor: function(key, a) {
-    return a;
-  },
-  attributeValueProcessor: function(attrName, a) {
-    return a;
-  },
-  preserveOrder: false,
-  commentPropName: false,
-  unpairedTags: [],
-  entities: [
-    { regex: new RegExp("&", "g"), val: "&amp;" },//it must be on top
-    { regex: new RegExp(">", "g"), val: "&gt;" },
-    { regex: new RegExp("<", "g"), val: "&lt;" },
-    { regex: new RegExp("\'", "g"), val: "&apos;" },
-    { regex: new RegExp("\"", "g"), val: "&quot;" }
-  ],
-  processEntities: true,
-  stopNodes: [],
-  // transformTagName: false,
-  // transformAttributeName: false,
-  oneListGroup: false
-};
-
-function Builder(options) {
-  this.options = Object.assign({}, defaultOptions, options);
-  if (this.options.ignoreAttributes || this.options.attributesGroupName) {
-    this.isAttribute = function(/*a*/) {
-      return false;
-    };
-  } else {
-    this.attrPrefixLen = this.options.attributeNamePrefix.length;
-    this.isAttribute = isAttribute;
-  }
-
-  this.processTextOrObjNode = processTextOrObjNode
-
-  if (this.options.format) {
-    this.indentate = indentate;
-    this.tagEndChar = '>\n';
-    this.newLine = '\n';
-  } else {
-    this.indentate = function() {
-      return '';
-    };
-    this.tagEndChar = '>';
-    this.newLine = '';
-  }
-}
-
-Builder.prototype.build = function(jObj) {
-  if(this.options.preserveOrder){
-    return buildFromOrderedJs(jObj, this.options);
-  }else {
-    if(Array.isArray(jObj) && this.options.arrayNodeName && this.options.arrayNodeName.length > 1){
-      jObj = {
-        [this.options.arrayNodeName] : jObj
-      }
-    }
-    return this.j2x(jObj, 0).val;
-  }
-};
-
-Builder.prototype.j2x = function(jObj, level) {
-  let attrStr = '';
-  let val = '';
-  for (let key in jObj) {
-    if(!Object.prototype.hasOwnProperty.call(jObj, key)) continue;
-    if (typeof jObj[key] === 'undefined') {
-      // supress undefined node only if it is not an attribute
-      if (this.isAttribute(key)) {
-        val += '';
-      }
-    } else if (jObj[key] === null) {
-      // null attribute should be ignored by the attribute list, but should not cause the tag closing
-      if (this.isAttribute(key)) {
-        val += '';
-      } else if (key[0] === '?') {
-        val += this.indentate(level) + '<' + key + '?' + this.tagEndChar;
-      } else {
-        val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;
-      }
-      // val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;
-    } else if (jObj[key] instanceof Date) {
-      val += this.buildTextValNode(jObj[key], key, '', level);
-    } else if (typeof jObj[key] !== 'object') {
-      //premitive type
-      const attr = this.isAttribute(key);
-      if (attr) {
-        attrStr += this.buildAttrPairStr(attr, '' + jObj[key]);
-      }else {
-        //tag value
-        if (key === this.options.textNodeName) {
-          let newval = this.options.tagValueProcessor(key, '' + jObj[key]);
-          val += this.replaceEntitiesValue(newval);
-        } else {
-          val += this.buildTextValNode(jObj[key], key, '', level);
-        }
-      }
-    } else if (Array.isArray(jObj[key])) {
-      //repeated nodes
-      const arrLen = jObj[key].length;
-      let listTagVal = "";
-      let listTagAttr = "";
-      for (let j = 0; j < arrLen; j++) {
-        const item = jObj[key][j];
-        if (typeof item === 'undefined') {
-          // supress undefined node
-        } else if (item === null) {
-          if(key[0] === "?") val += this.indentate(level) + '<' + key + '?' + this.tagEndChar;
-          else val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;
-          // val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;
-        } else if (typeof item === 'object') {
-          if(this.options.oneListGroup){
-            const result = this.j2x(item, level + 1);
-            listTagVal += result.val;
-            if (this.options.attributesGroupName && item.hasOwnProperty(this.options.attributesGroupName)) {
-              listTagAttr += result.attrStr
-            }
-          }else{
-            listTagVal += this.processTextOrObjNode(item, key, level)
-          }
-        } else {
-          if (this.options.oneListGroup) {
-            let textValue = this.options.tagValueProcessor(key, item);
-            textValue = this.replaceEntitiesValue(textValue);
-            listTagVal += textValue;
-          } else {
-            listTagVal += this.buildTextValNode(item, key, '', level);
-          }
-        }
-      }
-      if(this.options.oneListGroup){
-        listTagVal = this.buildObjectNode(listTagVal, key, listTagAttr, level);
-      }
-      val += listTagVal;
-    } else {
-      //nested node
-      if (this.options.attributesGroupName && key === this.options.attributesGroupName) {
-        const Ks = Object.keys(jObj[key]);
-        const L = Ks.length;
-        for (let j = 0; j < L; j++) {
-          attrStr += this.buildAttrPairStr(Ks[j], '' + jObj[key][Ks[j]]);
-        }
-      } else {
-        val += this.processTextOrObjNode(jObj[key], key, level)
-      }
-    }
-  }
-  return {attrStr: attrStr, val: val};
-};
-
-Builder.prototype.buildAttrPairStr = function(attrName, val){
-  val = this.options.attributeValueProcessor(attrName, '' + val);
-  val = this.replaceEntitiesValue(val);
-  if (this.options.suppressBooleanAttributes && val === "true") {
-    return ' ' + attrName;
-  } else return ' ' + attrName + '="' + val + '"';
-}
-
-function processTextOrObjNode (object, key, level) {
-  const result = this.j2x(object, level + 1);
-  if (object[this.options.textNodeName] !== undefined && Object.keys(object).length === 1) {
-    return this.buildTextValNode(object[this.options.textNodeName], key, result.attrStr, level);
-  } else {
-    return this.buildObjectNode(result.val, key, result.attrStr, level);
-  }
-}
-
-Builder.prototype.buildObjectNode = function(val, key, attrStr, level) {
-  if(val === ""){
-    if(key[0] === "?") return  this.indentate(level) + '<' + key + attrStr+ '?' + this.tagEndChar;
-    else {
-      return this.indentate(level) + '<' + key + attrStr + this.closeTag(key) + this.tagEndChar;
-    }
-  }else{
-
-    let tagEndExp = '</' + key + this.tagEndChar;
-    let piClosingChar = "";
-    
-    if(key[0] === "?") {
-      piClosingChar = "?";
-      tagEndExp = "";
-    }
-  
-    // attrStr is an empty string in case the attribute came as undefined or null
-    if ((attrStr || attrStr === '') && val.indexOf('<') === -1) {
-      return ( this.indentate(level) + '<' +  key + attrStr + piClosingChar + '>' + val + tagEndExp );
-    } else if (this.options.commentPropName !== false && key === this.options.commentPropName && piClosingChar.length === 0) {
-      return this.indentate(level) + `<!--${val}-->` + this.newLine;
-    }else {
-      return (
-        this.indentate(level) + '<' + key + attrStr + piClosingChar + this.tagEndChar +
-        val +
-        this.indentate(level) + tagEndExp    );
-    }
-  }
-}
-
-Builder.prototype.closeTag = function(key){
-  let closeTag = "";
-  if(this.options.unpairedTags.indexOf(key) !== -1){ //unpaired
-    if(!this.options.suppressUnpairedNode) closeTag = "/"
-  }else if(this.options.suppressEmptyNode){ //empty
-    closeTag = "/";
-  }else{
-    closeTag = `></${key}`
-  }
-  return closeTag;
-}
-
-function buildEmptyObjNode(val, key, attrStr, level) {
-  if (val !== '') {
-    return this.buildObjectNode(val, key, attrStr, level);
-  } else {
-    if(key[0] === "?") return  this.indentate(level) + '<' + key + attrStr+ '?' + this.tagEndChar;
-    else {
-      return  this.indentate(level) + '<' + key + attrStr + '/' + this.tagEndChar;
-      // return this.buildTagStr(level,key, attrStr);
-    }
-  }
-}
-
-Builder.prototype.buildTextValNode = function(val, key, attrStr, level) {
-  if (this.options.cdataPropName !== false && key === this.options.cdataPropName) {
-    return this.indentate(level) + `<![CDATA[${val}]]>` +  this.newLine;
-  }else if (this.options.commentPropName !== false && key === this.options.commentPropName) {
-    return this.indentate(level) + `<!--${val}-->` +  this.newLine;
-  }else if(key[0] === "?") {//PI tag
-    return  this.indentate(level) + '<' + key + attrStr+ '?' + this.tagEndChar; 
-  }else{
-    let textValue = this.options.tagValueProcessor(key, val);
-    textValue = this.replaceEntitiesValue(textValue);
-  
-    if( textValue === ''){
-      return this.indentate(level) + '<' + key + attrStr + this.closeTag(key) + this.tagEndChar;
-    }else{
-      return this.indentate(level) + '<' + key + attrStr + '>' +
-         textValue +
-        '</' + key + this.tagEndChar;
-    }
-  }
-}
-
-Builder.prototype.replaceEntitiesValue = function(textValue){
-  if(textValue && textValue.length > 0 && this.options.processEntities){
-    for (let i=0; i<this.options.entities.length; i++) {
-      const entity = this.options.entities[i];
-      textValue = textValue.replace(entity.regex, entity.val);
-    }
-  }
-  return textValue;
-}
-
-function indentate(level) {
-  return this.options.indentBy.repeat(level);
-}
-
-function isAttribute(name /*, options*/) {
-  if (name.startsWith(this.options.attributeNamePrefix) && name !== this.options.textNodeName) {
-    return name.substr(this.attrPrefixLen);
-  } else {
-    return false;
-  }
-}
-
-module.exports = Builder;
-
-
-/***/ }),
-
-/***/ 9603:
-/***/ ((module) => {
-
-const EOL = "\n";
-
-/**
- * 
- * @param {array} jArray 
- * @param {any} options 
- * @returns 
- */
-function toXml(jArray, options) {
-    let indentation = "";
-    if (options.format && options.indentBy.length > 0) {
-        indentation = EOL;
-    }
-    return arrToStr(jArray, options, "", indentation);
-}
-
-function arrToStr(arr, options, jPath, indentation) {
-    let xmlStr = "";
-    let isPreviousElementTag = false;
-
-    for (let i = 0; i < arr.length; i++) {
-        const tagObj = arr[i];
-        const tagName = propName(tagObj);
-        if(tagName === undefined) continue;
-
-        let newJPath = "";
-        if (jPath.length === 0) newJPath = tagName
-        else newJPath = `${jPath}.${tagName}`;
-
-        if (tagName === options.textNodeName) {
-            let tagText = tagObj[tagName];
-            if (!isStopNode(newJPath, options)) {
-                tagText = options.tagValueProcessor(tagName, tagText);
-                tagText = replaceEntitiesValue(tagText, options);
-            }
-            if (isPreviousElementTag) {
-                xmlStr += indentation;
-            }
-            xmlStr += tagText;
-            isPreviousElementTag = false;
-            continue;
-        } else if (tagName === options.cdataPropName) {
-            if (isPreviousElementTag) {
-                xmlStr += indentation;
-            }
-            xmlStr += `<![CDATA[${tagObj[tagName][0][options.textNodeName]}]]>`;
-            isPreviousElementTag = false;
-            continue;
-        } else if (tagName === options.commentPropName) {
-            xmlStr += indentation + `<!--${tagObj[tagName][0][options.textNodeName]}-->`;
-            isPreviousElementTag = true;
-            continue;
-        } else if (tagName[0] === "?") {
-            const attStr = attr_to_str(tagObj[":@"], options);
-            const tempInd = tagName === "?xml" ? "" : indentation;
-            let piTextNodeName = tagObj[tagName][0][options.textNodeName];
-            piTextNodeName = piTextNodeName.length !== 0 ? " " + piTextNodeName : ""; //remove extra spacing
-            xmlStr += tempInd + `<${tagName}${piTextNodeName}${attStr}?>`;
-            isPreviousElementTag = true;
-            continue;
-        }
-        let newIdentation = indentation;
-        if (newIdentation !== "") {
-            newIdentation += options.indentBy;
-        }
-        const attStr = attr_to_str(tagObj[":@"], options);
-        const tagStart = indentation + `<${tagName}${attStr}`;
-        const tagValue = arrToStr(tagObj[tagName], options, newJPath, newIdentation);
-        if (options.unpairedTags.indexOf(tagName) !== -1) {
-            if (options.suppressUnpairedNode) xmlStr += tagStart + ">";
-            else xmlStr += tagStart + "/>";
-        } else if ((!tagValue || tagValue.length === 0) && options.suppressEmptyNode) {
-            xmlStr += tagStart + "/>";
-        } else if (tagValue && tagValue.endsWith(">")) {
-            xmlStr += tagStart + `>${tagValue}${indentation}</${tagName}>`;
-        } else {
-            xmlStr += tagStart + ">";
-            if (tagValue && indentation !== "" && (tagValue.includes("/>") || tagValue.includes("</"))) {
-                xmlStr += indentation + options.indentBy + tagValue + indentation;
-            } else {
-                xmlStr += tagValue;
-            }
-            xmlStr += `</${tagName}>`;
-        }
-        isPreviousElementTag = true;
-    }
-
-    return xmlStr;
-}
-
-function propName(obj) {
-    const keys = Object.keys(obj);
-    for (let i = 0; i < keys.length; i++) {
-        const key = keys[i];
-        if(!obj.hasOwnProperty(key)) continue;
-        if (key !== ":@") return key;
-    }
-}
-
-function attr_to_str(attrMap, options) {
-    let attrStr = "";
-    if (attrMap && !options.ignoreAttributes) {
-        for (let attr in attrMap) {
-            if(!attrMap.hasOwnProperty(attr)) continue;
-            let attrVal = options.attributeValueProcessor(attr, attrMap[attr]);
-            attrVal = replaceEntitiesValue(attrVal, options);
-            if (attrVal === true && options.suppressBooleanAttributes) {
-                attrStr += ` ${attr.substr(options.attributeNamePrefix.length)}`;
-            } else {
-                attrStr += ` ${attr.substr(options.attributeNamePrefix.length)}="${attrVal}"`;
-            }
-        }
-    }
-    return attrStr;
-}
-
-function isStopNode(jPath, options) {
-    jPath = jPath.substr(0, jPath.length - options.textNodeName.length - 1);
-    let tagName = jPath.substr(jPath.lastIndexOf(".") + 1);
-    for (let index in options.stopNodes) {
-        if (options.stopNodes[index] === jPath || options.stopNodes[index] === "*." + tagName) return true;
-    }
-    return false;
-}
-
-function replaceEntitiesValue(textValue, options) {
-    if (textValue && textValue.length > 0 && options.processEntities) {
-        for (let i = 0; i < options.entities.length; i++) {
-            const entity = options.entities[i];
-            textValue = textValue.replace(entity.regex, entity.val);
-        }
-    }
-    return textValue;
-}
-module.exports = toXml;
-
-
-/***/ }),
-
-/***/ 8778:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-const util = __nccwpck_require__(3480);
-
-//TODO: handle comments
-function readDocType(xmlData, i){
-    
-    const entities = {};
-    if( xmlData[i + 3] === 'O' &&
-         xmlData[i + 4] === 'C' &&
-         xmlData[i + 5] === 'T' &&
-         xmlData[i + 6] === 'Y' &&
-         xmlData[i + 7] === 'P' &&
-         xmlData[i + 8] === 'E')
-    {    
-        i = i+9;
-        let angleBracketsCount = 1;
-        let hasBody = false, comment = false;
-        let exp = "";
-        for(;i<xmlData.length;i++){
-            if (xmlData[i] === '<' && !comment) { //Determine the tag type
-                if( hasBody && isEntity(xmlData, i)){
-                    i += 7; 
-                    [entityName, val,i] = readEntityExp(xmlData,i+1);
-                    if(val.indexOf("&") === -1) //Parameter entities are not supported
-                        entities[ validateEntityName(entityName) ] = {
-                            regx : RegExp( `&${entityName};`,"g"),
-                            val: val
-                        };
-                }
-                else if( hasBody && isElement(xmlData, i))  i += 8;//Not supported
-                else if( hasBody && isAttlist(xmlData, i))  i += 8;//Not supported
-                else if( hasBody && isNotation(xmlData, i)) i += 9;//Not supported
-                else if( isComment)                         comment = true;
-                else                                        throw new Error("Invalid DOCTYPE");
-
-                angleBracketsCount++;
-                exp = "";
-            } else if (xmlData[i] === '>') { //Read tag content
-                if(comment){
-                    if( xmlData[i - 1] === "-" && xmlData[i - 2] === "-"){
-                        comment = false;
-                        angleBracketsCount--;
-                    }
-                }else{
-                    angleBracketsCount--;
-                }
-                if (angleBracketsCount === 0) {
-                  break;
-                }
-            }else if( xmlData[i] === '['){
-                hasBody = true;
-            }else{
-                exp += xmlData[i];
-            }
-        }
-        if(angleBracketsCount !== 0){
-            throw new Error(`Unclosed DOCTYPE`);
-        }
-    }else{
-        throw new Error(`Invalid Tag instead of DOCTYPE`);
-    }
-    return {entities, i};
-}
-
-function readEntityExp(xmlData,i){
-    //External entities are not supported
-    //    <!ENTITY ext SYSTEM "http://normal-website.com" >
-
-    //Parameter entities are not supported
-    //    <!ENTITY entityname "&anotherElement;">
-
-    //Internal entities are supported
-    //    <!ENTITY entityname "replacement text">
-    
-    //read EntityName
-    let entityName = "";
-    for (; i < xmlData.length && (xmlData[i] !== "'" && xmlData[i] !== '"' ); i++) {
-        // if(xmlData[i] === " ") continue;
-        // else 
-        entityName += xmlData[i];
-    }
-    entityName = entityName.trim();
-    if(entityName.indexOf(" ") !== -1) throw new Error("External entites are not supported");
-
-    //read Entity Value
-    const startChar = xmlData[i++];
-    let val = ""
-    for (; i < xmlData.length && xmlData[i] !== startChar ; i++) {
-        val += xmlData[i];
-    }
-    return [entityName, val, i];
-}
-
-function isComment(xmlData, i){
-    if(xmlData[i+1] === '!' &&
-    xmlData[i+2] === '-' &&
-    xmlData[i+3] === '-') return true
-    return false
-}
-function isEntity(xmlData, i){
-    if(xmlData[i+1] === '!' &&
-    xmlData[i+2] === 'E' &&
-    xmlData[i+3] === 'N' &&
-    xmlData[i+4] === 'T' &&
-    xmlData[i+5] === 'I' &&
-    xmlData[i+6] === 'T' &&
-    xmlData[i+7] === 'Y') return true
-    return false
-}
-function isElement(xmlData, i){
-    if(xmlData[i+1] === '!' &&
-    xmlData[i+2] === 'E' &&
-    xmlData[i+3] === 'L' &&
-    xmlData[i+4] === 'E' &&
-    xmlData[i+5] === 'M' &&
-    xmlData[i+6] === 'E' &&
-    xmlData[i+7] === 'N' &&
-    xmlData[i+8] === 'T') return true
-    return false
-}
-
-function isAttlist(xmlData, i){
-    if(xmlData[i+1] === '!' &&
-    xmlData[i+2] === 'A' &&
-    xmlData[i+3] === 'T' &&
-    xmlData[i+4] === 'T' &&
-    xmlData[i+5] === 'L' &&
-    xmlData[i+6] === 'I' &&
-    xmlData[i+7] === 'S' &&
-    xmlData[i+8] === 'T') return true
-    return false
-}
-function isNotation(xmlData, i){
-    if(xmlData[i+1] === '!' &&
-    xmlData[i+2] === 'N' &&
-    xmlData[i+3] === 'O' &&
-    xmlData[i+4] === 'T' &&
-    xmlData[i+5] === 'A' &&
-    xmlData[i+6] === 'T' &&
-    xmlData[i+7] === 'I' &&
-    xmlData[i+8] === 'O' &&
-    xmlData[i+9] === 'N') return true
-    return false
-}
-
-function validateEntityName(name){
-    if (util.isName(name))
-	return name;
-    else
-        throw new Error(`Invalid entity name ${name}`);
-}
-
-module.exports = readDocType;
-
-
-/***/ }),
-
-/***/ 5922:
-/***/ ((__unused_webpack_module, exports) => {
-
-
-const defaultOptions = {
-    preserveOrder: false,
-    attributeNamePrefix: '@_',
-    attributesGroupName: false,
-    textNodeName: '#text',
-    ignoreAttributes: true,
-    removeNSPrefix: false, // remove NS from tag name or attribute name if true
-    allowBooleanAttributes: false, //a tag can have attributes without any value
-    //ignoreRootElement : false,
-    parseTagValue: true,
-    parseAttributeValue: false,
-    trimValues: true, //Trim string values of tag and attributes
-    cdataPropName: false,
-    numberParseOptions: {
-      hex: true,
-      leadingZeros: true,
-      eNotation: true
-    },
-    tagValueProcessor: function(tagName, val) {
-      return val;
-    },
-    attributeValueProcessor: function(attrName, val) {
-      return val;
-    },
-    stopNodes: [], //nested tags will not be parsed even for errors
-    alwaysCreateTextNode: false,
-    isArray: () => false,
-    commentPropName: false,
-    unpairedTags: [],
-    processEntities: true,
-    htmlEntities: false,
-    ignoreDeclaration: false,
-    ignorePiTags: false,
-    transformTagName: false,
-    transformAttributeName: false,
-    updateTag: function(tagName, jPath, attrs){
-      return tagName
-    },
-    // skipEmptyListItem: false
-};
-   
-const buildOptions = function(options) {
-    return Object.assign({}, defaultOptions, options);
-};
-
-exports.buildOptions = buildOptions;
-exports.defaultOptions = defaultOptions;
-
-/***/ }),
-
-/***/ 1076:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-
-///@ts-check
-
-const util = __nccwpck_require__(3480);
-const xmlNode = __nccwpck_require__(308);
-const readDocType = __nccwpck_require__(8778);
-const toNumber = __nccwpck_require__(9578);
-
-// const regx =
-//   '<((!\\[CDATA\\[([\\s\\S]*?)(]]>))|((NAME:)?(NAME))([^>]*)>|((\\/)(NAME)\\s*>))([^<]*)'
-//   .replace(/NAME/g, util.nameRegexp);
-
-//const tagsRegx = new RegExp("<(\\/?[\\w:\\-\._]+)([^>]*)>(\\s*"+cdataRegx+")*([^<]+)?","g");
-//const tagsRegx = new RegExp("<(\\/?)((\\w*:)?([\\w:\\-\._]+))([^>]*)>([^<]*)("+cdataRegx+"([^<]*))*([^<]+)?","g");
-
-class OrderedObjParser{
-  constructor(options){
-    this.options = options;
-    this.currentNode = null;
-    this.tagsNodeStack = [];
-    this.docTypeEntities = {};
-    this.lastEntities = {
-      "apos" : { regex: /&(apos|#39|#x27);/g, val : "'"},
-      "gt" : { regex: /&(gt|#62|#x3E);/g, val : ">"},
-      "lt" : { regex: /&(lt|#60|#x3C);/g, val : "<"},
-      "quot" : { regex: /&(quot|#34|#x22);/g, val : "\""},
-    };
-    this.ampEntity = { regex: /&(amp|#38|#x26);/g, val : "&"};
-    this.htmlEntities = {
-      "space": { regex: /&(nbsp|#160);/g, val: " " },
-      // "lt" : { regex: /&(lt|#60);/g, val: "<" },
-      // "gt" : { regex: /&(gt|#62);/g, val: ">" },
-      // "amp" : { regex: /&(amp|#38);/g, val: "&" },
-      // "quot" : { regex: /&(quot|#34);/g, val: "\"" },
-      // "apos" : { regex: /&(apos|#39);/g, val: "'" },
-      "cent" : { regex: /&(cent|#162);/g, val: "¢" },
-      "pound" : { regex: /&(pound|#163);/g, val: "£" },
-      "yen" : { regex: /&(yen|#165);/g, val: "¥" },
-      "euro" : { regex: /&(euro|#8364);/g, val: "€" },
-      "copyright" : { regex: /&(copy|#169);/g, val: "©" },
-      "reg" : { regex: /&(reg|#174);/g, val: "®" },
-      "inr" : { regex: /&(inr|#8377);/g, val: "₹" },
-      "num_dec": { regex: /&#([0-9]{1,7});/g, val : (_, str) => String.fromCharCode(Number.parseInt(str, 10)) },
-      "num_hex": { regex: /&#x([0-9a-fA-F]{1,6});/g, val : (_, str) => String.fromCharCode(Number.parseInt(str, 16)) },
-    };
-    this.addExternalEntities = addExternalEntities;
-    this.parseXml = parseXml;
-    this.parseTextData = parseTextData;
-    this.resolveNameSpace = resolveNameSpace;
-    this.buildAttributesMap = buildAttributesMap;
-    this.isItStopNode = isItStopNode;
-    this.replaceEntitiesValue = replaceEntitiesValue;
-    this.readStopNodeData = readStopNodeData;
-    this.saveTextToParentTag = saveTextToParentTag;
-    this.addChild = addChild;
-  }
-
-}
-
-function addExternalEntities(externalEntities){
-  const entKeys = Object.keys(externalEntities);
-  for (let i = 0; i < entKeys.length; i++) {
-    const ent = entKeys[i];
-    this.lastEntities[ent] = {
-       regex: new RegExp("&"+ent+";","g"),
-       val : externalEntities[ent]
-    }
-  }
-}
-
-/**
- * @param {string} val
- * @param {string} tagName
- * @param {string} jPath
- * @param {boolean} dontTrim
- * @param {boolean} hasAttributes
- * @param {boolean} isLeafNode
- * @param {boolean} escapeEntities
- */
-function parseTextData(val, tagName, jPath, dontTrim, hasAttributes, isLeafNode, escapeEntities) {
-  if (val !== undefined) {
-    if (this.options.trimValues && !dontTrim) {
-      val = val.trim();
-    }
-    if(val.length > 0){
-      if(!escapeEntities) val = this.replaceEntitiesValue(val);
-      
-      const newval = this.options.tagValueProcessor(tagName, val, jPath, hasAttributes, isLeafNode);
-      if(newval === null || newval === undefined){
-        //don't parse
-        return val;
-      }else if(typeof newval !== typeof val || newval !== val){
-        //overwrite
-        return newval;
-      }else if(this.options.trimValues){
-        return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
-      }else{
-        const trimmedVal = val.trim();
-        if(trimmedVal === val){
-          return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
-        }else{
-          return val;
-        }
-      }
-    }
-  }
-}
-
-function resolveNameSpace(tagname) {
-  if (this.options.removeNSPrefix) {
-    const tags = tagname.split(':');
-    const prefix = tagname.charAt(0) === '/' ? '/' : '';
-    if (tags[0] === 'xmlns') {
-      return '';
-    }
-    if (tags.length === 2) {
-      tagname = prefix + tags[1];
-    }
-  }
-  return tagname;
-}
-
-//TODO: change regex to capture NS
-//const attrsRegx = new RegExp("([\\w\\-\\.\\:]+)\\s*=\\s*(['\"])((.|\n)*?)\\2","gm");
-const attrsRegx = new RegExp('([^\\s=]+)\\s*(=\\s*([\'"])([\\s\\S]*?)\\3)?', 'gm');
-
-function buildAttributesMap(attrStr, jPath, tagName) {
-  if (!this.options.ignoreAttributes && typeof attrStr === 'string') {
-    // attrStr = attrStr.replace(/\r?\n/g, ' ');
-    //attrStr = attrStr || attrStr.trim();
-
-    const matches = util.getAllMatches(attrStr, attrsRegx);
-    const len = matches.length; //don't make it inline
-    const attrs = {};
-    for (let i = 0; i < len; i++) {
-      const attrName = this.resolveNameSpace(matches[i][1]);
-      let oldVal = matches[i][4];
-      let aName = this.options.attributeNamePrefix + attrName;
-      if (attrName.length) {
-        if (this.options.transformAttributeName) {
-          aName = this.options.transformAttributeName(aName);
-        }
-        if(aName === "__proto__") aName  = "#__proto__";
-        if (oldVal !== undefined) {
-          if (this.options.trimValues) {
-            oldVal = oldVal.trim();
-          }
-          oldVal = this.replaceEntitiesValue(oldVal);
-          const newVal = this.options.attributeValueProcessor(attrName, oldVal, jPath);
-          if(newVal === null || newVal === undefined){
-            //don't parse
-            attrs[aName] = oldVal;
-          }else if(typeof newVal !== typeof oldVal || newVal !== oldVal){
-            //overwrite
-            attrs[aName] = newVal;
-          }else{
-            //parse
-            attrs[aName] = parseValue(
-              oldVal,
-              this.options.parseAttributeValue,
-              this.options.numberParseOptions
-            );
-          }
-        } else if (this.options.allowBooleanAttributes) {
-          attrs[aName] = true;
-        }
-      }
-    }
-    if (!Object.keys(attrs).length) {
-      return;
-    }
-    if (this.options.attributesGroupName) {
-      const attrCollection = {};
-      attrCollection[this.options.attributesGroupName] = attrs;
-      return attrCollection;
-    }
-    return attrs
-  }
-}
-
-const parseXml = function(xmlData) {
-  xmlData = xmlData.replace(/\r\n?/g, "\n"); //TODO: remove this line
-  const xmlObj = new xmlNode('!xml');
-  let currentNode = xmlObj;
-  let textData = "";
-  let jPath = "";
-  for(let i=0; i< xmlData.length; i++){//for each char in XML data
-    const ch = xmlData[i];
-    if(ch === '<'){
-      // const nextIndex = i+1;
-      // const _2ndChar = xmlData[nextIndex];
-      if( xmlData[i+1] === '/') {//Closing Tag
-        const closeIndex = findClosingIndex(xmlData, ">", i, "Closing Tag is not closed.")
-        let tagName = xmlData.substring(i+2,closeIndex).trim();
-
-        if(this.options.removeNSPrefix){
-          const colonIndex = tagName.indexOf(":");
-          if(colonIndex !== -1){
-            tagName = tagName.substr(colonIndex+1);
-          }
-        }
-
-        if(this.options.transformTagName) {
-          tagName = this.options.transformTagName(tagName);
-        }
-
-        if(currentNode){
-          textData = this.saveTextToParentTag(textData, currentNode, jPath);
-        }
-
-        //check if last tag of nested tag was unpaired tag
-        const lastTagName = jPath.substring(jPath.lastIndexOf(".")+1);
-        if(tagName && this.options.unpairedTags.indexOf(tagName) !== -1 ){
-          throw new Error(`Unpaired tag can not be used as closing tag: </${tagName}>`);
-        }
-        let propIndex = 0
-        if(lastTagName && this.options.unpairedTags.indexOf(lastTagName) !== -1 ){
-          propIndex = jPath.lastIndexOf('.', jPath.lastIndexOf('.')-1)
-          this.tagsNodeStack.pop();
-        }else{
-          propIndex = jPath.lastIndexOf(".");
-        }
-        jPath = jPath.substring(0, propIndex);
-
-        currentNode = this.tagsNodeStack.pop();//avoid recursion, set the parent tag scope
-        textData = "";
-        i = closeIndex;
-      } else if( xmlData[i+1] === '?') {
-
-        let tagData = readTagExp(xmlData,i, false, "?>");
-        if(!tagData) throw new Error("Pi Tag is not closed.");
-
-        textData = this.saveTextToParentTag(textData, currentNode, jPath);
-        if( (this.options.ignoreDeclaration && tagData.tagName === "?xml") || this.options.ignorePiTags){
-
-        }else{
-  
-          const childNode = new xmlNode(tagData.tagName);
-          childNode.add(this.options.textNodeName, "");
-          
-          if(tagData.tagName !== tagData.tagExp && tagData.attrExpPresent){
-            childNode[":@"] = this.buildAttributesMap(tagData.tagExp, jPath, tagData.tagName);
-          }
-          this.addChild(currentNode, childNode, jPath)
-
-        }
-
-
-        i = tagData.closeIndex + 1;
-      } else if(xmlData.substr(i + 1, 3) === '!--') {
-        const endIndex = findClosingIndex(xmlData, "-->", i+4, "Comment is not closed.")
-        if(this.options.commentPropName){
-          const comment = xmlData.substring(i + 4, endIndex - 2);
-
-          textData = this.saveTextToParentTag(textData, currentNode, jPath);
-
-          currentNode.add(this.options.commentPropName, [ { [this.options.textNodeName] : comment } ]);
-        }
-        i = endIndex;
-      } else if( xmlData.substr(i + 1, 2) === '!D') {
-        const result = readDocType(xmlData, i);
-        this.docTypeEntities = result.entities;
-        i = result.i;
-      }else if(xmlData.substr(i + 1, 2) === '![') {
-        const closeIndex = findClosingIndex(xmlData, "]]>", i, "CDATA is not closed.") - 2;
-        const tagExp = xmlData.substring(i + 9,closeIndex);
-
-        textData = this.saveTextToParentTag(textData, currentNode, jPath);
-
-        let val = this.parseTextData(tagExp, currentNode.tagname, jPath, true, false, true, true);
-        if(val == undefined) val = "";
-
-        //cdata should be set even if it is 0 length string
-        if(this.options.cdataPropName){
-          currentNode.add(this.options.cdataPropName, [ { [this.options.textNodeName] : tagExp } ]);
-        }else{
-          currentNode.add(this.options.textNodeName, val);
-        }
-        
-        i = closeIndex + 2;
-      }else {//Opening tag
-        let result = readTagExp(xmlData,i, this.options.removeNSPrefix);
-        let tagName= result.tagName;
-        const rawTagName = result.rawTagName;
-        let tagExp = result.tagExp;
-        let attrExpPresent = result.attrExpPresent;
-        let closeIndex = result.closeIndex;
-
-        if (this.options.transformTagName) {
-          tagName = this.options.transformTagName(tagName);
-        }
-        
-        //save text as child node
-        if (currentNode && textData) {
-          if(currentNode.tagname !== '!xml'){
-            //when nested tag is found
-            textData = this.saveTextToParentTag(textData, currentNode, jPath, false);
-          }
-        }
-
-        //check if last tag was unpaired tag
-        const lastTag = currentNode;
-        if(lastTag && this.options.unpairedTags.indexOf(lastTag.tagname) !== -1 ){
-          currentNode = this.tagsNodeStack.pop();
-          jPath = jPath.substring(0, jPath.lastIndexOf("."));
-        }
-        if(tagName !== xmlObj.tagname){
-          jPath += jPath ? "." + tagName : tagName;
-        }
-        if (this.isItStopNode(this.options.stopNodes, jPath, tagName)) {
-          let tagContent = "";
-          //self-closing tag
-          if(tagExp.length > 0 && tagExp.lastIndexOf("/") === tagExp.length - 1){
-            if(tagName[tagName.length - 1] === "/"){ //remove trailing '/'
-              tagName = tagName.substr(0, tagName.length - 1);
-              jPath = jPath.substr(0, jPath.length - 1);
-              tagExp = tagName;
-            }else{
-              tagExp = tagExp.substr(0, tagExp.length - 1);
-            }
-            i = result.closeIndex;
-          }
-          //unpaired tag
-          else if(this.options.unpairedTags.indexOf(tagName) !== -1){
-            
-            i = result.closeIndex;
-          }
-          //normal tag
-          else{
-            //read until closing tag is found
-            const result = this.readStopNodeData(xmlData, rawTagName, closeIndex + 1);
-            if(!result) throw new Error(`Unexpected end of ${rawTagName}`);
-            i = result.i;
-            tagContent = result.tagContent;
-          }
-
-          const childNode = new xmlNode(tagName);
-          if(tagName !== tagExp && attrExpPresent){
-            childNode[":@"] = this.buildAttributesMap(tagExp, jPath, tagName);
-          }
-          if(tagContent) {
-            tagContent = this.parseTextData(tagContent, tagName, jPath, true, attrExpPresent, true, true);
-          }
-          
-          jPath = jPath.substr(0, jPath.lastIndexOf("."));
-          childNode.add(this.options.textNodeName, tagContent);
-          
-          this.addChild(currentNode, childNode, jPath)
-        }else{
-  //selfClosing tag
-          if(tagExp.length > 0 && tagExp.lastIndexOf("/") === tagExp.length - 1){
-            if(tagName[tagName.length - 1] === "/"){ //remove trailing '/'
-              tagName = tagName.substr(0, tagName.length - 1);
-              jPath = jPath.substr(0, jPath.length - 1);
-              tagExp = tagName;
-            }else{
-              tagExp = tagExp.substr(0, tagExp.length - 1);
-            }
-            
-            if(this.options.transformTagName) {
-              tagName = this.options.transformTagName(tagName);
-            }
-
-            const childNode = new xmlNode(tagName);
-            if(tagName !== tagExp && attrExpPresent){
-              childNode[":@"] = this.buildAttributesMap(tagExp, jPath, tagName);
-            }
-            this.addChild(currentNode, childNode, jPath)
-            jPath = jPath.substr(0, jPath.lastIndexOf("."));
-          }
-    //opening tag
-          else{
-            const childNode = new xmlNode( tagName);
-            this.tagsNodeStack.push(currentNode);
-            
-            if(tagName !== tagExp && attrExpPresent){
-              childNode[":@"] = this.buildAttributesMap(tagExp, jPath, tagName);
-            }
-            this.addChild(currentNode, childNode, jPath)
-            currentNode = childNode;
-          }
-          textData = "";
-          i = closeIndex;
-        }
-      }
-    }else{
-      textData += xmlData[i];
-    }
-  }
-  return xmlObj.child;
-}
-
-function addChild(currentNode, childNode, jPath){
-  const result = this.options.updateTag(childNode.tagname, jPath, childNode[":@"])
-  if(result === false){
-  }else if(typeof result === "string"){
-    childNode.tagname = result
-    currentNode.addChild(childNode);
-  }else{
-    currentNode.addChild(childNode);
-  }
-}
-
-const replaceEntitiesValue = function(val){
-
-  if(this.options.processEntities){
-    for(let entityName in this.docTypeEntities){
-      const entity = this.docTypeEntities[entityName];
-      val = val.replace( entity.regx, entity.val);
-    }
-    for(let entityName in this.lastEntities){
-      const entity = this.lastEntities[entityName];
-      val = val.replace( entity.regex, entity.val);
-    }
-    if(this.options.htmlEntities){
-      for(let entityName in this.htmlEntities){
-        const entity = this.htmlEntities[entityName];
-        val = val.replace( entity.regex, entity.val);
-      }
-    }
-    val = val.replace( this.ampEntity.regex, this.ampEntity.val);
-  }
-  return val;
-}
-function saveTextToParentTag(textData, currentNode, jPath, isLeafNode) {
-  if (textData) { //store previously collected data as textNode
-    if(isLeafNode === undefined) isLeafNode = Object.keys(currentNode.child).length === 0
-    
-    textData = this.parseTextData(textData,
-      currentNode.tagname,
-      jPath,
-      false,
-      currentNode[":@"] ? Object.keys(currentNode[":@"]).length !== 0 : false,
-      isLeafNode);
-
-    if (textData !== undefined && textData !== "")
-      currentNode.add(this.options.textNodeName, textData);
-    textData = "";
-  }
-  return textData;
-}
-
-//TODO: use jPath to simplify the logic
-/**
- * 
- * @param {string[]} stopNodes 
- * @param {string} jPath
- * @param {string} currentTagName 
- */
-function isItStopNode(stopNodes, jPath, currentTagName){
-  const allNodesExp = "*." + currentTagName;
-  for (const stopNodePath in stopNodes) {
-    const stopNodeExp = stopNodes[stopNodePath];
-    if( allNodesExp === stopNodeExp || jPath === stopNodeExp  ) return true;
-  }
-  return false;
-}
-
-/**
- * Returns the tag Expression and where it is ending handling single-double quotes situation
- * @param {string} xmlData 
- * @param {number} i starting index
- * @returns 
- */
-function tagExpWithClosingIndex(xmlData, i, closingChar = ">"){
-  let attrBoundary;
-  let tagExp = "";
-  for (let index = i; index < xmlData.length; index++) {
-    let ch = xmlData[index];
-    if (attrBoundary) {
-        if (ch === attrBoundary) attrBoundary = "";//reset
-    } else if (ch === '"' || ch === "'") {
-        attrBoundary = ch;
-    } else if (ch === closingChar[0]) {
-      if(closingChar[1]){
-        if(xmlData[index + 1] === closingChar[1]){
-          return {
-            data: tagExp,
-            index: index
-          }
-        }
-      }else{
-        return {
-          data: tagExp,
-          index: index
-        }
-      }
-    } else if (ch === '\t') {
-      ch = " "
-    }
-    tagExp += ch;
-  }
-}
-
-function findClosingIndex(xmlData, str, i, errMsg){
-  const closingIndex = xmlData.indexOf(str, i);
-  if(closingIndex === -1){
-    throw new Error(errMsg)
-  }else{
-    return closingIndex + str.length - 1;
-  }
-}
-
-function readTagExp(xmlData,i, removeNSPrefix, closingChar = ">"){
-  const result = tagExpWithClosingIndex(xmlData, i+1, closingChar);
-  if(!result) return;
-  let tagExp = result.data;
-  const closeIndex = result.index;
-  const separatorIndex = tagExp.search(/\s/);
-  let tagName = tagExp;
-  let attrExpPresent = true;
-  if(separatorIndex !== -1){//separate tag name and attributes expression
-    tagName = tagExp.substring(0, separatorIndex);
-    tagExp = tagExp.substring(separatorIndex + 1).trimStart();
-  }
-
-  const rawTagName = tagName;
-  if(removeNSPrefix){
-    const colonIndex = tagName.indexOf(":");
-    if(colonIndex !== -1){
-      tagName = tagName.substr(colonIndex+1);
-      attrExpPresent = tagName !== result.data.substr(colonIndex + 1);
-    }
-  }
-
-  return {
-    tagName: tagName,
-    tagExp: tagExp,
-    closeIndex: closeIndex,
-    attrExpPresent: attrExpPresent,
-    rawTagName: rawTagName,
-  }
-}
-/**
- * find paired tag for a stop node
- * @param {string} xmlData 
- * @param {string} tagName 
- * @param {number} i 
- */
-function readStopNodeData(xmlData, tagName, i){
-  const startIndex = i;
-  // Starting at 1 since we already have an open tag
-  let openTagCount = 1;
-
-  for (; i < xmlData.length; i++) {
-    if( xmlData[i] === "<"){ 
-      if (xmlData[i+1] === "/") {//close tag
-          const closeIndex = findClosingIndex(xmlData, ">", i, `${tagName} is not closed`);
-          let closeTagName = xmlData.substring(i+2,closeIndex).trim();
-          if(closeTagName === tagName){
-            openTagCount--;
-            if (openTagCount === 0) {
-              return {
-                tagContent: xmlData.substring(startIndex, i),
-                i : closeIndex
-              }
-            }
-          }
-          i=closeIndex;
-        } else if(xmlData[i+1] === '?') { 
-          const closeIndex = findClosingIndex(xmlData, "?>", i+1, "StopNode is not closed.")
-          i=closeIndex;
-        } else if(xmlData.substr(i + 1, 3) === '!--') { 
-          const closeIndex = findClosingIndex(xmlData, "-->", i+3, "StopNode is not closed.")
-          i=closeIndex;
-        } else if(xmlData.substr(i + 1, 2) === '![') { 
-          const closeIndex = findClosingIndex(xmlData, "]]>", i, "StopNode is not closed.") - 2;
-          i=closeIndex;
-        } else {
-          const tagData = readTagExp(xmlData, i, '>')
-
-          if (tagData) {
-            const openTagName = tagData && tagData.tagName;
-            if (openTagName === tagName && tagData.tagExp[tagData.tagExp.length-1] !== "/") {
-              openTagCount++;
-            }
-            i=tagData.closeIndex;
-          }
-        }
-      }
-  }//end for loop
-}
-
-function parseValue(val, shouldParse, options) {
-  if (shouldParse && typeof val === 'string') {
-    //console.log(options)
-    const newval = val.trim();
-    if(newval === 'true' ) return true;
-    else if(newval === 'false' ) return false;
-    else return toNumber(val, options);
-  } else {
-    if (util.isExist(val)) {
-      return val;
-    } else {
-      return '';
-    }
-  }
-}
-
-
-module.exports = OrderedObjParser;
-
-
-/***/ }),
-
-/***/ 897:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-const { buildOptions} = __nccwpck_require__(5922);
-const OrderedObjParser = __nccwpck_require__(1076);
-const { prettify} = __nccwpck_require__(9872);
-const validator = __nccwpck_require__(8128);
-
-class XMLParser{
-    
-    constructor(options){
-        this.externalEntities = {};
-        this.options = buildOptions(options);
-        
-    }
-    /**
-     * Parse XML dats to JS object 
-     * @param {string|Buffer} xmlData 
-     * @param {boolean|Object} validationOption 
-     */
-    parse(xmlData,validationOption){
-        if(typeof xmlData === "string"){
-        }else if( xmlData.toString){
-            xmlData = xmlData.toString();
-        }else{
-            throw new Error("XML data is accepted in String or Bytes[] form.")
-        }
-        if( validationOption){
-            if(validationOption === true) validationOption = {}; //validate with default options
-            
-            const result = validator.validate(xmlData, validationOption);
-            if (result !== true) {
-              throw Error( `${result.err.msg}:${result.err.line}:${result.err.col}` )
-            }
-          }
-        const orderedObjParser = new OrderedObjParser(this.options);
-        orderedObjParser.addExternalEntities(this.externalEntities);
-        const orderedResult = orderedObjParser.parseXml(xmlData);
-        if(this.options.preserveOrder || orderedResult === undefined) return orderedResult;
-        else return prettify(orderedResult, this.options);
-    }
-
-    /**
-     * Add Entity which is not by default supported by this library
-     * @param {string} key 
-     * @param {string} value 
-     */
-    addEntity(key, value){
-        if(value.indexOf("&") !== -1){
-            throw new Error("Entity value can't have '&'")
-        }else if(key.indexOf("&") !== -1 || key.indexOf(";") !== -1){
-            throw new Error("An entity must be set without '&' and ';'. Eg. use '#xD' for '&#xD;'")
-        }else if(value === "&"){
-            throw new Error("An entity with value '&' is not permitted");
-        }else{
-            this.externalEntities[key] = value;
-        }
-    }
-}
-
-module.exports = XMLParser;
-
-/***/ }),
-
-/***/ 9872:
-/***/ ((__unused_webpack_module, exports) => {
-
-
-
-/**
- * 
- * @param {array} node 
- * @param {any} options 
- * @returns 
- */
-function prettify(node, options){
-  return compress( node, options);
-}
-
-/**
- * 
- * @param {array} arr 
- * @param {object} options 
- * @param {string} jPath 
- * @returns object
- */
-function compress(arr, options, jPath){
-  let text;
-  const compressedObj = {};
-  for (let i = 0; i < arr.length; i++) {
-    const tagObj = arr[i];
-    const property = propName(tagObj);
-    let newJpath = "";
-    if(jPath === undefined) newJpath = property;
-    else newJpath = jPath + "." + property;
-
-    if(property === options.textNodeName){
-      if(text === undefined) text = tagObj[property];
-      else text += "" + tagObj[property];
-    }else if(property === undefined){
-      continue;
-    }else if(tagObj[property]){
-      
-      let val = compress(tagObj[property], options, newJpath);
-      const isLeaf = isLeafTag(val, options);
-
-      if(tagObj[":@"]){
-        assignAttributes( val, tagObj[":@"], newJpath, options);
-      }else if(Object.keys(val).length === 1 && val[options.textNodeName] !== undefined && !options.alwaysCreateTextNode){
-        val = val[options.textNodeName];
-      }else if(Object.keys(val).length === 0){
-        if(options.alwaysCreateTextNode) val[options.textNodeName] = "";
-        else val = "";
-      }
-
-      if(compressedObj[property] !== undefined && compressedObj.hasOwnProperty(property)) {
-        if(!Array.isArray(compressedObj[property])) {
-            compressedObj[property] = [ compressedObj[property] ];
-        }
-        compressedObj[property].push(val);
-      }else{
-        //TODO: if a node is not an array, then check if it should be an array
-        //also determine if it is a leaf node
-        if (options.isArray(property, newJpath, isLeaf )) {
-          compressedObj[property] = [val];
-        }else{
-          compressedObj[property] = val;
-        }
-      }
-    }
-    
-  }
-  // if(text && text.length > 0) compressedObj[options.textNodeName] = text;
-  if(typeof text === "string"){
-    if(text.length > 0) compressedObj[options.textNodeName] = text;
-  }else if(text !== undefined) compressedObj[options.textNodeName] = text;
-  return compressedObj;
-}
-
-function propName(obj){
-  const keys = Object.keys(obj);
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i];
-    if(key !== ":@") return key;
-  }
-}
-
-function assignAttributes(obj, attrMap, jpath, options){
-  if (attrMap) {
-    const keys = Object.keys(attrMap);
-    const len = keys.length; //don't make it inline
-    for (let i = 0; i < len; i++) {
-      const atrrName = keys[i];
-      if (options.isArray(atrrName, jpath + "." + atrrName, true, true)) {
-        obj[atrrName] = [ attrMap[atrrName] ];
-      } else {
-        obj[atrrName] = attrMap[atrrName];
-      }
-    }
-  }
-}
-
-function isLeafTag(obj, options){
-  const { textNodeName } = options;
-  const propCount = Object.keys(obj).length;
-  
-  if (propCount === 0) {
-    return true;
-  }
-
-  if (
-    propCount === 1 &&
-    (obj[textNodeName] || typeof obj[textNodeName] === "boolean" || obj[textNodeName] === 0)
-  ) {
-    return true;
-  }
-
-  return false;
-}
-exports.prettify = prettify;
-
-
-/***/ }),
-
-/***/ 308:
-/***/ ((module) => {
-
-
-
-class XmlNode{
-  constructor(tagname) {
-    this.tagname = tagname;
-    this.child = []; //nested tags, text, cdata, comments in order
-    this[":@"] = {}; //attributes map
-  }
-  add(key,val){
-    // this.child.push( {name : key, val: val, isCdata: isCdata });
-    if(key === "__proto__") key = "#__proto__";
-    this.child.push( {[key]: val });
-  }
-  addChild(node) {
-    if(node.tagname === "__proto__") node.tagname = "#__proto__";
-    if(node[":@"] && Object.keys(node[":@"]).length > 0){
-      this.child.push( { [node.tagname]: node.child, [":@"]: node[":@"] });
-    }else{
-      this.child.push( { [node.tagname]: node.child });
-    }
-  };
-};
-
-
-module.exports = XmlNode;
-
-/***/ }),
-
 /***/ 9113:
 /***/ ((module) => {
 
@@ -38432,9 +43068,9 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.HttpProxyAgent = void 0;
 const net = __importStar(__nccwpck_require__(1808));
 const tls = __importStar(__nccwpck_require__(4404));
-const debug_1 = __importDefault(__nccwpck_require__(4684));
+const debug_1 = __importDefault(__nccwpck_require__(646));
 const events_1 = __nccwpck_require__(2361);
-const agent_base_1 = __nccwpck_require__(8247);
+const agent_base_1 = __nccwpck_require__(6814);
 const url_1 = __nccwpck_require__(7310);
 const debug = (0, debug_1.default)('http-proxy-agent');
 /**
@@ -38552,7 +43188,7 @@ function omit(obj, ...keys) {
 
 /***/ }),
 
-/***/ 2838:
+/***/ 4178:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -38587,11 +43223,22 @@ exports.HttpsProxyAgent = void 0;
 const net = __importStar(__nccwpck_require__(1808));
 const tls = __importStar(__nccwpck_require__(4404));
 const assert_1 = __importDefault(__nccwpck_require__(9491));
-const debug_1 = __importDefault(__nccwpck_require__(4684));
-const agent_base_1 = __nccwpck_require__(8247);
+const debug_1 = __importDefault(__nccwpck_require__(646));
+const agent_base_1 = __nccwpck_require__(6814);
 const url_1 = __nccwpck_require__(7310);
-const parse_proxy_response_1 = __nccwpck_require__(7372);
+const parse_proxy_response_1 = __nccwpck_require__(1123);
 const debug = (0, debug_1.default)('https-proxy-agent');
+const setServernameFromNonIpHost = (options) => {
+    if (options.servername === undefined &&
+        options.host &&
+        !net.isIP(options.host)) {
+        return {
+            ...options,
+            servername: options.host,
+        };
+    }
+    return options;
+};
 /**
  * The `HttpsProxyAgent` implements an HTTP Agent subclass that connects to
  * the specified "HTTP(s) proxy server" in order to proxy HTTPS requests.
@@ -38639,11 +43286,7 @@ class HttpsProxyAgent extends agent_base_1.Agent {
         let socket;
         if (proxy.protocol === 'https:') {
             debug('Creating `tls.Socket`: %o', this.connectOpts);
-            const servername = this.connectOpts.servername || this.connectOpts.host;
-            socket = tls.connect({
-                ...this.connectOpts,
-                servername,
-            });
+            socket = tls.connect(setServernameFromNonIpHost(this.connectOpts));
         }
         else {
             debug('Creating `net.Socket`: %o', this.connectOpts);
@@ -38679,11 +43322,9 @@ class HttpsProxyAgent extends agent_base_1.Agent {
                 // The proxy is connecting to a TLS server, so upgrade
                 // this socket connection to a TLS connection.
                 debug('Upgrading socket connection to TLS');
-                const servername = opts.servername || opts.host;
                 return tls.connect({
-                    ...omit(opts, 'host', 'path', 'port'),
+                    ...omit(setServernameFromNonIpHost(opts), 'host', 'path', 'port'),
                     socket,
-                    servername,
                 });
             }
             return socket;
@@ -38733,7 +43374,7 @@ function omit(obj, ...keys) {
 
 /***/ }),
 
-/***/ 7372:
+/***/ 1123:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 
@@ -38742,7 +43383,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.parseProxyResponse = void 0;
-const debug_1 = __importDefault(__nccwpck_require__(4684));
+const debug_1 = __importDefault(__nccwpck_require__(646));
 const debug = (0, debug_1.default)('https-proxy-agent:parse-proxy-response');
 function parseProxyResponse(socket) {
     return new Promise((resolve, reject) => {
@@ -39794,7 +44435,7 @@ function regExpEscape (s) {
 
 /***/ }),
 
-/***/ 5717:
+/***/ 158:
 /***/ ((module) => {
 
 /**
@@ -39822,7 +44463,7 @@ var y = d * 365.25;
  * @api public
  */
 
-module.exports = function(val, options) {
+module.exports = function (val, options) {
   options = options || {};
   var type = typeof val;
   if (type === 'string' && val.length > 0) {
@@ -41662,137 +46303,6 @@ function coerce (version, options) {
 
 /***/ }),
 
-/***/ 9578:
-/***/ ((module) => {
-
-const hexRegex = /^[-+]?0x[a-fA-F0-9]+$/;
-const numRegex = /^([\-\+])?(0*)(\.[0-9]+([eE]\-?[0-9]+)?|[0-9]+(\.[0-9]+([eE]\-?[0-9]+)?)?)$/;
-// const octRegex = /0x[a-z0-9]+/;
-// const binRegex = /0x[a-z0-9]+/;
-
-
-//polyfill
-if (!Number.parseInt && window.parseInt) {
-    Number.parseInt = window.parseInt;
-}
-if (!Number.parseFloat && window.parseFloat) {
-    Number.parseFloat = window.parseFloat;
-}
-
-  
-const consider = {
-    hex :  true,
-    leadingZeros: true,
-    decimalPoint: "\.",
-    eNotation: true
-    //skipLike: /regex/
-};
-
-function toNumber(str, options = {}){
-    // const options = Object.assign({}, consider);
-    // if(opt.leadingZeros === false){
-    //     options.leadingZeros = false;
-    // }else if(opt.hex === false){
-    //     options.hex = false;
-    // }
-
-    options = Object.assign({}, consider, options );
-    if(!str || typeof str !== "string" ) return str;
-    
-    let trimmedStr  = str.trim();
-    // if(trimmedStr === "0.0") return 0;
-    // else if(trimmedStr === "+0.0") return 0;
-    // else if(trimmedStr === "-0.0") return -0;
-
-    if(options.skipLike !== undefined && options.skipLike.test(trimmedStr)) return str;
-    else if (options.hex && hexRegex.test(trimmedStr)) {
-        return Number.parseInt(trimmedStr, 16);
-    // } else if (options.parseOct && octRegex.test(str)) {
-    //     return Number.parseInt(val, 8);
-    // }else if (options.parseBin && binRegex.test(str)) {
-    //     return Number.parseInt(val, 2);
-    }else{
-        //separate negative sign, leading zeros, and rest number
-        const match = numRegex.exec(trimmedStr);
-        if(match){
-            const sign = match[1];
-            const leadingZeros = match[2];
-            let numTrimmedByZeros = trimZeros(match[3]); //complete num without leading zeros
-            //trim ending zeros for floating number
-            
-            const eNotation = match[4] || match[6];
-            if(!options.leadingZeros && leadingZeros.length > 0 && sign && trimmedStr[2] !== ".") return str; //-0123
-            else if(!options.leadingZeros && leadingZeros.length > 0 && !sign && trimmedStr[1] !== ".") return str; //0123
-            else{//no leading zeros or leading zeros are allowed
-                const num = Number(trimmedStr);
-                const numStr = "" + num;
-                if(numStr.search(/[eE]/) !== -1){ //given number is long and parsed to eNotation
-                    if(options.eNotation) return num;
-                    else return str;
-                }else if(eNotation){ //given number has enotation
-                    if(options.eNotation) return num;
-                    else return str;
-                }else if(trimmedStr.indexOf(".") !== -1){ //floating number
-                    // const decimalPart = match[5].substr(1);
-                    // const intPart = trimmedStr.substr(0,trimmedStr.indexOf("."));
-
-                    
-                    // const p = numStr.indexOf(".");
-                    // const givenIntPart = numStr.substr(0,p);
-                    // const givenDecPart = numStr.substr(p+1);
-                    if(numStr === "0" && (numTrimmedByZeros === "") ) return num; //0.0
-                    else if(numStr === numTrimmedByZeros) return num; //0.456. 0.79000
-                    else if( sign && numStr === "-"+numTrimmedByZeros) return num;
-                    else return str;
-                }
-                
-                if(leadingZeros){
-                    // if(numTrimmedByZeros === numStr){
-                    //     if(options.leadingZeros) return num;
-                    //     else return str;
-                    // }else return str;
-                    if(numTrimmedByZeros === numStr) return num;
-                    else if(sign+numTrimmedByZeros === numStr) return num;
-                    else return str;
-                }
-
-                if(trimmedStr === numStr) return num;
-                else if(trimmedStr === sign+numStr) return num;
-                // else{
-                //     //number with +/- sign
-                //     trimmedStr.test(/[-+][0-9]);
-
-                // }
-                return str;
-            }
-            // else if(!eNotation && trimmedStr && trimmedStr !== Number(trimmedStr) ) return str;
-            
-        }else{ //non-numeric string
-            return str;
-        }
-    }
-}
-
-/**
- * 
- * @param {string} numStr without leading zeros
- * @returns 
- */
-function trimZeros(numStr){
-    if(numStr && numStr.indexOf(".") !== -1){//float
-        numStr = numStr.replace(/0+$/, ""); //remove ending zeros
-        if(numStr === ".")  numStr = "0";
-        else if(numStr[0] === ".")  numStr = "0"+numStr;
-        else if(numStr[numStr.length-1] === ".")  numStr = numStr.substr(0,numStr.length-1);
-        return numStr;
-    }
-    return numStr;
-}
-module.exports = toNumber
-
-
-/***/ }),
-
 /***/ 8516:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -41935,7 +46445,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 6928:
+/***/ 1772:
 /***/ ((module) => {
 
 /******************************************************************************
@@ -41952,7 +46462,7 @@ LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
 OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 PERFORMANCE OF THIS SOFTWARE.
 ***************************************************************************** */
-/* global global, define, Symbol, Reflect, Promise, SuppressedError */
+/* global global, define, Symbol, Reflect, Promise, SuppressedError, Iterator */
 var __extends;
 var __assign;
 var __rest;
@@ -41984,6 +46494,7 @@ var __classPrivateFieldIn;
 var __createBinding;
 var __addDisposableResource;
 var __disposeResources;
+var __rewriteRelativeImportExtension;
 (function (factory) {
     var root = typeof global === "object" ? global : typeof self === "object" ? self : typeof this === "object" ? this : {};
     if (typeof define === "function" && define.amd) {
@@ -42111,8 +46622,8 @@ var __disposeResources;
     };
 
     __generator = function (thisArg, body) {
-        var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g;
-        return g = { next: verb(0), "throw": verb(1), "return": verb(2) }, typeof Symbol === "function" && (g[Symbol.iterator] = function() { return this; }), g;
+        var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g = Object.create((typeof Iterator === "function" ? Iterator : Object).prototype);
+        return g.next = verb(0), g["throw"] = verb(1), g["return"] = verb(2), typeof Symbol === "function" && (g[Symbol.iterator] = function() { return this; }), g;
         function verb(n) { return function (v) { return step([n, v]); }; }
         function step(op) {
             if (f) throw new TypeError("Generator is already executing.");
@@ -42216,7 +46727,7 @@ var __disposeResources;
     __asyncGenerator = function (thisArg, _arguments, generator) {
         if (!Symbol.asyncIterator) throw new TypeError("Symbol.asyncIterator is not defined.");
         var g = generator.apply(thisArg, _arguments || []), i, q = [];
-        return i = {}, verb("next"), verb("throw"), verb("return", awaitReturn), i[Symbol.asyncIterator] = function () { return this; }, i;
+        return i = Object.create((typeof AsyncIterator === "function" ? AsyncIterator : Object).prototype), verb("next"), verb("throw"), verb("return", awaitReturn), i[Symbol.asyncIterator] = function () { return this; }, i;
         function awaitReturn(f) { return function (v) { return Promise.resolve(v).then(f, reject); }; }
         function verb(n, f) { if (g[n]) { i[n] = function (v) { return new Promise(function (a, b) { q.push([n, v, a, b]) > 1 || resume(n, v); }); }; if (f) i[n] = f(i[n]); } }
         function resume(n, v) { try { step(g[n](v)); } catch (e) { settle(q[0][3], e); } }
@@ -42251,10 +46762,19 @@ var __disposeResources;
         o["default"] = v;
     };
 
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+
     __importStar = function (mod) {
         if (mod && mod.__esModule) return mod;
         var result = {};
-        if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
         __setModuleDefault(result, mod);
         return result;
     };
@@ -42314,20 +46834,34 @@ var __disposeResources;
             env.error = env.hasError ? new _SuppressedError(e, env.error, "An error was suppressed during disposal.") : e;
             env.hasError = true;
         }
+        var r, s = 0;
         function next() {
-            while (env.stack.length) {
-                var rec = env.stack.pop();
+            while (r = env.stack.pop()) {
                 try {
-                    var result = rec.dispose && rec.dispose.call(rec.value);
-                    if (rec.async) return Promise.resolve(result).then(next, function(e) { fail(e); return next(); });
+                    if (!r.async && s === 1) return s = 0, env.stack.push(r), Promise.resolve().then(next);
+                    if (r.dispose) {
+                        var result = r.dispose.call(r.value);
+                        if (r.async) return s |= 2, Promise.resolve(result).then(next, function(e) { fail(e); return next(); });
+                    }
+                    else s |= 1;
                 }
                 catch (e) {
                     fail(e);
                 }
             }
+            if (s === 1) return env.hasError ? Promise.reject(env.error) : Promise.resolve();
             if (env.hasError) throw env.error;
         }
         return next();
+    };
+
+    __rewriteRelativeImportExtension = function (path, preserveJsx) {
+        if (typeof path === "string" && /^\.\.?\//.test(path)) {
+            return path.replace(/\.(tsx)$|((?:\.d)?)((?:\.[^./]+?)?)\.([cm]?)ts$/i, function (m, tsx, d, ext, cm) {
+                return tsx ? preserveJsx ? ".jsx" : ".js" : d && (!ext || !cm) ? m : (d + ext + "." + cm.toLowerCase() + "js");
+            });
+        }
+        return path;
     };
 
     exporter("__extends", __extends);
@@ -42361,7 +46895,10 @@ var __disposeResources;
     exporter("__classPrivateFieldIn", __classPrivateFieldIn);
     exporter("__addDisposableResource", __addDisposableResource);
     exporter("__disposeResources", __disposeResources);
+    exporter("__rewriteRelativeImportExtension", __rewriteRelativeImportExtension);
 });
+
+0 && (0);
 
 
 /***/ }),
@@ -42645,31 +47182,31 @@ exports.debug = debug; // for test
 
 /***/ }),
 
-/***/ 7181:
+/***/ 624:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const Client = __nccwpck_require__(8352)
-const Dispatcher = __nccwpck_require__(3954)
-const errors = __nccwpck_require__(3501)
-const Pool = __nccwpck_require__(9859)
-const BalancedPool = __nccwpck_require__(1579)
-const Agent = __nccwpck_require__(8551)
-const util = __nccwpck_require__(9647)
+const Client = __nccwpck_require__(8962)
+const Dispatcher = __nccwpck_require__(289)
+const errors = __nccwpck_require__(1641)
+const Pool = __nccwpck_require__(5115)
+const BalancedPool = __nccwpck_require__(7367)
+const Agent = __nccwpck_require__(8854)
+const util = __nccwpck_require__(2355)
 const { InvalidArgumentError } = errors
-const api = __nccwpck_require__(7750)
-const buildConnector = __nccwpck_require__(6840)
-const MockClient = __nccwpck_require__(9103)
-const MockAgent = __nccwpck_require__(1045)
-const MockPool = __nccwpck_require__(1153)
-const mockErrors = __nccwpck_require__(5458)
-const ProxyAgent = __nccwpck_require__(7929)
-const RetryHandler = __nccwpck_require__(6734)
-const { getGlobalDispatcher, setGlobalDispatcher } = __nccwpck_require__(5683)
-const DecoratorHandler = __nccwpck_require__(3563)
-const RedirectHandler = __nccwpck_require__(6086)
-const createRedirectInterceptor = __nccwpck_require__(3163)
+const api = __nccwpck_require__(6105)
+const buildConnector = __nccwpck_require__(2113)
+const MockClient = __nccwpck_require__(7070)
+const MockAgent = __nccwpck_require__(425)
+const MockPool = __nccwpck_require__(3535)
+const mockErrors = __nccwpck_require__(7589)
+const ProxyAgent = __nccwpck_require__(2405)
+const RetryHandler = __nccwpck_require__(2767)
+const { getGlobalDispatcher, setGlobalDispatcher } = __nccwpck_require__(8561)
+const DecoratorHandler = __nccwpck_require__(5671)
+const RedirectHandler = __nccwpck_require__(2054)
+const createRedirectInterceptor = __nccwpck_require__(7594)
 
 let hasCrypto
 try {
@@ -42752,7 +47289,7 @@ if (util.nodeMajor > 16 || (util.nodeMajor === 16 && util.nodeMinor >= 8)) {
   let fetchImpl = null
   module.exports.fetch = async function fetch (resource) {
     if (!fetchImpl) {
-      fetchImpl = (__nccwpck_require__(3254).fetch)
+      fetchImpl = (__nccwpck_require__(4111).fetch)
     }
 
     try {
@@ -42765,20 +47302,20 @@ if (util.nodeMajor > 16 || (util.nodeMajor === 16 && util.nodeMinor >= 8)) {
       throw err
     }
   }
-  module.exports.Headers = __nccwpck_require__(6909).Headers
-  module.exports.Response = __nccwpck_require__(6913).Response
-  module.exports.Request = __nccwpck_require__(9787).Request
-  module.exports.FormData = __nccwpck_require__(8076).FormData
-  module.exports.File = __nccwpck_require__(1575).File
-  module.exports.FileReader = __nccwpck_require__(6528).FileReader
+  module.exports.Headers = __nccwpck_require__(434).Headers
+  module.exports.Response = __nccwpck_require__(6724).Response
+  module.exports.Request = __nccwpck_require__(7234).Request
+  module.exports.FormData = __nccwpck_require__(1815).FormData
+  module.exports.File = __nccwpck_require__(5999).File
+  module.exports.FileReader = __nccwpck_require__(385).FileReader
 
-  const { setGlobalOrigin, getGlobalOrigin } = __nccwpck_require__(128)
+  const { setGlobalOrigin, getGlobalOrigin } = __nccwpck_require__(3765)
 
   module.exports.setGlobalOrigin = setGlobalOrigin
   module.exports.getGlobalOrigin = getGlobalOrigin
 
-  const { CacheStorage } = __nccwpck_require__(3187)
-  const { kConstruct } = __nccwpck_require__(2994)
+  const { CacheStorage } = __nccwpck_require__(6860)
+  const { kConstruct } = __nccwpck_require__(6045)
 
   // Cache & CacheStorage are tightly coupled with fetch. Even if it may run
   // in an older version of Node, it doesn't have any use without fetch.
@@ -42786,21 +47323,21 @@ if (util.nodeMajor > 16 || (util.nodeMajor === 16 && util.nodeMinor >= 8)) {
 }
 
 if (util.nodeMajor >= 16) {
-  const { deleteCookie, getCookies, getSetCookies, setCookie } = __nccwpck_require__(9351)
+  const { deleteCookie, getCookies, getSetCookies, setCookie } = __nccwpck_require__(6367)
 
   module.exports.deleteCookie = deleteCookie
   module.exports.getCookies = getCookies
   module.exports.getSetCookies = getSetCookies
   module.exports.setCookie = setCookie
 
-  const { parseMIMEType, serializeAMimeType } = __nccwpck_require__(6932)
+  const { parseMIMEType, serializeAMimeType } = __nccwpck_require__(5723)
 
   module.exports.parseMIMEType = parseMIMEType
   module.exports.serializeAMimeType = serializeAMimeType
 }
 
 if (util.nodeMajor >= 18 && hasCrypto) {
-  const { WebSocket } = __nccwpck_require__(553)
+  const { WebSocket } = __nccwpck_require__(1423)
 
   module.exports.WebSocket = WebSocket
 }
@@ -42819,19 +47356,19 @@ module.exports.mockErrors = mockErrors
 
 /***/ }),
 
-/***/ 8551:
+/***/ 8854:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { InvalidArgumentError } = __nccwpck_require__(3501)
-const { kClients, kRunning, kClose, kDestroy, kDispatch, kInterceptors } = __nccwpck_require__(7621)
-const DispatcherBase = __nccwpck_require__(6775)
-const Pool = __nccwpck_require__(9859)
-const Client = __nccwpck_require__(8352)
-const util = __nccwpck_require__(9647)
-const createRedirectInterceptor = __nccwpck_require__(3163)
-const { WeakRef, FinalizationRegistry } = __nccwpck_require__(9374)()
+const { InvalidArgumentError } = __nccwpck_require__(1641)
+const { kClients, kRunning, kClose, kDestroy, kDispatch, kInterceptors } = __nccwpck_require__(3283)
+const DispatcherBase = __nccwpck_require__(4681)
+const Pool = __nccwpck_require__(5115)
+const Client = __nccwpck_require__(8962)
+const util = __nccwpck_require__(2355)
+const createRedirectInterceptor = __nccwpck_require__(7594)
+const { WeakRef, FinalizationRegistry } = __nccwpck_require__(5835)()
 
 const kOnConnect = Symbol('onConnect')
 const kOnDisconnect = Symbol('onDisconnect')
@@ -42974,11 +47511,11 @@ module.exports = Agent
 
 /***/ }),
 
-/***/ 4125:
+/***/ 770:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-const { addAbortListener } = __nccwpck_require__(9647)
-const { RequestAbortedError } = __nccwpck_require__(3501)
+const { addAbortListener } = __nccwpck_require__(2355)
+const { RequestAbortedError } = __nccwpck_require__(1641)
 
 const kListener = Symbol('kListener')
 const kSignal = Symbol('kSignal')
@@ -43035,15 +47572,15 @@ module.exports = {
 
 /***/ }),
 
-/***/ 2745:
+/***/ 2565:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const { AsyncResource } = __nccwpck_require__(852)
-const { InvalidArgumentError, RequestAbortedError, SocketError } = __nccwpck_require__(3501)
-const util = __nccwpck_require__(9647)
-const { addSignal, removeSignal } = __nccwpck_require__(4125)
+const { InvalidArgumentError, RequestAbortedError, SocketError } = __nccwpck_require__(1641)
+const util = __nccwpck_require__(2355)
+const { addSignal, removeSignal } = __nccwpck_require__(770)
 
 class ConnectHandler extends AsyncResource {
   constructor (opts, callback) {
@@ -43146,7 +47683,7 @@ module.exports = connect
 
 /***/ }),
 
-/***/ 1747:
+/***/ 2295:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -43160,10 +47697,10 @@ const {
   InvalidArgumentError,
   InvalidReturnValueError,
   RequestAbortedError
-} = __nccwpck_require__(3501)
-const util = __nccwpck_require__(9647)
+} = __nccwpck_require__(1641)
+const util = __nccwpck_require__(2355)
 const { AsyncResource } = __nccwpck_require__(852)
-const { addSignal, removeSignal } = __nccwpck_require__(4125)
+const { addSignal, removeSignal } = __nccwpck_require__(770)
 const assert = __nccwpck_require__(9491)
 
 const kResume = Symbol('resume')
@@ -43402,20 +47939,20 @@ module.exports = pipeline
 
 /***/ }),
 
-/***/ 414:
+/***/ 4338:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const Readable = __nccwpck_require__(7040)
+const Readable = __nccwpck_require__(6325)
 const {
   InvalidArgumentError,
   RequestAbortedError
-} = __nccwpck_require__(3501)
-const util = __nccwpck_require__(9647)
-const { getResolveErrorBodyCallback } = __nccwpck_require__(7323)
+} = __nccwpck_require__(1641)
+const util = __nccwpck_require__(2355)
+const { getResolveErrorBodyCallback } = __nccwpck_require__(1825)
 const { AsyncResource } = __nccwpck_require__(852)
-const { addSignal, removeSignal } = __nccwpck_require__(4125)
+const { addSignal, removeSignal } = __nccwpck_require__(770)
 
 class RequestHandler extends AsyncResource {
   constructor (opts, callback) {
@@ -43589,7 +48126,7 @@ module.exports.RequestHandler = RequestHandler
 
 /***/ }),
 
-/***/ 7835:
+/***/ 3603:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -43599,11 +48136,11 @@ const {
   InvalidArgumentError,
   InvalidReturnValueError,
   RequestAbortedError
-} = __nccwpck_require__(3501)
-const util = __nccwpck_require__(9647)
-const { getResolveErrorBodyCallback } = __nccwpck_require__(7323)
+} = __nccwpck_require__(1641)
+const util = __nccwpck_require__(2355)
+const { getResolveErrorBodyCallback } = __nccwpck_require__(1825)
 const { AsyncResource } = __nccwpck_require__(852)
-const { addSignal, removeSignal } = __nccwpck_require__(4125)
+const { addSignal, removeSignal } = __nccwpck_require__(770)
 
 class StreamHandler extends AsyncResource {
   constructor (opts, factory, callback) {
@@ -43816,15 +48353,15 @@ module.exports = stream
 
 /***/ }),
 
-/***/ 9706:
+/***/ 1753:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { InvalidArgumentError, RequestAbortedError, SocketError } = __nccwpck_require__(3501)
+const { InvalidArgumentError, RequestAbortedError, SocketError } = __nccwpck_require__(1641)
 const { AsyncResource } = __nccwpck_require__(852)
-const util = __nccwpck_require__(9647)
-const { addSignal, removeSignal } = __nccwpck_require__(4125)
+const util = __nccwpck_require__(2355)
+const { addSignal, removeSignal } = __nccwpck_require__(770)
 const assert = __nccwpck_require__(9491)
 
 class UpgradeHandler extends AsyncResource {
@@ -43928,21 +48465,21 @@ module.exports = upgrade
 
 /***/ }),
 
-/***/ 7750:
+/***/ 6105:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-module.exports.request = __nccwpck_require__(414)
-module.exports.stream = __nccwpck_require__(7835)
-module.exports.pipeline = __nccwpck_require__(1747)
-module.exports.upgrade = __nccwpck_require__(9706)
-module.exports.connect = __nccwpck_require__(2745)
+module.exports.request = __nccwpck_require__(4338)
+module.exports.stream = __nccwpck_require__(3603)
+module.exports.pipeline = __nccwpck_require__(2295)
+module.exports.upgrade = __nccwpck_require__(1753)
+module.exports.connect = __nccwpck_require__(2565)
 
 
 /***/ }),
 
-/***/ 7040:
+/***/ 6325:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 // Ported from https://github.com/nodejs/undici/pull/907
@@ -43951,9 +48488,9 @@ module.exports.connect = __nccwpck_require__(2745)
 
 const assert = __nccwpck_require__(9491)
 const { Readable } = __nccwpck_require__(2781)
-const { RequestAbortedError, NotSupportedError, InvalidArgumentError } = __nccwpck_require__(3501)
-const util = __nccwpck_require__(9647)
-const { ReadableStreamFrom, toUSVString } = __nccwpck_require__(9647)
+const { RequestAbortedError, NotSupportedError, InvalidArgumentError } = __nccwpck_require__(1641)
+const util = __nccwpck_require__(2355)
+const { ReadableStreamFrom, toUSVString } = __nccwpck_require__(2355)
 
 let Blob
 
@@ -44271,14 +48808,14 @@ function consumeFinish (consume, err) {
 
 /***/ }),
 
-/***/ 7323:
+/***/ 1825:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const assert = __nccwpck_require__(9491)
 const {
   ResponseStatusCodeError
-} = __nccwpck_require__(3501)
-const { toUSVString } = __nccwpck_require__(9647)
+} = __nccwpck_require__(1641)
+const { toUSVString } = __nccwpck_require__(2355)
 
 async function getResolveErrorBodyCallback ({ callback, body, contentType, statusCode, statusMessage, headers }) {
   assert(body)
@@ -44324,7 +48861,7 @@ module.exports = { getResolveErrorBodyCallback }
 
 /***/ }),
 
-/***/ 1579:
+/***/ 7367:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -44332,7 +48869,7 @@ module.exports = { getResolveErrorBodyCallback }
 const {
   BalancedPoolMissingUpstreamError,
   InvalidArgumentError
-} = __nccwpck_require__(3501)
+} = __nccwpck_require__(1641)
 const {
   PoolBase,
   kClients,
@@ -44340,10 +48877,10 @@ const {
   kAddClient,
   kRemoveClient,
   kGetDispatcher
-} = __nccwpck_require__(5411)
-const Pool = __nccwpck_require__(9859)
-const { kUrl, kInterceptors } = __nccwpck_require__(7621)
-const { parseOrigin } = __nccwpck_require__(9647)
+} = __nccwpck_require__(2903)
+const Pool = __nccwpck_require__(5115)
+const { kUrl, kInterceptors } = __nccwpck_require__(3283)
+const { parseOrigin } = __nccwpck_require__(2355)
 const kFactory = Symbol('factory')
 
 const kOptions = Symbol('options')
@@ -44521,23 +49058,23 @@ module.exports = BalancedPool
 
 /***/ }),
 
-/***/ 5075:
+/***/ 9900:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { kConstruct } = __nccwpck_require__(2994)
-const { urlEquals, fieldValues: getFieldValues } = __nccwpck_require__(8826)
-const { kEnumerableProperty, isDisturbed } = __nccwpck_require__(9647)
-const { kHeadersList } = __nccwpck_require__(7621)
-const { webidl } = __nccwpck_require__(3721)
-const { Response, cloneResponse } = __nccwpck_require__(6913)
-const { Request } = __nccwpck_require__(9787)
-const { kState, kHeaders, kGuard, kRealm } = __nccwpck_require__(3386)
-const { fetching } = __nccwpck_require__(3254)
-const { urlIsHttpHttpsScheme, createDeferredPromise, readAllBytes } = __nccwpck_require__(6860)
+const { kConstruct } = __nccwpck_require__(6045)
+const { urlEquals, fieldValues: getFieldValues } = __nccwpck_require__(15)
+const { kEnumerableProperty, isDisturbed } = __nccwpck_require__(2355)
+const { kHeadersList } = __nccwpck_require__(3283)
+const { webidl } = __nccwpck_require__(7914)
+const { Response, cloneResponse } = __nccwpck_require__(6724)
+const { Request } = __nccwpck_require__(7234)
+const { kState, kHeaders, kGuard, kRealm } = __nccwpck_require__(2653)
+const { fetching } = __nccwpck_require__(4111)
+const { urlIsHttpHttpsScheme, createDeferredPromise, readAllBytes } = __nccwpck_require__(5135)
 const assert = __nccwpck_require__(9491)
-const { getGlobalDispatcher } = __nccwpck_require__(5683)
+const { getGlobalDispatcher } = __nccwpck_require__(8561)
 
 /**
  * @see https://w3c.github.io/ServiceWorker/#dfn-cache-batch-operation
@@ -45366,15 +49903,15 @@ module.exports = {
 
 /***/ }),
 
-/***/ 3187:
+/***/ 6860:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { kConstruct } = __nccwpck_require__(2994)
-const { Cache } = __nccwpck_require__(5075)
-const { webidl } = __nccwpck_require__(3721)
-const { kEnumerableProperty } = __nccwpck_require__(9647)
+const { kConstruct } = __nccwpck_require__(6045)
+const { Cache } = __nccwpck_require__(9900)
+const { webidl } = __nccwpck_require__(7914)
+const { kEnumerableProperty } = __nccwpck_require__(2355)
 
 class CacheStorage {
   /**
@@ -45517,26 +50054,26 @@ module.exports = {
 
 /***/ }),
 
-/***/ 2994:
+/***/ 6045:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 module.exports = {
-  kConstruct: (__nccwpck_require__(7621).kConstruct)
+  kConstruct: (__nccwpck_require__(3283).kConstruct)
 }
 
 
 /***/ }),
 
-/***/ 8826:
+/***/ 15:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const assert = __nccwpck_require__(9491)
-const { URLSerializer } = __nccwpck_require__(6932)
-const { isValidHeaderName } = __nccwpck_require__(6860)
+const { URLSerializer } = __nccwpck_require__(5723)
+const { isValidHeaderName } = __nccwpck_require__(5135)
 
 /**
  * @see https://url.spec.whatwg.org/#concept-url-equals
@@ -45585,7 +50122,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 8352:
+/***/ 8962:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 // @ts-check
@@ -45598,10 +50135,10 @@ const assert = __nccwpck_require__(9491)
 const net = __nccwpck_require__(1808)
 const http = __nccwpck_require__(3685)
 const { pipeline } = __nccwpck_require__(2781)
-const util = __nccwpck_require__(9647)
-const timers = __nccwpck_require__(8748)
-const Request = __nccwpck_require__(2619)
-const DispatcherBase = __nccwpck_require__(6775)
+const util = __nccwpck_require__(2355)
+const timers = __nccwpck_require__(6562)
+const Request = __nccwpck_require__(7880)
+const DispatcherBase = __nccwpck_require__(4681)
 const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
@@ -45615,8 +50152,8 @@ const {
   HTTPParserError,
   ResponseExceededMaxSizeError,
   ClientDestroyedError
-} = __nccwpck_require__(3501)
-const buildConnector = __nccwpck_require__(6840)
+} = __nccwpck_require__(1641)
+const buildConnector = __nccwpck_require__(2113)
 const {
   kUrl,
   kReset,
@@ -45668,7 +50205,7 @@ const {
   kHTTP2BuildRequest,
   kHTTP2CopyHeaders,
   kHTTP1BuildRequest
-} = __nccwpck_require__(7621)
+} = __nccwpck_require__(3283)
 
 /** @type {import('http2')} */
 let http2
@@ -46074,16 +50611,16 @@ function onHTTP2GoAway (code) {
   resume(client)
 }
 
-const constants = __nccwpck_require__(446)
-const createRedirectInterceptor = __nccwpck_require__(3163)
+const constants = __nccwpck_require__(2649)
+const createRedirectInterceptor = __nccwpck_require__(7594)
 const EMPTY_BUF = Buffer.alloc(0)
 
 async function lazyllhttp () {
-  const llhttpWasmData = process.env.JEST_WORKER_ID ? __nccwpck_require__(2959) : undefined
+  const llhttpWasmData = process.env.JEST_WORKER_ID ? __nccwpck_require__(2062) : undefined
 
   let mod
   try {
-    mod = await WebAssembly.compile(Buffer.from(__nccwpck_require__(5674), 'base64'))
+    mod = await WebAssembly.compile(Buffer.from(__nccwpck_require__(3674), 'base64'))
   } catch (e) {
     /* istanbul ignore next */
 
@@ -46091,7 +50628,7 @@ async function lazyllhttp () {
     // being enabled, but the occurring of this other error
     // * https://github.com/emscripten-core/emscripten/issues/11495
     // got me to remove that check to avoid breaking Node 12.
-    mod = await WebAssembly.compile(Buffer.from(llhttpWasmData || __nccwpck_require__(2959), 'base64'))
+    mod = await WebAssembly.compile(Buffer.from(llhttpWasmData || __nccwpck_require__(2062), 'base64'))
   }
 
   return await WebAssembly.instantiate(mod, {
@@ -47875,14 +52412,14 @@ module.exports = Client
 
 /***/ }),
 
-/***/ 9374:
+/***/ 5835:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 /* istanbul ignore file: only for Node 12 */
 
-const { kConnected, kSize } = __nccwpck_require__(7621)
+const { kConnected, kSize } = __nccwpck_require__(3283)
 
 class CompatWeakRef {
   constructor (value) {
@@ -47930,7 +52467,7 @@ module.exports = function () {
 
 /***/ }),
 
-/***/ 4791:
+/***/ 7415:
 /***/ ((module) => {
 
 
@@ -47949,15 +52486,15 @@ module.exports = {
 
 /***/ }),
 
-/***/ 9351:
+/***/ 6367:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { parseSetCookie } = __nccwpck_require__(2805)
-const { stringify, getHeadersList } = __nccwpck_require__(3319)
-const { webidl } = __nccwpck_require__(3721)
-const { Headers } = __nccwpck_require__(6909)
+const { parseSetCookie } = __nccwpck_require__(5782)
+const { stringify } = __nccwpck_require__(5913)
+const { webidl } = __nccwpck_require__(7914)
+const { Headers } = __nccwpck_require__(434)
 
 /**
  * @typedef {Object} Cookie
@@ -48031,14 +52568,13 @@ function getSetCookies (headers) {
 
   webidl.brandCheck(headers, Headers, { strict: false })
 
-  const cookies = getHeadersList(headers).cookies
+  const cookies = headers.getSetCookie()
 
   if (!cookies) {
     return []
   }
 
-  // In older versions of undici, cookies is a list of name:value.
-  return cookies.map((pair) => parseSetCookie(Array.isArray(pair) ? pair[1] : pair))
+  return cookies.map((pair) => parseSetCookie(pair))
 }
 
 /**
@@ -48140,14 +52676,14 @@ module.exports = {
 
 /***/ }),
 
-/***/ 2805:
+/***/ 5782:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { maxNameValuePairSize, maxAttributeValueSize } = __nccwpck_require__(4791)
-const { isCTLExcludingHtab } = __nccwpck_require__(3319)
-const { collectASequenceOfCodePointsFast } = __nccwpck_require__(6932)
+const { maxNameValuePairSize, maxAttributeValueSize } = __nccwpck_require__(7415)
+const { isCTLExcludingHtab } = __nccwpck_require__(5913)
+const { collectASequenceOfCodePointsFast } = __nccwpck_require__(5723)
 const assert = __nccwpck_require__(9491)
 
 /**
@@ -48464,14 +53000,15 @@ module.exports = {
 
 /***/ }),
 
-/***/ 3319:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+/***/ 5913:
+/***/ ((module) => {
 
 
 
-const assert = __nccwpck_require__(9491)
-const { kHeadersList } = __nccwpck_require__(7621)
-
+/**
+ * @param {string} value
+ * @returns {boolean}
+ */
 function isCTLExcludingHtab (value) {
   if (value.length === 0) {
     return false
@@ -48732,45 +53269,27 @@ function stringify (cookie) {
   return out.join('; ')
 }
 
-let kHeadersListNode
-
-function getHeadersList (headers) {
-  if (headers[kHeadersList]) {
-    return headers[kHeadersList]
-  }
-
-  if (!kHeadersListNode) {
-    kHeadersListNode = Object.getOwnPropertySymbols(headers).find(
-      (symbol) => symbol.description === 'headers list'
-    )
-
-    assert(kHeadersListNode, 'Headers cannot be parsed')
-  }
-
-  const headersList = headers[kHeadersListNode]
-  assert(headersList)
-
-  return headersList
-}
-
 module.exports = {
   isCTLExcludingHtab,
-  stringify,
-  getHeadersList
+  validateCookieName,
+  validateCookiePath,
+  validateCookieValue,
+  toIMFDate,
+  stringify
 }
 
 
 /***/ }),
 
-/***/ 6840:
+/***/ 2113:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const net = __nccwpck_require__(1808)
 const assert = __nccwpck_require__(9491)
-const util = __nccwpck_require__(9647)
-const { InvalidArgumentError, ConnectTimeoutError } = __nccwpck_require__(3501)
+const util = __nccwpck_require__(2355)
+const { InvalidArgumentError, ConnectTimeoutError } = __nccwpck_require__(1641)
 
 let tls // include tls conditionally since it is not always available
 
@@ -48958,7 +53477,7 @@ module.exports = buildConnector
 
 /***/ }),
 
-/***/ 2306:
+/***/ 8338:
 /***/ ((module) => {
 
 
@@ -49083,7 +53602,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 3501:
+/***/ 1641:
 /***/ ((module) => {
 
 
@@ -49320,7 +53839,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 2619:
+/***/ 7880:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -49328,10 +53847,10 @@ module.exports = {
 const {
   InvalidArgumentError,
   NotSupportedError
-} = __nccwpck_require__(3501)
+} = __nccwpck_require__(1641)
 const assert = __nccwpck_require__(9491)
-const { kHTTP2BuildRequest, kHTTP2CopyHeaders, kHTTP1BuildRequest } = __nccwpck_require__(7621)
-const util = __nccwpck_require__(9647)
+const { kHTTP2BuildRequest, kHTTP2CopyHeaders, kHTTP1BuildRequest } = __nccwpck_require__(3283)
+const util = __nccwpck_require__(2355)
 
 // tokenRegExp and headerCharRegex have been lifted from
 // https://github.com/nodejs/node/blob/main/lib/_http_common.js
@@ -49526,7 +54045,7 @@ class Request {
       }
 
       if (!extractBody) {
-        extractBody = (__nccwpck_require__(6477).extractBody)
+        extractBody = (__nccwpck_require__(1820).extractBody)
       }
 
       const [bodyStream, contentType] = extractBody(body)
@@ -49826,7 +54345,7 @@ module.exports = Request
 
 /***/ }),
 
-/***/ 7621:
+/***/ 3283:
 /***/ ((module) => {
 
 module.exports = {
@@ -49896,21 +54415,21 @@ module.exports = {
 
 /***/ }),
 
-/***/ 9647:
+/***/ 2355:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const assert = __nccwpck_require__(9491)
-const { kDestroyed, kBodyUsed } = __nccwpck_require__(7621)
+const { kDestroyed, kBodyUsed } = __nccwpck_require__(3283)
 const { IncomingMessage } = __nccwpck_require__(3685)
 const stream = __nccwpck_require__(2781)
 const net = __nccwpck_require__(1808)
-const { InvalidArgumentError } = __nccwpck_require__(3501)
+const { InvalidArgumentError } = __nccwpck_require__(1641)
 const { Blob } = __nccwpck_require__(4300)
 const nodeUtil = __nccwpck_require__(3837)
 const { stringify } = __nccwpck_require__(3477)
-const { headerNameLowerCasedRecord } = __nccwpck_require__(2306)
+const { headerNameLowerCasedRecord } = __nccwpck_require__(8338)
 
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(v => Number(v))
 
@@ -50425,18 +54944,18 @@ module.exports = {
 
 /***/ }),
 
-/***/ 6775:
+/***/ 4681:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const Dispatcher = __nccwpck_require__(3954)
+const Dispatcher = __nccwpck_require__(289)
 const {
   ClientDestroyedError,
   ClientClosedError,
   InvalidArgumentError
-} = __nccwpck_require__(3501)
-const { kDestroy, kClose, kDispatch, kInterceptors } = __nccwpck_require__(7621)
+} = __nccwpck_require__(1641)
+const { kDestroy, kClose, kDispatch, kInterceptors } = __nccwpck_require__(3283)
 
 const kDestroyed = Symbol('destroyed')
 const kClosed = Symbol('closed')
@@ -50624,7 +55143,7 @@ module.exports = DispatcherBase
 
 /***/ }),
 
-/***/ 3954:
+/***/ 289:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -50650,13 +55169,13 @@ module.exports = Dispatcher
 
 /***/ }),
 
-/***/ 6477:
+/***/ 1820:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const Busboy = __nccwpck_require__(6954)
-const util = __nccwpck_require__(9647)
+const util = __nccwpck_require__(2355)
 const {
   ReadableStreamFrom,
   isBlobLike,
@@ -50664,18 +55183,26 @@ const {
   readableStreamClose,
   createDeferredPromise,
   fullyReadBody
-} = __nccwpck_require__(6860)
-const { FormData } = __nccwpck_require__(8076)
-const { kState } = __nccwpck_require__(3386)
-const { webidl } = __nccwpck_require__(3721)
-const { DOMException, structuredClone } = __nccwpck_require__(756)
+} = __nccwpck_require__(5135)
+const { FormData } = __nccwpck_require__(1815)
+const { kState } = __nccwpck_require__(2653)
+const { webidl } = __nccwpck_require__(7914)
+const { DOMException, structuredClone } = __nccwpck_require__(7033)
 const { Blob, File: NativeFile } = __nccwpck_require__(4300)
-const { kBodyUsed } = __nccwpck_require__(7621)
+const { kBodyUsed } = __nccwpck_require__(3283)
 const assert = __nccwpck_require__(9491)
-const { isErrored } = __nccwpck_require__(9647)
+const { isErrored } = __nccwpck_require__(2355)
 const { isUint8Array, isArrayBuffer } = __nccwpck_require__(9830)
-const { File: UndiciFile } = __nccwpck_require__(1575)
-const { parseMIMEType, serializeAMimeType } = __nccwpck_require__(6932)
+const { File: UndiciFile } = __nccwpck_require__(5999)
+const { parseMIMEType, serializeAMimeType } = __nccwpck_require__(5723)
+
+let random
+try {
+  const crypto = __nccwpck_require__(6005)
+  random = (max) => crypto.randomInt(0, max)
+} catch {
+  random = (max) => Math.floor(Math.random(max))
+}
 
 let ReadableStream = globalThis.ReadableStream
 
@@ -50762,7 +55289,7 @@ function extractBody (object, keepalive = false) {
     // Set source to a copy of the bytes held by object.
     source = new Uint8Array(object.buffer.slice(object.byteOffset, object.byteOffset + object.byteLength))
   } else if (util.isFormDataLike(object)) {
-    const boundary = `----formdata-undici-0${`${Math.floor(Math.random() * 1e11)}`.padStart(11, '0')}`
+    const boundary = `----formdata-undici-0${`${random(1e11)}`.padStart(11, '0')}`
     const prefix = `--${boundary}\r\nContent-Disposition: form-data`
 
     /*! formdata-polyfill. MIT License. Jimmy Wärting <https://jimmy.warting.se/opensource> */
@@ -51262,7 +55789,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 756:
+/***/ 7033:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -51420,12 +55947,12 @@ module.exports = {
 
 /***/ }),
 
-/***/ 6932:
+/***/ 5723:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const assert = __nccwpck_require__(9491)
 const { atob } = __nccwpck_require__(4300)
-const { isomorphicDecode } = __nccwpck_require__(6860)
+const { isomorphicDecode } = __nccwpck_require__(5135)
 
 const encoder = new TextEncoder()
 
@@ -52054,18 +56581,18 @@ module.exports = {
 
 /***/ }),
 
-/***/ 1575:
+/***/ 5999:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const { Blob, File: NativeFile } = __nccwpck_require__(4300)
 const { types } = __nccwpck_require__(3837)
-const { kState } = __nccwpck_require__(3386)
-const { isBlobLike } = __nccwpck_require__(6860)
-const { webidl } = __nccwpck_require__(3721)
-const { parseMIMEType, serializeAMimeType } = __nccwpck_require__(6932)
-const { kEnumerableProperty } = __nccwpck_require__(9647)
+const { kState } = __nccwpck_require__(2653)
+const { isBlobLike } = __nccwpck_require__(5135)
+const { webidl } = __nccwpck_require__(7914)
+const { parseMIMEType, serializeAMimeType } = __nccwpck_require__(5723)
+const { kEnumerableProperty } = __nccwpck_require__(2355)
 const encoder = new TextEncoder()
 
 class File extends Blob {
@@ -52405,15 +56932,15 @@ module.exports = { File, FileLike, isFileLike }
 
 /***/ }),
 
-/***/ 8076:
+/***/ 1815:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { isBlobLike, toUSVString, makeIterator } = __nccwpck_require__(6860)
-const { kState } = __nccwpck_require__(3386)
-const { File: UndiciFile, FileLike, isFileLike } = __nccwpck_require__(1575)
-const { webidl } = __nccwpck_require__(3721)
+const { isBlobLike, toUSVString, makeIterator } = __nccwpck_require__(5135)
+const { kState } = __nccwpck_require__(2653)
+const { File: UndiciFile, FileLike, isFileLike } = __nccwpck_require__(5999)
+const { webidl } = __nccwpck_require__(7914)
 const { Blob, File: NativeFile } = __nccwpck_require__(4300)
 
 /** @type {globalThis['File']} */
@@ -52677,7 +57204,7 @@ module.exports = { FormData }
 
 /***/ }),
 
-/***/ 128:
+/***/ 3765:
 /***/ ((module) => {
 
 
@@ -52724,22 +57251,23 @@ module.exports = {
 
 /***/ }),
 
-/***/ 6909:
+/***/ 434:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 // https://github.com/Ethan-Arrowood/undici-fetch
 
 
 
-const { kHeadersList, kConstruct } = __nccwpck_require__(7621)
-const { kGuard } = __nccwpck_require__(3386)
-const { kEnumerableProperty } = __nccwpck_require__(9647)
+const { kHeadersList, kConstruct } = __nccwpck_require__(3283)
+const { kGuard } = __nccwpck_require__(2653)
+const { kEnumerableProperty } = __nccwpck_require__(2355)
 const {
   makeIterator,
   isValidHeaderName,
   isValidHeaderValue
-} = __nccwpck_require__(6860)
-const { webidl } = __nccwpck_require__(3721)
+} = __nccwpck_require__(5135)
+const util = __nccwpck_require__(3837)
+const { webidl } = __nccwpck_require__(7914)
 const assert = __nccwpck_require__(9491)
 
 const kHeadersMap = Symbol('headers map')
@@ -53292,6 +57820,9 @@ Object.defineProperties(Headers.prototype, {
   [Symbol.toStringTag]: {
     value: 'Headers',
     configurable: true
+  },
+  [util.inspect.custom]: {
+    enumerable: false
   }
 })
 
@@ -53320,7 +57851,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 3254:
+/***/ 4111:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 // https://github.com/Ethan-Arrowood/undici-fetch
@@ -53333,9 +57864,9 @@ const {
   makeAppropriateNetworkError,
   filterResponse,
   makeResponse
-} = __nccwpck_require__(6913)
-const { Headers } = __nccwpck_require__(6909)
-const { Request, makeRequest } = __nccwpck_require__(9787)
+} = __nccwpck_require__(6724)
+const { Headers } = __nccwpck_require__(434)
+const { Request, makeRequest } = __nccwpck_require__(7234)
 const zlib = __nccwpck_require__(9796)
 const {
   bytesMatch,
@@ -53366,10 +57897,10 @@ const {
   urlIsLocal,
   urlIsHttpHttpsScheme,
   urlHasHttpsScheme
-} = __nccwpck_require__(6860)
-const { kState, kHeaders, kGuard, kRealm } = __nccwpck_require__(3386)
+} = __nccwpck_require__(5135)
+const { kState, kHeaders, kGuard, kRealm } = __nccwpck_require__(2653)
 const assert = __nccwpck_require__(9491)
-const { safelyExtractBody } = __nccwpck_require__(6477)
+const { safelyExtractBody } = __nccwpck_require__(1820)
 const {
   redirectStatusSet,
   nullBodyStatus,
@@ -53377,15 +57908,15 @@ const {
   requestBodyHeader,
   subresourceSet,
   DOMException
-} = __nccwpck_require__(756)
-const { kHeadersList } = __nccwpck_require__(7621)
+} = __nccwpck_require__(7033)
+const { kHeadersList } = __nccwpck_require__(3283)
 const EE = __nccwpck_require__(2361)
 const { Readable, pipeline } = __nccwpck_require__(2781)
-const { addAbortListener, isErrored, isReadable, nodeMajor, nodeMinor } = __nccwpck_require__(9647)
-const { dataURLProcessor, serializeAMimeType } = __nccwpck_require__(6932)
+const { addAbortListener, isErrored, isReadable, nodeMajor, nodeMinor } = __nccwpck_require__(2355)
+const { dataURLProcessor, serializeAMimeType } = __nccwpck_require__(5723)
 const { TransformStream } = __nccwpck_require__(5356)
-const { getGlobalDispatcher } = __nccwpck_require__(5683)
-const { webidl } = __nccwpck_require__(3721)
+const { getGlobalDispatcher } = __nccwpck_require__(8561)
+const { webidl } = __nccwpck_require__(7914)
 const { STATUS_CODES } = __nccwpck_require__(3685)
 const GET_OR_HEAD = ['GET', 'HEAD']
 
@@ -55475,24 +60006,24 @@ module.exports = {
 
 /***/ }),
 
-/***/ 9787:
+/***/ 7234:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 /* globals AbortController */
 
 
 
-const { extractBody, mixinBody, cloneBody } = __nccwpck_require__(6477)
-const { Headers, fill: fillHeaders, HeadersList } = __nccwpck_require__(6909)
-const { FinalizationRegistry } = __nccwpck_require__(9374)()
-const util = __nccwpck_require__(9647)
+const { extractBody, mixinBody, cloneBody } = __nccwpck_require__(1820)
+const { Headers, fill: fillHeaders, HeadersList } = __nccwpck_require__(434)
+const { FinalizationRegistry } = __nccwpck_require__(5835)()
+const util = __nccwpck_require__(2355)
 const {
   isValidHTTPToken,
   sameOrigin,
   normalizeMethod,
   makePolicyContainer,
   normalizeMethodRecord
-} = __nccwpck_require__(6860)
+} = __nccwpck_require__(5135)
 const {
   forbiddenMethodsSet,
   corsSafeListedMethodsSet,
@@ -55502,13 +60033,13 @@ const {
   requestCredentials,
   requestCache,
   requestDuplex
-} = __nccwpck_require__(756)
+} = __nccwpck_require__(7033)
 const { kEnumerableProperty } = util
-const { kHeaders, kSignal, kState, kGuard, kRealm } = __nccwpck_require__(3386)
-const { webidl } = __nccwpck_require__(3721)
-const { getGlobalOrigin } = __nccwpck_require__(128)
-const { URLSerializer } = __nccwpck_require__(6932)
-const { kHeadersList, kConstruct } = __nccwpck_require__(7621)
+const { kHeaders, kSignal, kState, kGuard, kRealm } = __nccwpck_require__(2653)
+const { webidl } = __nccwpck_require__(7914)
+const { getGlobalOrigin } = __nccwpck_require__(3765)
+const { URLSerializer } = __nccwpck_require__(5723)
+const { kHeadersList, kConstruct } = __nccwpck_require__(3283)
 const assert = __nccwpck_require__(9491)
 const { getMaxListeners, setMaxListeners, getEventListeners, defaultMaxListeners } = __nccwpck_require__(2361)
 
@@ -56428,14 +60959,14 @@ module.exports = { Request, makeRequest }
 
 /***/ }),
 
-/***/ 6913:
+/***/ 6724:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { Headers, HeadersList, fill } = __nccwpck_require__(6909)
-const { extractBody, cloneBody, mixinBody } = __nccwpck_require__(6477)
-const util = __nccwpck_require__(9647)
+const { Headers, HeadersList, fill } = __nccwpck_require__(434)
+const { extractBody, cloneBody, mixinBody } = __nccwpck_require__(1820)
+const util = __nccwpck_require__(2355)
 const { kEnumerableProperty } = util
 const {
   isValidReasonPhrase,
@@ -56445,18 +60976,18 @@ const {
   serializeJavascriptValueToJSONString,
   isErrorLike,
   isomorphicEncode
-} = __nccwpck_require__(6860)
+} = __nccwpck_require__(5135)
 const {
   redirectStatusSet,
   nullBodyStatus,
   DOMException
-} = __nccwpck_require__(756)
-const { kState, kHeaders, kGuard, kRealm } = __nccwpck_require__(3386)
-const { webidl } = __nccwpck_require__(3721)
-const { FormData } = __nccwpck_require__(8076)
-const { getGlobalOrigin } = __nccwpck_require__(128)
-const { URLSerializer } = __nccwpck_require__(6932)
-const { kHeadersList, kConstruct } = __nccwpck_require__(7621)
+} = __nccwpck_require__(7033)
+const { kState, kHeaders, kGuard, kRealm } = __nccwpck_require__(2653)
+const { webidl } = __nccwpck_require__(7914)
+const { FormData } = __nccwpck_require__(1815)
+const { getGlobalOrigin } = __nccwpck_require__(3765)
+const { URLSerializer } = __nccwpck_require__(5723)
+const { kHeadersList, kConstruct } = __nccwpck_require__(3283)
 const assert = __nccwpck_require__(9491)
 const { types } = __nccwpck_require__(3837)
 
@@ -57006,7 +61537,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 3386:
+/***/ 2653:
 /***/ ((module) => {
 
 
@@ -57023,15 +61554,15 @@ module.exports = {
 
 /***/ }),
 
-/***/ 6860:
+/***/ 5135:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { redirectStatusSet, referrerPolicySet: referrerPolicyTokens, badPortsSet } = __nccwpck_require__(756)
-const { getGlobalOrigin } = __nccwpck_require__(128)
+const { redirectStatusSet, referrerPolicySet: referrerPolicyTokens, badPortsSet } = __nccwpck_require__(7033)
+const { getGlobalOrigin } = __nccwpck_require__(3765)
 const { performance } = __nccwpck_require__(4074)
-const { isBlobLike, toUSVString, ReadableStreamFrom } = __nccwpck_require__(9647)
+const { isBlobLike, toUSVString, ReadableStreamFrom } = __nccwpck_require__(2355)
 const assert = __nccwpck_require__(9491)
 const { isUint8Array } = __nccwpck_require__(9830)
 
@@ -58174,13 +62705,13 @@ module.exports = {
 
 /***/ }),
 
-/***/ 3721:
+/***/ 7914:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const { types } = __nccwpck_require__(3837)
-const { hasOwn, toUSVString } = __nccwpck_require__(6860)
+const { hasOwn, toUSVString } = __nccwpck_require__(5135)
 
 /** @type {import('../../types/webidl').Webidl} */
 const webidl = {}
@@ -58827,7 +63358,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 2444:
+/***/ 2522:
 /***/ ((module) => {
 
 
@@ -59124,7 +63655,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 6528:
+/***/ 385:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -59133,16 +63664,16 @@ const {
   staticPropertyDescriptors,
   readOperation,
   fireAProgressEvent
-} = __nccwpck_require__(2882)
+} = __nccwpck_require__(3627)
 const {
   kState,
   kError,
   kResult,
   kEvents,
   kAborted
-} = __nccwpck_require__(3738)
-const { webidl } = __nccwpck_require__(3721)
-const { kEnumerableProperty } = __nccwpck_require__(9647)
+} = __nccwpck_require__(5889)
+const { webidl } = __nccwpck_require__(7914)
+const { kEnumerableProperty } = __nccwpck_require__(2355)
 
 class FileReader extends EventTarget {
   constructor () {
@@ -59475,12 +64006,12 @@ module.exports = {
 
 /***/ }),
 
-/***/ 6002:
+/***/ 4124:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { webidl } = __nccwpck_require__(3721)
+const { webidl } = __nccwpck_require__(7914)
 
 const kState = Symbol('ProgressEvent state')
 
@@ -59560,7 +64091,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 3738:
+/***/ 5889:
 /***/ ((module) => {
 
 
@@ -59577,7 +64108,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 2882:
+/***/ 3627:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -59588,11 +64119,11 @@ const {
   kResult,
   kAborted,
   kLastProgressEventFired
-} = __nccwpck_require__(3738)
-const { ProgressEvent } = __nccwpck_require__(6002)
-const { getEncoding } = __nccwpck_require__(2444)
-const { DOMException } = __nccwpck_require__(756)
-const { serializeAMimeType, parseMIMEType } = __nccwpck_require__(6932)
+} = __nccwpck_require__(5889)
+const { ProgressEvent } = __nccwpck_require__(4124)
+const { getEncoding } = __nccwpck_require__(2522)
+const { DOMException } = __nccwpck_require__(7033)
+const { serializeAMimeType, parseMIMEType } = __nccwpck_require__(5723)
 const { types } = __nccwpck_require__(3837)
 const { StringDecoder } = __nccwpck_require__(1576)
 const { btoa } = __nccwpck_require__(4300)
@@ -59976,7 +64507,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 5683:
+/***/ 8561:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -59984,8 +64515,8 @@ module.exports = {
 // We include a version number for the Dispatcher API. In case of breaking changes,
 // this version number must be increased to avoid conflicts.
 const globalDispatcher = Symbol.for('undici.globalDispatcher.1')
-const { InvalidArgumentError } = __nccwpck_require__(3501)
-const Agent = __nccwpck_require__(8551)
+const { InvalidArgumentError } = __nccwpck_require__(1641)
+const Agent = __nccwpck_require__(8854)
 
 if (getGlobalDispatcher() === undefined) {
   setGlobalDispatcher(new Agent())
@@ -60015,7 +64546,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 3563:
+/***/ 5671:
 /***/ ((module) => {
 
 
@@ -60057,15 +64588,15 @@ module.exports = class DecoratorHandler {
 
 /***/ }),
 
-/***/ 6086:
+/***/ 2054:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const util = __nccwpck_require__(9647)
-const { kBodyUsed } = __nccwpck_require__(7621)
+const util = __nccwpck_require__(2355)
+const { kBodyUsed } = __nccwpck_require__(3283)
 const assert = __nccwpck_require__(9491)
-const { InvalidArgumentError } = __nccwpck_require__(3501)
+const { InvalidArgumentError } = __nccwpck_require__(1641)
 const EE = __nccwpck_require__(2361)
 
 const redirectableStatusCodes = [300, 301, 302, 303, 307, 308]
@@ -60285,14 +64816,14 @@ module.exports = RedirectHandler
 
 /***/ }),
 
-/***/ 6734:
+/***/ 2767:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const assert = __nccwpck_require__(9491)
 
-const { kRetryHandlerDefaultRetry } = __nccwpck_require__(7621)
-const { RequestRetryError } = __nccwpck_require__(3501)
-const { isDisturbed, parseHeaders, parseRangeHeader } = __nccwpck_require__(9647)
+const { kRetryHandlerDefaultRetry } = __nccwpck_require__(3283)
+const { RequestRetryError } = __nccwpck_require__(1641)
+const { isDisturbed, parseHeaders, parseRangeHeader } = __nccwpck_require__(2355)
 
 function calculateRetryAfterHeader (retryAfter) {
   const current = Date.now()
@@ -60628,12 +65159,12 @@ module.exports = RetryHandler
 
 /***/ }),
 
-/***/ 3163:
+/***/ 7594:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const RedirectHandler = __nccwpck_require__(6086)
+const RedirectHandler = __nccwpck_require__(2054)
 
 function createRedirectInterceptor ({ maxRedirections: defaultMaxRedirections }) {
   return (dispatch) => {
@@ -60656,13 +65187,13 @@ module.exports = createRedirectInterceptor
 
 /***/ }),
 
-/***/ 446:
+/***/ 2649:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.SPECIAL_HEADERS = exports.HEADER_STATE = exports.MINOR = exports.MAJOR = exports.CONNECTION_TOKEN_CHARS = exports.HEADER_CHARS = exports.TOKEN = exports.STRICT_TOKEN = exports.HEX = exports.URL_CHAR = exports.STRICT_URL_CHAR = exports.USERINFO_CHARS = exports.MARK = exports.ALPHANUM = exports.NUM = exports.HEX_MAP = exports.NUM_MAP = exports.ALPHA = exports.FINISH = exports.H_METHOD_MAP = exports.METHOD_MAP = exports.METHODS_RTSP = exports.METHODS_ICE = exports.METHODS_HTTP = exports.METHODS = exports.LENIENT_FLAGS = exports.FLAGS = exports.TYPE = exports.ERROR = void 0;
-const utils_1 = __nccwpck_require__(8675);
+const utils_1 = __nccwpck_require__(6663);
 // C headers
 var ERROR;
 (function (ERROR) {
@@ -60940,7 +65471,7 @@ exports.SPECIAL_HEADERS = {
 
 /***/ }),
 
-/***/ 2959:
+/***/ 2062:
 /***/ ((module) => {
 
 module.exports = 'AGFzbQEAAAABMAhgAX8Bf2ADf39/AX9gBH9/f38Bf2AAAGADf39/AGABfwBgAn9/AGAGf39/f39/AALLAQgDZW52GHdhc21fb25faGVhZGVyc19jb21wbGV0ZQACA2VudhV3YXNtX29uX21lc3NhZ2VfYmVnaW4AAANlbnYLd2FzbV9vbl91cmwAAQNlbnYOd2FzbV9vbl9zdGF0dXMAAQNlbnYUd2FzbV9vbl9oZWFkZXJfZmllbGQAAQNlbnYUd2FzbV9vbl9oZWFkZXJfdmFsdWUAAQNlbnYMd2FzbV9vbl9ib2R5AAEDZW52GHdhc21fb25fbWVzc2FnZV9jb21wbGV0ZQAAA0ZFAwMEAAAFAAAAAAAABQEFAAUFBQAABgAAAAAGBgYGAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAAABAQcAAAUFAwABBAUBcAESEgUDAQACBggBfwFBgNQECwfRBSIGbWVtb3J5AgALX2luaXRpYWxpemUACRlfX2luZGlyZWN0X2Z1bmN0aW9uX3RhYmxlAQALbGxodHRwX2luaXQAChhsbGh0dHBfc2hvdWxkX2tlZXBfYWxpdmUAQQxsbGh0dHBfYWxsb2MADAZtYWxsb2MARgtsbGh0dHBfZnJlZQANBGZyZWUASA9sbGh0dHBfZ2V0X3R5cGUADhVsbGh0dHBfZ2V0X2h0dHBfbWFqb3IADxVsbGh0dHBfZ2V0X2h0dHBfbWlub3IAEBFsbGh0dHBfZ2V0X21ldGhvZAARFmxsaHR0cF9nZXRfc3RhdHVzX2NvZGUAEhJsbGh0dHBfZ2V0X3VwZ3JhZGUAEwxsbGh0dHBfcmVzZXQAFA5sbGh0dHBfZXhlY3V0ZQAVFGxsaHR0cF9zZXR0aW5nc19pbml0ABYNbGxodHRwX2ZpbmlzaAAXDGxsaHR0cF9wYXVzZQAYDWxsaHR0cF9yZXN1bWUAGRtsbGh0dHBfcmVzdW1lX2FmdGVyX3VwZ3JhZGUAGhBsbGh0dHBfZ2V0X2Vycm5vABsXbGxodHRwX2dldF9lcnJvcl9yZWFzb24AHBdsbGh0dHBfc2V0X2Vycm9yX3JlYXNvbgAdFGxsaHR0cF9nZXRfZXJyb3JfcG9zAB4RbGxodHRwX2Vycm5vX25hbWUAHxJsbGh0dHBfbWV0aG9kX25hbWUAIBJs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ADcDACAAQShqQgA3AwAgAEEgakIANwMAIABBEGpCADcDACAAQQhqQgA3AwAgAEHdATYCHEEAC3sBAX8CQCAAKAIMIgMNAAJAIAAoAgRFDQAgACABNgIECwJAIAAgASACEMSAgIAAIgMNACAAKAIMDwsgACADNgIcQQAhAyAAKAIEIgFFDQAgACABIAIgACgCCBGBgICAAAAiAUUNACAAIAI2AhQgACABNgIMIAEhAwsgAwvk8wEDDn8DfgR/I4CAgIAAQRBrIgMkgICAgAAgASEEIAEhBSABIQYgASEHIAEhCCABIQkgASEKIAEhCyABIQwgASENIAEhDiABIQ8CQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkAgACgCHCIQQX9qDt0B2gEB2QECAwQFBgcICQoLDA0O2AEPENcBERLWARMUFRYXGBkaG+AB3wEcHR7VAR8gISIjJCXUASYnKCkqKyzTAdIBLS7RAdABLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVG2wFHSElKzwHOAUvNAUzMAU1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4ABgQGCAYMBhAGFAYYBhwGIAYkB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QAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkAC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FCAAIBA2AgxBACEQDLIBCyAAKAIEIRAgAEEANgIEAkAgACAQIAEQp4CAgAAiEA0AIAEhAQxNCyAAQdMANgIcIAAgATYCFCAAIBA2AgxBACEQDLEBCyAAKAIEIRAgAEEANgIEAkAgACAQIAEQp4CAgAAiEA0AIAEhAQxRCyAAQeUANgIcIAAgATYCFCAAIBA2AgxBACEQDLABCyAAQQA2AhwgACABNgIUIABBxoqAgAA2AhAgAEEHNgIMQQAhEAyvAQsgACgCBCEQIABBADYCBAJAIAAgECABEKeAgIAAIhANACABIQEMSQsgAEHSADYCHCAAIAE2AhQgACAQNgIMQQAhEAyuAQsgACgCBCEQIABBADYCBAJAIAAgECABEKeAgIAAIhANACABIQEMSQsgAEHTADYCHCAAIAE2AhQgACAQNgIMQQAhEAytAQsgACgCBCEQIABBADYCBAJAIAAgECABEKeAgIAAIhANACABIQEMTQsgAEHlADYCHCAAIAE2AhQgACAQNgIMQQAhEAysAQsgAEEANgIcIAAgATYCFCAAQdyIgIAANgIQIABBBzYCDEEAIRAMqwELIBBBP0cNASABQQFqIQELQQUhEAyQAQtBACEQIABBADYCHCAAIAE2AhQgAEH9koCAADYCECAAQQc2AgwMqAELIAAoAgQhECAAQQA2AgQCQCAAIBAgARCngICAACIQDQAgASEBDEILIABB0gA2AhwgACABNgIUIAAgEDYCDEEAIRAMpwELIAAoAgQhECAAQQA2AgQCQCAAIBAgARCngICAACIQDQAgASEBDEILIABB0wA2AhwgACABNgIUIAAgEDYCDEEAIRAMpgELIAAoAgQhECAAQQA2AgQCQCAAIBAgARCngICAACIQDQAgASEBDEYLIABB5QA2AhwgACABNgIUIAAgEDYCDEEAIRAMpQELIAAoAgQhASAAQQA2AgQCQCAAIAEgFBCngICAACIBDQAgFCEBDD8LIABB0gA2AhwgACAUNgIUIAAgATYCDEEAIRAMpAELIAAoAgQhASAAQQA2AgQCQCAAIAEgFBCngICAACIBDQAgFCEBDD8LIABB0wA2AhwgACAUNgIUIAAgATYCDEEAIRAMowELIAAoAgQhASAAQQA2AgQCQCAAIAEgFBCngICAACIBDQAgFCEBDEMLIABB5QA2AhwgACAU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YWdlX2JlZ2luYCBjYWxsYmFjayBlcnJvcgBgb25fY2h1bmtfZXh0ZW5zaW9uX3ZhbHVlYCBjYWxsYmFjayBlcnJvcgBgb25fc3RhdHVzX2NvbXBsZXRlYCBjYWxsYmFjayBlcnJvcgBgb25fdmVyc2lvbl9jb21wbGV0ZWAgY2FsbGJhY2sgZXJyb3IAYG9uX3VybF9jb21wbGV0ZWAgY2FsbGJhY2sgZXJyb3IAYG9uX2NodW5rX2NvbXBsZXRlYCBjYWxsYmFjayBlcnJvcgBgb25faGVhZGVyX3ZhbHVlX2NvbXBsZXRlYCBjYWxsYmFjayBlcnJvcgBgb25fbWVzc2FnZV9jb21wbGV0ZWAgY2FsbGJhY2sgZXJyb3IAYG9uX21ldGhvZF9jb21wbGV0ZWAgY2FsbGJhY2sgZXJyb3IAYG9uX2hlYWRlcl9maWVsZF9jb21wbGV0ZWAgY2FsbGJhY2sgZXJyb3IAYG9uX2NodW5rX2V4dGVuc2lvbl9uYW1lYCBjYWxsYmFjayBlcnJvcgBVbmV4cGVjdGVkIGNoYXIgaW4gdXJsIHNlcnZlcgBJbnZhbGlkIGhlYWRlciB2YWx1ZSBjaGFyAEludmFsaWQgaGVhZGVyIGZpZWxkIGNoYXIAU3BhbiBjYWxsYmFjayBlcnJvciBpbiBvbl92ZXJzaW9uAEludmFsaWQgbWlub3IgdmVyc2lvbgBJbnZhbGlkIG1ham9yIHZlcnNpb24ARXhwZWN0ZWQgc3BhY2UgYWZ0ZXIgdmVyc2lvbgBFeHBlY3RlZCBDUkxGIGFmdGVyIHZlcnNpb24ASW52YWxpZCBIVFRQIHZlcnNpb24ASW52YWxpZCBoZWFkZXIgdG9rZW4AU3BhbiBjYWxsYmFjayBlcnJvciBpbiBvbl91cmwASW52YWxpZCBjaGFyYWN0ZXJzIGluIHVybABVbmV4cGVjdGVkIHN0YXJ0IGNoYXIgaW4gdXJsAERvdWJsZSBAIGluIHVybABFbXB0eSBDb250ZW50LUxlbmd0aABJbnZhbGlkIGNoYXJhY3RlciBpbiBDb250ZW50LUxlbmd0aABEdXBsaWNhdGUgQ29udGVudC1MZW5ndGgASW52YWxpZCBjaGFyIGluIHVybCBwYXRoAENvbnRlbnQtTGVuZ3RoIGNhbid0IGJlIHByZXNlbnQgd2l0aCBUcmFuc2Zlci1FbmNvZGluZwBJbnZhbGlkIGNoYXJhY3RlciBpbiBjaHVuayBzaXplAFNwYW4gY2FsbGJhY2sgZXJyb3IgaW4gb25faGVhZGVyX3ZhbHVlAFNwYW4gY2FsbGJhY2sgZXJyb3IgaW4gb25fY2h1bmtfZXh0ZW5zaW9uX3ZhbHVlAEludmFsaWQgY2hhcmFjdGVyIGluIGNodW5rIGV4dGVuc2lvbnMgdmFsdWUATWlzc2luZyBleHBlY3RlZCBMRiBhZnRlciBoZWFkZXIgdmFsdWUASW52YWxpZCBgVHJhbnNmZXItRW5jb2RpbmdgIGhlYWRlciB2YWx1ZQBJbnZhbGlkIGNoYXJhY3RlciBpbiBjaHVuayBleHRlbnNpb25zIHF1b3RlIHZhbHVlAEludmFsaWQgY2hhcmFjdGVyIGluIGNodW5rIGV4dGVuc2lvbnMgcXVvdGVkIHZhbHVlAFBhdXNlZCBieSBvbl9oZWFkZXJzX2NvbXBsZXRlAEludmFsaWQgRU9GIHN0YXRlAG9uX3Jlc2V0IHBhdXNlAG9uX2NodW5rX2hlYWRlciBwYXVzZQBvbl9tZXNzYWdlX2JlZ2luIHBhdXNlAG9uX2NodW5rX2V4dGVuc2lvbl92YWx1ZSBwYXVzZQBvbl9zdGF0dXNfY29tcGxldGUgcGF1c2UAb25fdmVyc2lvbl9jb21wbGV0ZSBwYXVzZQBvbl91cmxfY29tcGxldGUgcGF1c2UAb25fY2h1bmtfY29tcGxldGUgcGF1c2UAb25faGVhZGVyX3ZhbHVlX2NvbXBsZXRlIHBhdXNlAG9uX21lc3NhZ2VfY29tcGxldGUgcGF1c2UAb25fbWV0aG9kX2NvbXBsZXRlIHBhdXNlAG9uX2hlYWRlcl9maWVsZF9jb21wbGV0ZSBwYXVzZQBvbl9jaHVua19leHRlbnNpb25fbmFtZSBwYXVzZQBVbmV4cGVjdGVkIHNwYWNlIGFmdGVyIHN0YXJ0IGxpbmUAU3BhbiBjYWxsYmFjayBlcnJvciBpbiBvbl9jaHVua19leHRlbnNpb25fbmFtZQBJbnZhbGlkIGNoYXJhY3RlciBpbiBjaHVuayBleHRlbnNpb25zIG5hbWUAUGF1c2Ugb24gQ09OTkVDVC9VcGdyYWRlAFBhdXNlIG9uIFBSSS9VcGdyYWRlAEV4cGVjdGVkIEhUVFAvMiBDb25uZWN0aW9uIFByZWZhY2UAU3BhbiBjYWxsYmFjayBlcnJvciBpbiBvbl9tZXRob2QARXhwZWN0ZWQgc3BhY2UgYWZ0ZXIgbWV0aG9kAFNwYW4gY2FsbGJhY2sgZXJyb3IgaW4gb25faGVhZGVyX2ZpZWxkAFBhdXNlZABJbnZhbGlkIHdvcmQgZW5jb3VudGVyZWQASW52YWxpZCBtZXRob2QgZW5jb3VudGVyZWQAVW5leHBlY3RlZCBjaGFyIGluIHVybCBzY2hlbWEAUmVxdWVzdCBoYXMgaW52YWxpZCBgVHJhbnNmZXItRW5jb2RpbmdgAFNXSVRDSF9QUk9YWQBVU0VfUFJPWFkATUtBQ1RJVklUWQBVTlBST0NFU1NBQkxFX0VOVElUWQBDT1BZAE1PVkVEX1BFUk1BTkVOVExZAFRPT19FQVJMWQBOT1RJRlkARkFJTEVEX0RFUEVOREVOQ1kAQkFEX0dBVEVXQVkAUExBWQBQVVQAQ0hFQ0tPVVQAR0FURVdBWV9USU1FT1VUAFJFUVVFU1RfVElNRU9VVABORVRXT1JLX0NPTk5FQ1RfVElNRU9VVABDT05ORUNUSU9OX1RJTUVPVVQATE9HSU5fVElNRU9VVABORVRXT1JLX1JFQURfVElNRU9VVABQT1NUAE1JU0RJUkVDVEVEX1JFUVVFU1QAQ0xJRU5UX0NMT1NFRF9SRVFVRVNUAENMSUVOVF9DTE9TRURfTE9BRF9CQUxBTkNFRF9SRVFVRVNUAEJBRF9SRVFVRVNUAEhUVFBfUkVRVUVTVF9TRU5UX1RPX0hUVFBTX1BPUlQAUkVQT1JUAElNX0FfVEVBUE9UAFJFU0VUX0NPTlRFTlQATk9fQ09OVEVOVABQQVJUSUFMX0NPTlRFTlQASFBFX0lOVkFMSURfQ09OU1RBTlQASFBFX0NCX1JFU0VUAEdFVABIUEVfU1RSSUNUAENPTkZMSUNUAFRFTVBPUkFSWV9SRURJUkVDVABQRVJNQU5FTlRfUkVESVJFQ1QAQ09OTkVDVABNVUxUSV9TVEFUVVMASFBFX0lOVkFMSURfU1RBVFVTAFRPT19NQU5ZX1JFUVVFU1RTAEVBUkxZX0hJTlRTAFVOQVZBSUxBQkxFX0ZPUl9MRUdBTF9SRUFTT05TAE9QVElPTlMAU1dJVENISU5HX1BST1RPQ09MUwBWQVJJQU5UX0FMU09fTkVHT1RJQVRFUwBNVUxUSVBMRV9DSE9JQ0VTAElOVEVSTkFMX1NFUlZFUl9FUlJPUgBXRUJfU0VSVkVSX1VOS05PV05fRVJST1IAUkFJTEdVTl9FUlJPUgBJREVOVElUWV9QUk9WSURFUl9BVVRIRU5USUNBVElPTl9FUlJPUgBTU0xfQ0VSVElGSUNBVEVfRVJST1IASU5WQUxJRF9YX0ZPUldBUkRFRF9GT1IAU0VUX1BBUkFNRVRFUgBHRVRfUEFSQU1FVEVSAEhQRV9VU0VSAFNFRV9PVEhFUgBIUEVfQ0JfQ0hVTktfSEVBREVSAE1LQ0FMRU5EQVIAU0VUVVAAV0VCX1NFUlZFUl9JU19ET1dOAFRFQVJET1dOAEhQRV9DTE9TRURfQ09OTkVDVElPTgBIRVVSSVNUSUNfRVhQSVJBVElPTgBESVNDT05ORUNURURfT1BFUkFUSU9OAE5PTl9BVVRIT1JJVEFUSVZFX0lORk9STUFUSU9OAEhQRV9JTlZBTElEX1ZFUlNJT04ASFBFX0NCX01FU1NBR0VfQkVHSU4AU0lURV9JU19GUk9aRU4ASFBFX0lOVkFMSURfSEVBREVSX1RPS0VOAElOVkFMSURfVE9LRU4ARk9SQklEREVOAEVOSEFOQ0VfWU9VUl9DQUxNAEhQRV9JTlZBTElEX1VSTABCTE9DS0VEX0JZX1BBUkVOVEFMX0NPTlRST0wATUtDT0wAQUNMAEhQRV9JTlRFUk5BTABSRVFVRVNUX0hFQURFUl9GSUVMRFNfVE9PX0xBUkdFX1VOT0ZGSUNJQUwASFBFX09LAFVOTElOSwBVTkxPQ0sAUFJJAFJFVFJZX1dJVEgASFBFX0lOVkFMSURfQ09OVEVOVF9MRU5HVEgASFBFX1VORVhQRUNURURfQ09OVEVOVF9MRU5HVEgARkxVU0gAUFJPUFBBVENIAE0tU0VBUkNIAFVSSV9UT09fTE9ORwBQUk9DRVNTSU5HAE1JU0NFTExBTkVPVVNfUEVSU0lTVEVOVF9XQVJOSU5HAE1JU0NFTExBTkVPVVNfV0FSTklORwBIUEVfSU5WQUxJRF9UUkFOU0ZFUl9FTkNPRElORwBFeHBlY3RlZCBDUkxGAEhQRV9JTlZBTElEX0NIVU5LX1NJWkUATU9WRQBDT05USU5VRQBIUEVfQ0JfU1RBVFVTX0NPTVBMRVRFAEhQRV9DQl9IRUFERVJTX0NPTVBMRVRFAEhQRV9DQl9WRVJTSU9OX0NPTVBMRVRFAEhQRV9DQl9VUkxfQ09NUExFVEUASFBFX0NCX0NIVU5LX0NPTVBMRVRFAEhQRV9DQl9IRUFERVJfVkFMVUVfQ09NUExFVEUASFBFX0NCX0NIVU5LX0VYVEVOU0lPTl9WQUxVRV9DT01QTEVURQBIUEVfQ0JfQ0hVTktfRVhURU5TSU9OX05BTUVfQ09NUExFVEUASFBFX0NCX01FU1NBR0VfQ09NUExFVEUASFBFX0NCX01FVEhPRF9DT01QTEVURQBIUEVfQ0JfSEVBREVSX0ZJRUxEX0NPTVBMRVRFAERFTEVURQBIUEVfSU5WQUxJRF9FT0ZfU1RBVEUASU5WQUxJRF9TU0xfQ0VSVElGSUNBVEUAUEFVU0UATk9fUkVTUE9OU0UAVU5TVVBQT1JURURfTUVESUFfVFlQRQBHT05FAE5PVF9BQ0NFUFRBQkxFAFNFUlZJQ0VfVU5BVkFJTEFCTEUAUkFOR0VfTk9UX1NBVElTRklBQkxFAE9SSUdJTl9JU19VTlJFQUNIQUJMRQBSRVNQT05TRV9JU19TVEFMRQBQVVJHRQBNRVJHRQBSRVFVRVNUX0hFQURFUl9GSUVMRFNfVE9PX0xBUkdFAFJFUVVFU1RfSEVBREVSX1RPT19MQVJHRQBQQVlMT0FEX1RPT19MQVJHRQBJTlNVRkZJQ0lFTlRfU1RPUkFHRQBIUEVfUEFVU0VEX1VQR1JBREUASFBFX1BBVVNFRF9IMl9VUEdSQURFAFNPVVJDRQBBTk5PVU5DRQBUUkFDRQBIUEVfVU5FWFBFQ1RFRF9TUEFDRQBERVNDUklCRQBVTlNVQlNDUklCRQBSRUNPUkQASFBFX0lOVkFMSURfTUVUSE9EAE5PVF9GT1VORABQUk9QRklORABVTkJJTkQAUkVCSU5EAFVOQVVUSE9SSVpFRABNRVRIT0RfTk9UX0FMTE9XRUQASFRUUF9WRVJTSU9OX05PVF9TVVBQT1JURUQAQUxSRUFEWV9SRVBPUlRFRABBQ0NFUFRFRABOT1RfSU1QTEVNRU5URUQATE9PUF9ERVRFQ1RFRABIUEVfQ1JfRVhQRUNURUQASFBFX0xGX0VYUEVDVEVEAENSRUFURUQASU1fVVNFRABIUEVfUEFVU0VEAFRJTUVPVVRfT0NDVVJFRABQQVlNRU5UX1JFUVVJUkVEAFBSRUNPTkRJVElPTl9SRVFVSVJFRABQUk9YWV9BVVRIRU5USUNBVElPTl9SRVFVSVJFRABORVRXT1JLX0FVVEhFTlRJQ0FUSU9OX1JFUVVJUkVEAExFTkdUSF9SRVFVSVJFRABTU0xfQ0VSVElGSUNBVEVfUkVRVUlSRUQAVVBHUkFERV9SRVFVSVJFRABQQUdFX0VYUElSRUQAUFJFQ09ORElUSU9OX0ZBSUxFRABFWFBFQ1RBVElPTl9GQUlMRUQAUkVWQUxJREFUSU9OX0ZBSUxFRABTU0xfSEFORFNIQUtFX0ZBSUxFRABMT0NLRUQAVFJBTlNGT1JNQVRJT05fQVBQTElFRABOT1RfTU9ESUZJRUQATk9UX0VYVEVOREVEAEJBTkRXSURUSF9MSU1JVF9FWENFRURFRABTSVRFX0lTX09WRVJMT0FERUQASEVBRABFeHBlY3RlZCBIVFRQLwAAXhMAACYTAAAwEAAA8BcAAJ0TAAAVEgAAORcAAPASAAAKEAAAdRIAAK0SAACCEwAATxQAAH8QAACgFQAAIxQAAIkSAACLFAAATRUAANQRAADPFAAAEBgAAMkWAADcFgAAwREAAOAXAAC7FAAAdBQAAHwVAADlFAAACBcAAB8QAABlFQAAoxQAACgVAAACFQAAmRUAACwQAACLGQAATw8AANQOAABqEAAAzhAAAAIXAACJDgAAbhMAABwTAABmFAAAVhcAAMETAADNEwAAbBMAAGgXAABmFwAAXxcAACITAADODwAAaQ4AANgOAABjFgAAyxMAAKoOAAAoFwAAJhcAAMUTAABdFgAA6BEAAGcTAABlEwAA8hYAAHMTAAAdFwAA+RYAAPMRAADPDgAAzhUAAAwSAACzEQAApREAAGEQAAAyFwAAuxMAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQIBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAIDAgICAgIAAAICAAICAAICAgICAgICAgIABAAAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgACAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAACAAICAgICAAACAgACAgACAgICAgICAgICAAMABAAAAAICAgICAgICAgICAgICAgICAgICAgICAgICAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAgACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbG9zZWVlcC1hbGl2ZQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEBAQEBAQEBAQIBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBY2h1bmtlZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEAAQEBAQEAAAEBAAEBAAEBAQEBAQEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABlY3Rpb25lbnQtbGVuZ3Rob25yb3h5LWNvbm5lY3Rpb24AAAAAAAAAAAAAAAAAAAByYW5zZmVyLWVuY29kaW5ncGdyYWRlDQoNCg0KU00NCg0KVFRQL0NFL1RTUC8AAAAAAAAAAAAAAAABAgABAwAAAAAAAAAAAAAAAAAAAAAAAAQBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAAAAAAAAAAAQIAAQMAAAAAAAAAAAAAAAAAAAAAAAAEAQEFAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAAAAAAAAAEAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAAAAAAAAQAAAgAAAAAAAAAAAAAAAAAAAAAAAAMEAAAEBAQEBAQEBAQEBAUEBAQEBAQEBAQEBAQABAAGBwQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEAAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAEAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAABAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAIAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMAAAAAAAADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABOT1VOQ0VFQ0tPVVRORUNURVRFQ1JJQkVMVVNIRVRFQURTRUFSQ0hSR0VDVElWSVRZTEVOREFSVkVPVElGWVBUSU9OU0NIU0VBWVNUQVRDSEdFT1JESVJFQ1RPUlRSQ0hQQVJBTUVURVJVUkNFQlNDUklCRUFSRE9XTkFDRUlORE5LQ0tVQlNDUklCRUhUVFAvQURUUC8='
@@ -60948,7 +65479,7 @@ module.exports = 'AGFzbQEAAAABMAhgAX8Bf2ADf39/AX9gBH9/f38Bf2AAAGADf39/AGABfwBgAn
 
 /***/ }),
 
-/***/ 5674:
+/***/ 3674:
 /***/ ((module) => {
 
 module.exports = 'AGFzbQEAAAABMAhgAX8Bf2ADf39/AX9gBH9/f38Bf2AAAGADf39/AGABfwBgAn9/AGAGf39/f39/AALLAQgDZW52GHdhc21fb25faGVhZGVyc19jb21wbGV0ZQACA2VudhV3YXNtX29uX21lc3NhZ2VfYmVnaW4AAANlbnYLd2FzbV9vbl91cmwAAQNlbnYOd2FzbV9vbl9zdGF0dXMAAQNlbnYUd2FzbV9vbl9oZWFkZXJfZmllbGQAAQNlbnYUd2FzbV9vbl9oZWFkZXJfdmFsdWUAAQNlbnYMd2FzbV9vbl9ib2R5AAEDZW52GHdhc21fb25fbWVzc2FnZV9jb21wbGV0ZQAAA0ZFAwMEAAAFAAAAAAAABQEFAAUFBQAABgAAAAAGBgYGAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAAABAQcAAAUFAwABBAUBcAESEgUDAQACBggBfwFBgNQECwfRBSIGbWVtb3J5AgALX2luaXRpYWxpemUACRlfX2luZGlyZWN0X2Z1bmN0aW9uX3RhYmxlAQALbGxodHRwX2luaXQAChhsbGh0dHBfc2hvdWxkX2tlZXBfYWxpdmUAQQxsbGh0dHBfYWxsb2MADAZtYWxsb2MARgtsbGh0dHBfZnJlZQANBGZyZWUASA9sbGh0dHBfZ2V0X3R5cGUADhVsbGh0dHBfZ2V0X2h0dHBfbWFqb3IADxVsbGh0dHBfZ2V0X2h0dHBfbWlub3IAEBFsbGh0dHBfZ2V0X21ldGhvZAARFmxsaHR0cF9nZXRfc3RhdHVzX2NvZGUAEhJsbGh0dHBfZ2V0X3VwZ3JhZGUAEwxsbGh0dHBfcmVzZXQAFA5sbGh0dHBfZXhlY3V0ZQAVFGxsaHR0cF9zZXR0aW5nc19pbml0ABYNbGxodHRwX2ZpbmlzaAAXDGxsaHR0cF9wYXVzZQAYDWxsaHR0cF9yZXN1bWUAGRtsbGh0dHBfcmVzdW1lX2FmdGVyX3VwZ3JhZGUAGhBsbGh0dHBfZ2V0X2Vycm5vABsXbGxodHRwX2dldF9lcnJvcl9yZWFzb24AHBdsbGh0dHBfc2V0X2Vycm9yX3JlYXNvbgAdFGxsaHR0cF9nZXRfZXJyb3JfcG9zAB4RbGxodHRwX2Vycm5vX25hbWUAHxJsbGh0dHBfbWV0aG9kX25hbWUAIBJs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IAH9CwMAIABBMGogAf0LAwAgAEEgaiAB/QsDACAAQd0BNgIcQQALewEBfwJAIAAoAgwiAw0AAkAgACgCBEUNACAAIAE2AgQLAkAgACABIAIQxICAgAAiAw0AIAAoAgwPCyAAIAM2AhxBACEDIAAoAgQiAUUNACAAIAEgAiAAKAIIEYGAgIAAACIBRQ0AIAAgAjYCFCAAIAE2AgwgASEDCyADC+TzAQMOfwN+BH8jgICAgABBEGsiAySAgICAACABIQQgASEFIAEhBiABIQcgASEIIAEhCSABIQogASELIAEhDCABIQ0gASEOIAEhDwJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQCAAKAIcIhBBf2oO3QHaAQHZAQIDBAUGBwgJCgsMDQ7YAQ8Q1wEREtYBExQVFhcYGRob4AHfARwdHtUBHyAhIiMkJdQBJicoKSorLNMB0gEtLtEB0AEvMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUbbAUdISUrPAc4BS80BTMwBTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5/gAGBAYIBgwGEAYUBhgGHAYgBiQGKAYsBjAGNAY4BjwGQAZEB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QAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAIBAOxwEAAQID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YWNrIGVycm9yAGBvbl9jaHVua19leHRlbnNpb25fdmFsdWVgIGNhbGxiYWNrIGVycm9yAGBvbl9zdGF0dXNfY29tcGxldGVgIGNhbGxiYWNrIGVycm9yAGBvbl92ZXJzaW9uX2NvbXBsZXRlYCBjYWxsYmFjayBlcnJvcgBgb25fdXJsX2NvbXBsZXRlYCBjYWxsYmFjayBlcnJvcgBgb25fY2h1bmtfY29tcGxldGVgIGNhbGxiYWNrIGVycm9yAGBvbl9oZWFkZXJfdmFsdWVfY29tcGxldGVgIGNhbGxiYWNrIGVycm9yAGBvbl9tZXNzYWdlX2NvbXBsZXRlYCBjYWxsYmFjayBlcnJvcgBgb25fbWV0aG9kX2NvbXBsZXRlYCBjYWxsYmFjayBlcnJvcgBgb25faGVhZGVyX2ZpZWxkX2NvbXBsZXRlYCBjYWxsYmFjayBlcnJvcgBgb25fY2h1bmtfZXh0ZW5zaW9uX25hbWVgIGNhbGxiYWNrIGVycm9yAFVuZXhwZWN0ZWQgY2hhciBpbiB1cmwgc2VydmVyAEludmFsaWQgaGVhZGVyIHZhbHVlIGNoYXIASW52YWxpZCBoZWFkZXIgZmllbGQgY2hhcgBTcGFuIGNhbGxiYWNrIGVycm9yIGluIG9uX3ZlcnNpb24ASW52YWxpZCBtaW5vciB2ZXJzaW9uAEludmFsaWQgbWFqb3IgdmVyc2lvbgBFeHBlY3RlZCBzcGFjZSBhZnRlciB2ZXJzaW9uAEV4cGVjdGVkIENSTEYgYWZ0ZXIgdmVyc2lvbgBJbnZhbGlkIEhUVFAgdmVyc2lvbgBJbnZhbGlkIGhlYWRlciB0b2tlbgBTcGFuIGNhbGxiYWNrIGVycm9yIGluIG9uX3VybABJbnZhbGlkIGNoYXJhY3RlcnMgaW4gdXJsAFVuZXhwZWN0ZWQgc3RhcnQgY2hhciBpbiB1cmwARG91YmxlIEAgaW4gdXJsAEVtcHR5IENvbnRlbnQtTGVuZ3RoAEludmFsaWQgY2hhcmFjdGVyIGluIENvbnRlbnQtTGVuZ3RoAER1cGxpY2F0ZSBDb250ZW50LUxlbmd0aABJbnZhbGlkIGNoYXIgaW4gdXJsIHBhdGgAQ29udGVudC1MZW5ndGggY2FuJ3QgYmUgcHJlc2VudCB3aXRoIFRyYW5zZmVyLUVuY29kaW5nAEludmFsaWQgY2hhcmFjdGVyIGluIGNodW5rIHNpemUAU3BhbiBjYWxsYmFjayBlcnJvciBpbiBvbl9oZWFkZXJfdmFsdWUAU3BhbiBjYWxsYmFjayBlcnJvciBpbiBvbl9jaHVua19leHRlbnNpb25fdmFsdWUASW52YWxpZCBjaGFyYWN0ZXIgaW4gY2h1bmsgZXh0ZW5zaW9ucyB2YWx1ZQBNaXNzaW5nIGV4cGVjdGVkIExGIGFmdGVyIGhlYWRlciB2YWx1ZQBJbnZhbGlkIGBUcmFuc2Zlci1FbmNvZGluZ2AgaGVhZGVyIHZhbHVlAEludmFsaWQgY2hhcmFjdGVyIGluIGNodW5rIGV4dGVuc2lvbnMgcXVvdGUgdmFsdWUASW52YWxpZCBjaGFyYWN0ZXIgaW4gY2h1bmsgZXh0ZW5zaW9ucyBxdW90ZWQgdmFsdWUAUGF1c2VkIGJ5IG9uX2hlYWRlcnNfY29tcGxldGUASW52YWxpZCBFT0Ygc3RhdGUAb25fcmVzZXQgcGF1c2UAb25fY2h1bmtfaGVhZGVyIHBhdXNlAG9uX21lc3NhZ2VfYmVnaW4gcGF1c2UAb25fY2h1bmtfZXh0ZW5zaW9uX3ZhbHVlIHBhdXNlAG9uX3N0YXR1c19jb21wbGV0ZSBwYXVzZQBvbl92ZXJzaW9uX2NvbXBsZXRlIHBhdXNlAG9uX3VybF9jb21wbGV0ZSBwYXVzZQBvbl9jaHVua19jb21wbGV0ZSBwYXVzZQBvbl9oZWFkZXJfdmFsdWVfY29tcGxldGUgcGF1c2UAb25fbWVzc2FnZV9jb21wbGV0ZSBwYXVzZQBvbl9tZXRob2RfY29tcGxldGUgcGF1c2UAb25faGVhZGVyX2ZpZWxkX2NvbXBsZXRlIHBhdXNlAG9uX2NodW5rX2V4dGVuc2lvbl9uYW1lIHBhdXNlAFVuZXhwZWN0ZWQgc3BhY2UgYWZ0ZXIgc3RhcnQgbGluZQBTcGFuIGNhbGxiYWNrIGVycm9yIGluIG9uX2NodW5rX2V4dGVuc2lvbl9uYW1lAEludmFsaWQgY2hhcmFjdGVyIGluIGNodW5rIGV4dGVuc2lvbnMgbmFtZQBQYXVzZSBvbiBDT05ORUNUL1VwZ3JhZGUAUGF1c2Ugb24gUFJJL1VwZ3JhZGUARXhwZWN0ZWQgSFRUUC8yIENvbm5lY3Rpb24gUHJlZmFjZQBTcGFuIGNhbGxiYWNrIGVycm9yIGluIG9uX21ldGhvZABFeHBlY3RlZCBzcGFjZSBhZnRlciBtZXRob2QAU3BhbiBjYWxsYmFjayBlcnJvciBpbiBvbl9oZWFkZXJfZmllbGQAUGF1c2VkAEludmFsaWQgd29yZCBlbmNvdW50ZXJlZABJbnZhbGlkIG1ldGhvZCBlbmNvdW50ZXJlZABVbmV4cGVjdGVkIGNoYXIgaW4gdXJsIHNjaGVtYQBSZXF1ZXN0IGhhcyBpbnZhbGlkIGBUcmFuc2Zlci1FbmNvZGluZ2AAU1dJVENIX1BST1hZAFVTRV9QUk9YWQBNS0FDVElWSVRZAFVOUFJPQ0VTU0FCTEVfRU5USVRZAENPUFkATU9WRURfUEVSTUFORU5UTFkAVE9PX0VBUkxZAE5PVElGWQBGQUlMRURfREVQRU5ERU5DWQBCQURfR0FURVdBWQBQTEFZAFBVVABDSEVDS09VVABHQVRFV0FZX1RJTUVPVVQAUkVRVUVTVF9USU1FT1VUAE5FVFdPUktfQ09OTkVDVF9USU1FT1VUAENPTk5FQ1RJT05fVElNRU9VVABMT0dJTl9USU1FT1VUAE5FVFdPUktfUkVBRF9USU1FT1VUAFBPU1QATUlTRElSRUNURURfUkVRVUVTVABDTElFTlRfQ0xPU0VEX1JFUVVFU1QAQ0xJRU5UX0NMT1NFRF9MT0FEX0JBTEFOQ0VEX1JFUVVFU1QAQkFEX1JFUVVFU1QASFRUUF9SRVFVRVNUX1NFTlRfVE9fSFRUUFNfUE9SVABSRVBPUlQASU1fQV9URUFQT1QAUkVTRVRfQ09OVEVOVABOT19DT05URU5UAFBBUlRJQUxfQ09OVEVOVABIUEVfSU5WQUxJRF9DT05TVEFOVABIUEVfQ0JfUkVTRVQAR0VUAEhQRV9TVFJJQ1QAQ09ORkxJQ1QAVEVNUE9SQVJZX1JFRElSRUNUAFBFUk1BTkVOVF9SRURJUkVDVABDT05ORUNUAE1VTFRJX1NUQVRVUwBIUEVfSU5WQUxJRF9TVEFUVVMAVE9PX01BTllfUkVRVUVTVFMARUFSTFlfSElOVFMAVU5BVkFJTEFCTEVfRk9SX0xFR0FMX1JFQVNPTlMAT1BUSU9OUwBTV0lUQ0hJTkdfUFJPVE9DT0xTAFZBUklBTlRfQUxTT19ORUdPVElBVEVTAE1VTFRJUExFX0NIT0lDRVMASU5URVJOQUxfU0VSVkVSX0VSUk9SAFdFQl9TRVJWRVJfVU5LTk9XTl9FUlJPUgBSQUlMR1VOX0VSUk9SAElERU5USVRZX1BST1ZJREVSX0FVVEhFTlRJQ0FUSU9OX0VSUk9SAFNTTF9DRVJUSUZJQ0FURV9FUlJPUgBJTlZBTElEX1hfRk9SV0FSREVEX0ZPUgBTRVRfUEFSQU1FVEVSAEdFVF9QQVJBTUVURVIASFBFX1VTRVIAU0VFX09USEVSAEhQRV9DQl9DSFVOS19IRUFERVIATUtDQUxFTkRBUgBTRVRVUABXRUJfU0VSVkVSX0lTX0RPV04AVEVBUkRPV04ASFBFX0NMT1NFRF9DT05ORUNUSU9OAEhFVVJJU1RJQ19FWFBJUkFUSU9OAERJU0NPTk5FQ1RFRF9PUEVSQVRJT04ATk9OX0FVVEhPUklUQVRJVkVfSU5GT1JNQVRJT04ASFBFX0lOVkFMSURfVkVSU0lPTgBIUEVfQ0JfTUVTU0FHRV9CRUdJTgBTSVRFX0lTX0ZST1pFTgBIUEVfSU5WQUxJRF9IRUFERVJfVE9LRU4ASU5WQUxJRF9UT0tFTgBGT1JCSURERU4ARU5IQU5DRV9ZT1VSX0NBTE0ASFBFX0lOVkFMSURfVVJMAEJMT0NLRURfQllfUEFSRU5UQUxfQ09OVFJPTABNS0NPTABBQ0wASFBFX0lOVEVSTkFMAFJFUVVFU1RfSEVBREVSX0ZJRUxEU19UT09fTEFSR0VfVU5PRkZJQ0lBTABIUEVfT0sAVU5MSU5LAFVOTE9DSwBQUkkAUkVUUllfV0lUSABIUEVfSU5WQUxJRF9DT05URU5UX0xFTkdUSABIUEVfVU5FWFBFQ1RFRF9DT05URU5UX0xFTkdUSABGTFVTSABQUk9QUEFUQ0gATS1TRUFSQ0gAVVJJX1RPT19MT05HAFBST0NFU1NJTkcATUlTQ0VMTEFORU9VU19QRVJTSVNURU5UX1dBUk5JTkcATUlTQ0VMTEFORU9VU19XQVJOSU5HAEhQRV9JTlZBTElEX1RSQU5TRkVSX0VOQ09ESU5HAEV4cGVjdGVkIENSTEYASFBFX0lOVkFMSURfQ0hVTktfU0laRQBNT1ZFAENPTlRJTlVFAEhQRV9DQl9TVEFUVVNfQ09NUExFVEUASFBFX0NCX0hFQURFUlNfQ09NUExFVEUASFBFX0NCX1ZFUlNJT05fQ09NUExFVEUASFBFX0NCX1VSTF9DT01QTEVURQBIUEVfQ0JfQ0hVTktfQ09NUExFVEUASFBFX0NCX0hFQURFUl9WQUxVRV9DT01QTEVURQBIUEVfQ0JfQ0hVTktfRVhURU5TSU9OX1ZBTFVFX0NPTVBMRVRFAEhQRV9DQl9DSFVOS19FWFRFTlNJT05fTkFNRV9DT01QTEVURQBIUEVfQ0JfTUVTU0FHRV9DT01QTEVURQBIUEVfQ0JfTUVUSE9EX0NPTVBMRVRFAEhQRV9DQl9IRUFERVJfRklFTERfQ09NUExFVEUAREVMRVRFAEhQRV9JTlZBTElEX0VPRl9TVEFURQBJTlZBTElEX1NTTF9DRVJUSUZJQ0FURQBQQVVTRQBOT19SRVNQT05TRQBVTlNVUFBPUlRFRF9NRURJQV9UWVBFAEdPTkUATk9UX0FDQ0VQVEFCTEUAU0VSVklDRV9VTkFWQUlMQUJMRQBSQU5HRV9OT1RfU0FUSVNGSUFCTEUAT1JJR0lOX0lTX1VOUkVBQ0hBQkxFAFJFU1BPTlNFX0lTX1NUQUxFAFBVUkdFAE1FUkdFAFJFUVVFU1RfSEVBREVSX0ZJRUxEU19UT09fTEFSR0UAUkVRVUVTVF9IRUFERVJfVE9PX0xBUkdFAFBBWUxPQURfVE9PX0xBUkdFAElOU1VGRklDSUVOVF9TVE9SQUdFAEhQRV9QQVVTRURfVVBHUkFERQBIUEVfUEFVU0VEX0gyX1VQR1JBREUAU09VUkNFAEFOTk9VTkNFAFRSQUNFAEhQRV9VTkVYUEVDVEVEX1NQQUNFAERFU0NSSUJFAFVOU1VCU0NSSUJFAFJFQ09SRABIUEVfSU5WQUxJRF9NRVRIT0QATk9UX0ZPVU5EAFBST1BGSU5EAFVOQklORABSRUJJTkQAVU5BVVRIT1JJWkVEAE1FVEhPRF9OT1RfQUxMT1dFRABIVFRQX1ZFUlNJT05fTk9UX1NVUFBPUlRFRABBTFJFQURZX1JFUE9SVEVEAEFDQ0VQVEVEAE5PVF9JTVBMRU1FTlRFRABMT09QX0RFVEVDVEVEAEhQRV9DUl9FWFBFQ1RFRABIUEVfTEZfRVhQRUNURUQAQ1JFQVRFRABJTV9VU0VEAEhQRV9QQVVTRUQAVElNRU9VVF9PQ0NVUkVEAFBBWU1FTlRfUkVRVUlSRUQAUFJFQ09ORElUSU9OX1JFUVVJUkVEAFBST1hZX0FVVEhFTlRJQ0FUSU9OX1JFUVVJUkVEAE5FVFdPUktfQVVUSEVOVElDQVRJT05fUkVRVUlSRUQATEVOR1RIX1JFUVVJUkVEAFNTTF9DRVJUSUZJQ0FURV9SRVFVSVJFRABVUEdSQURFX1JFUVVJUkVEAFBBR0VfRVhQSVJFRABQUkVDT05ESVRJT05fRkFJTEVEAEVYUEVDVEFUSU9OX0ZBSUxFRABSRVZBTElEQVRJT05fRkFJTEVEAFNTTF9IQU5EU0hBS0VfRkFJTEVEAExPQ0tFRABUUkFOU0ZPUk1BVElPTl9BUFBMSUVEAE5PVF9NT0RJRklFRABOT1RfRVhURU5ERUQAQkFORFdJRFRIX0xJTUlUX0VYQ0VFREVEAFNJVEVfSVNfT1ZFUkxPQURFRABIRUFEAEV4cGVjdGVkIEhUVFAvAABeEwAAJhMAADAQAADwFwAAnRMAABUSAAA5FwAA8BIAAAoQAAB1EgAArRIAAIITAABPFAAAfxAAAKAVAAAjFAAAiRIAAIsUAABNFQAA1BEAAM8UAAAQGAAAyRYAANwWAADBEQAA4BcAALsUAAB0FAAAfBUAAOUUAAAIFwAAHxAAAGUVAACjFAAAKBUAAAIVAACZFQAALBAAAIsZAABPDwAA1A4AAGoQAADOEAAAAhcAAIkOAABuEwAAHBMAAGYUAABWFwAAwRMAAM0TAABsEwAAaBcAAGYXAABfFwAAIhMAAM4PAABpDgAA2A4AAGMWAADLEwAAqg4AACgXAAAmFwAAxRMAAF0WAADoEQAAZxMAAGUTAADyFgAAcxMAAB0XAAD5FgAA8xEAAM8OAADOFQAADBIAALMRAAClEQAAYRAAADIXAAC7EwAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAgEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAgMCAgICAgAAAgIAAgIAAgICAgICAgICAgAEAAAAAAACAgICAgICAgICAgICAgICAgICAgICAgICAgAAAAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAAIAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAIAAgICAgIAAAICAAICAAICAgICAgICAgIAAwAEAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgACAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABsb3NlZWVwLWFsaXZlAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQEBAQEBAQEBAgEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQFjaHVua2VkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQABAQEBAQAAAQEAAQEAAQEBAQEBAQEBAQAAAAAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGVjdGlvbmVudC1sZW5ndGhvbnJveHktY29ubmVjdGlvbgAAAAAAAAAAAAAAAAAAAHJhbnNmZXItZW5jb2RpbmdwZ3JhZGUNCg0KDQpTTQ0KDQpUVFAvQ0UvVFNQLwAAAAAAAAAAAAAAAAECAAEDAAAAAAAAAAAAAAAAAAAAAAAABAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAAAAAABAgABAwAAAAAAAAAAAAAAAAAAAAAAAAQBAQUBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAAAAAAAAAAAQAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAAAAAAAAAABAAACAAAAAAAAAAAAAAAAAAAAAAAAAwQAAAQEBAQEBAQEBAQEBQQEBAQEBAQEBAQEBAAEAAYHBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQABAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAQAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAEAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAgAAAAACAAAAAAAAAAAAAAAAAAAAAAADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE5PVU5DRUVDS09VVE5FQ1RFVEVDUklCRUxVU0hFVEVBRFNFQVJDSFJHRUNUSVZJVFlMRU5EQVJWRU9USUZZUFRJT05TQ0hTRUFZU1RBVENIR0VPUkRJUkVDVE9SVFJDSFBBUkFNRVRFUlVSQ0VCU0NSSUJFQVJET1dOQUNFSU5ETktDS1VCU0NSSUJFSFRUUC9BRFRQLw=='
@@ -60956,7 +65487,7 @@ module.exports = 'AGFzbQEAAAABMAhgAX8Bf2ADf39/AX9gBH9/f38Bf2AAAGADf39/AGABfwBgAn
 
 /***/ }),
 
-/***/ 8675:
+/***/ 6663:
 /***/ ((__unused_webpack_module, exports) => {
 
 
@@ -60977,13 +65508,13 @@ exports.enumToMap = enumToMap;
 
 /***/ }),
 
-/***/ 1045:
+/***/ 425:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { kClients } = __nccwpck_require__(7621)
-const Agent = __nccwpck_require__(8551)
+const { kClients } = __nccwpck_require__(3283)
+const Agent = __nccwpck_require__(8854)
 const {
   kAgent,
   kMockAgentSet,
@@ -60994,14 +65525,14 @@ const {
   kGetNetConnect,
   kOptions,
   kFactory
-} = __nccwpck_require__(6978)
-const MockClient = __nccwpck_require__(9103)
-const MockPool = __nccwpck_require__(1153)
-const { matchValue, buildMockOptions } = __nccwpck_require__(8121)
-const { InvalidArgumentError, UndiciError } = __nccwpck_require__(3501)
-const Dispatcher = __nccwpck_require__(3954)
-const Pluralizer = __nccwpck_require__(2799)
-const PendingInterceptorsFormatter = __nccwpck_require__(7175)
+} = __nccwpck_require__(3767)
+const MockClient = __nccwpck_require__(7070)
+const MockPool = __nccwpck_require__(3535)
+const { matchValue, buildMockOptions } = __nccwpck_require__(9998)
+const { InvalidArgumentError, UndiciError } = __nccwpck_require__(1641)
+const Dispatcher = __nccwpck_require__(289)
+const Pluralizer = __nccwpck_require__(3859)
+const PendingInterceptorsFormatter = __nccwpck_require__(7140)
 
 class FakeWeakRef {
   constructor (value) {
@@ -61155,14 +65686,14 @@ module.exports = MockAgent
 
 /***/ }),
 
-/***/ 9103:
+/***/ 7070:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const { promisify } = __nccwpck_require__(3837)
-const Client = __nccwpck_require__(8352)
-const { buildMockDispatch } = __nccwpck_require__(8121)
+const Client = __nccwpck_require__(8962)
+const { buildMockDispatch } = __nccwpck_require__(9998)
 const {
   kDispatches,
   kMockAgent,
@@ -61171,10 +65702,10 @@ const {
   kOrigin,
   kOriginalDispatch,
   kConnected
-} = __nccwpck_require__(6978)
-const { MockInterceptor } = __nccwpck_require__(448)
-const Symbols = __nccwpck_require__(7621)
-const { InvalidArgumentError } = __nccwpck_require__(3501)
+} = __nccwpck_require__(3767)
+const { MockInterceptor } = __nccwpck_require__(963)
+const Symbols = __nccwpck_require__(3283)
+const { InvalidArgumentError } = __nccwpck_require__(1641)
 
 /**
  * MockClient provides an API that extends the Client to influence the mockDispatches.
@@ -61221,12 +65752,12 @@ module.exports = MockClient
 
 /***/ }),
 
-/***/ 5458:
+/***/ 7589:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { UndiciError } = __nccwpck_require__(3501)
+const { UndiciError } = __nccwpck_require__(1641)
 
 class MockNotMatchedError extends UndiciError {
   constructor (message) {
@@ -61245,12 +65776,12 @@ module.exports = {
 
 /***/ }),
 
-/***/ 448:
+/***/ 963:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { getResponseData, buildKey, addMockDispatch } = __nccwpck_require__(8121)
+const { getResponseData, buildKey, addMockDispatch } = __nccwpck_require__(9998)
 const {
   kDispatches,
   kDispatchKey,
@@ -61258,9 +65789,9 @@ const {
   kDefaultTrailers,
   kContentLength,
   kMockDispatch
-} = __nccwpck_require__(6978)
-const { InvalidArgumentError } = __nccwpck_require__(3501)
-const { buildURL } = __nccwpck_require__(9647)
+} = __nccwpck_require__(3767)
+const { InvalidArgumentError } = __nccwpck_require__(1641)
+const { buildURL } = __nccwpck_require__(2355)
 
 /**
  * Defines the scope API for an interceptor reply
@@ -61458,14 +65989,14 @@ module.exports.MockScope = MockScope
 
 /***/ }),
 
-/***/ 1153:
+/***/ 3535:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const { promisify } = __nccwpck_require__(3837)
-const Pool = __nccwpck_require__(9859)
-const { buildMockDispatch } = __nccwpck_require__(8121)
+const Pool = __nccwpck_require__(5115)
+const { buildMockDispatch } = __nccwpck_require__(9998)
 const {
   kDispatches,
   kMockAgent,
@@ -61474,10 +66005,10 @@ const {
   kOrigin,
   kOriginalDispatch,
   kConnected
-} = __nccwpck_require__(6978)
-const { MockInterceptor } = __nccwpck_require__(448)
-const Symbols = __nccwpck_require__(7621)
-const { InvalidArgumentError } = __nccwpck_require__(3501)
+} = __nccwpck_require__(3767)
+const { MockInterceptor } = __nccwpck_require__(963)
+const Symbols = __nccwpck_require__(3283)
+const { InvalidArgumentError } = __nccwpck_require__(1641)
 
 /**
  * MockPool provides an API that extends the Pool to influence the mockDispatches.
@@ -61524,7 +66055,7 @@ module.exports = MockPool
 
 /***/ }),
 
-/***/ 6978:
+/***/ 3767:
 /***/ ((module) => {
 
 
@@ -61554,20 +66085,20 @@ module.exports = {
 
 /***/ }),
 
-/***/ 8121:
+/***/ 9998:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { MockNotMatchedError } = __nccwpck_require__(5458)
+const { MockNotMatchedError } = __nccwpck_require__(7589)
 const {
   kDispatches,
   kMockAgent,
   kOriginalDispatch,
   kOrigin,
   kGetNetConnect
-} = __nccwpck_require__(6978)
-const { buildURL, nop } = __nccwpck_require__(9647)
+} = __nccwpck_require__(3767)
+const { buildURL, nop } = __nccwpck_require__(2355)
 const { STATUS_CODES } = __nccwpck_require__(3685)
 const {
   types: {
@@ -61912,7 +66443,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 7175:
+/***/ 7140:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -61959,7 +66490,7 @@ module.exports = class PendingInterceptorsFormatter {
 
 /***/ }),
 
-/***/ 2799:
+/***/ 3859:
 /***/ ((module) => {
 
 
@@ -61995,7 +66526,7 @@ module.exports = class Pluralizer {
 
 /***/ }),
 
-/***/ 4680:
+/***/ 6631:
 /***/ ((module) => {
 
 /* eslint-disable */
@@ -62119,15 +66650,15 @@ module.exports = class FixedQueue {
 
 /***/ }),
 
-/***/ 5411:
+/***/ 2903:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const DispatcherBase = __nccwpck_require__(6775)
-const FixedQueue = __nccwpck_require__(4680)
-const { kConnected, kSize, kRunning, kPending, kQueued, kBusy, kFree, kUrl, kClose, kDestroy, kDispatch } = __nccwpck_require__(7621)
-const PoolStats = __nccwpck_require__(8294)
+const DispatcherBase = __nccwpck_require__(4681)
+const FixedQueue = __nccwpck_require__(6631)
+const { kConnected, kSize, kRunning, kPending, kQueued, kBusy, kFree, kUrl, kClose, kDestroy, kDispatch } = __nccwpck_require__(3283)
+const PoolStats = __nccwpck_require__(5507)
 
 const kClients = Symbol('clients')
 const kNeedDrain = Symbol('needDrain')
@@ -62320,10 +66851,10 @@ module.exports = {
 
 /***/ }),
 
-/***/ 8294:
+/***/ 5507:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-const { kFree, kConnected, kPending, kQueued, kRunning, kSize } = __nccwpck_require__(7621)
+const { kFree, kConnected, kPending, kQueued, kRunning, kSize } = __nccwpck_require__(3283)
 const kPool = Symbol('pool')
 
 class PoolStats {
@@ -62361,7 +66892,7 @@ module.exports = PoolStats
 
 /***/ }),
 
-/***/ 9859:
+/***/ 5115:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -62372,14 +66903,14 @@ const {
   kNeedDrain,
   kAddClient,
   kGetDispatcher
-} = __nccwpck_require__(5411)
-const Client = __nccwpck_require__(8352)
+} = __nccwpck_require__(2903)
+const Client = __nccwpck_require__(8962)
 const {
   InvalidArgumentError
-} = __nccwpck_require__(3501)
-const util = __nccwpck_require__(9647)
-const { kUrl, kInterceptors } = __nccwpck_require__(7621)
-const buildConnector = __nccwpck_require__(6840)
+} = __nccwpck_require__(1641)
+const util = __nccwpck_require__(2355)
+const { kUrl, kInterceptors } = __nccwpck_require__(3283)
+const buildConnector = __nccwpck_require__(2113)
 
 const kOptions = Symbol('options')
 const kConnections = Symbol('connections')
@@ -62439,6 +66970,20 @@ class Pool extends PoolBase {
       ? { ...options.interceptors }
       : undefined
     this[kFactory] = factory
+
+    this.on('connectionError', (origin, targets, error) => {
+      // If a connection error occurs, we remove the client from the pool,
+      // and emit a connectionError event. They will not be re-used.
+      // Fixes https://github.com/nodejs/undici/issues/3895
+      for (const target of targets) {
+        // Do not use kRemoveClient here, as it will close the client,
+        // but the client cannot be closed in this state.
+        const idx = this[kClients].indexOf(target)
+        if (idx !== -1) {
+          this[kClients].splice(idx, 1)
+        }
+      }
+    })
   }
 
   [kGetDispatcher] () {
@@ -62462,18 +67007,18 @@ module.exports = Pool
 
 /***/ }),
 
-/***/ 7929:
+/***/ 2405:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { kProxy, kClose, kDestroy, kInterceptors } = __nccwpck_require__(7621)
+const { kProxy, kClose, kDestroy, kInterceptors } = __nccwpck_require__(3283)
 const { URL } = __nccwpck_require__(7310)
-const Agent = __nccwpck_require__(8551)
-const Pool = __nccwpck_require__(9859)
-const DispatcherBase = __nccwpck_require__(6775)
-const { InvalidArgumentError, RequestAbortedError } = __nccwpck_require__(3501)
-const buildConnector = __nccwpck_require__(6840)
+const Agent = __nccwpck_require__(8854)
+const Pool = __nccwpck_require__(5115)
+const DispatcherBase = __nccwpck_require__(4681)
+const { InvalidArgumentError, RequestAbortedError } = __nccwpck_require__(1641)
+const buildConnector = __nccwpck_require__(2113)
 
 const kAgent = Symbol('proxy agent')
 const kClient = Symbol('proxy client')
@@ -62658,7 +67203,7 @@ module.exports = ProxyAgent
 
 /***/ }),
 
-/***/ 8748:
+/***/ 6562:
 /***/ ((module) => {
 
 
@@ -62762,26 +67307,26 @@ module.exports = {
 
 /***/ }),
 
-/***/ 3592:
+/***/ 9893:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const diagnosticsChannel = __nccwpck_require__(7643)
-const { uid, states } = __nccwpck_require__(7479)
+const { uid, states } = __nccwpck_require__(5929)
 const {
   kReadyState,
   kSentClose,
   kByteParser,
   kReceivedClose
-} = __nccwpck_require__(6949)
-const { fireEvent, failWebsocketConnection } = __nccwpck_require__(4603)
-const { CloseEvent } = __nccwpck_require__(9134)
-const { makeRequest } = __nccwpck_require__(9787)
-const { fetching } = __nccwpck_require__(3254)
-const { Headers } = __nccwpck_require__(6909)
-const { getGlobalDispatcher } = __nccwpck_require__(5683)
-const { kHeadersList } = __nccwpck_require__(7621)
+} = __nccwpck_require__(3769)
+const { fireEvent, failWebsocketConnection } = __nccwpck_require__(2408)
+const { CloseEvent } = __nccwpck_require__(5341)
+const { makeRequest } = __nccwpck_require__(7234)
+const { fetching } = __nccwpck_require__(4111)
+const { Headers } = __nccwpck_require__(434)
+const { getGlobalDispatcher } = __nccwpck_require__(8561)
+const { kHeadersList } = __nccwpck_require__(3283)
 
 const channels = {}
 channels.open = diagnosticsChannel.channel('undici:websocket:open')
@@ -63060,7 +67605,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 7479:
+/***/ 5929:
 /***/ ((module) => {
 
 
@@ -63118,13 +67663,13 @@ module.exports = {
 
 /***/ }),
 
-/***/ 9134:
+/***/ 5341:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { webidl } = __nccwpck_require__(3721)
-const { kEnumerableProperty } = __nccwpck_require__(9647)
+const { webidl } = __nccwpck_require__(7914)
+const { kEnumerableProperty } = __nccwpck_require__(2355)
 const { MessagePort } = __nccwpck_require__(1267)
 
 /**
@@ -63428,12 +67973,12 @@ module.exports = {
 
 /***/ }),
 
-/***/ 5156:
+/***/ 1664:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { maxUnsigned16Bit } = __nccwpck_require__(7479)
+const { maxUnsigned16Bit } = __nccwpck_require__(5929)
 
 /** @type {import('crypto')} */
 let crypto
@@ -63508,17 +68053,17 @@ module.exports = {
 
 /***/ }),
 
-/***/ 4944:
+/***/ 9032:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
 const { Writable } = __nccwpck_require__(2781)
 const diagnosticsChannel = __nccwpck_require__(7643)
-const { parserStates, opcodes, states, emptyBuffer } = __nccwpck_require__(7479)
-const { kReadyState, kSentClose, kResponse, kReceivedClose } = __nccwpck_require__(6949)
-const { isValidStatusCode, failWebsocketConnection, websocketMessageReceived } = __nccwpck_require__(4603)
-const { WebsocketFrameSend } = __nccwpck_require__(5156)
+const { parserStates, opcodes, states, emptyBuffer } = __nccwpck_require__(5929)
+const { kReadyState, kSentClose, kResponse, kReceivedClose } = __nccwpck_require__(3769)
+const { isValidStatusCode, failWebsocketConnection, websocketMessageReceived } = __nccwpck_require__(2408)
+const { WebsocketFrameSend } = __nccwpck_require__(1664)
 
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -63859,7 +68404,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 6949:
+/***/ 3769:
 /***/ ((module) => {
 
 
@@ -63878,14 +68423,14 @@ module.exports = {
 
 /***/ }),
 
-/***/ 4603:
+/***/ 2408:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { kReadyState, kController, kResponse, kBinaryType, kWebSocketURL } = __nccwpck_require__(6949)
-const { states, opcodes } = __nccwpck_require__(7479)
-const { MessageEvent, ErrorEvent } = __nccwpck_require__(9134)
+const { kReadyState, kController, kResponse, kBinaryType, kWebSocketURL } = __nccwpck_require__(3769)
+const { states, opcodes } = __nccwpck_require__(5929)
+const { MessageEvent, ErrorEvent } = __nccwpck_require__(5341)
 
 /* globals Blob */
 
@@ -64085,16 +68630,16 @@ module.exports = {
 
 /***/ }),
 
-/***/ 553:
+/***/ 1423:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
-const { webidl } = __nccwpck_require__(3721)
-const { DOMException } = __nccwpck_require__(756)
-const { URLSerializer } = __nccwpck_require__(6932)
-const { getGlobalOrigin } = __nccwpck_require__(128)
-const { staticPropertyDescriptors, states, opcodes, emptyBuffer } = __nccwpck_require__(7479)
+const { webidl } = __nccwpck_require__(7914)
+const { DOMException } = __nccwpck_require__(7033)
+const { URLSerializer } = __nccwpck_require__(5723)
+const { getGlobalOrigin } = __nccwpck_require__(3765)
+const { staticPropertyDescriptors, states, opcodes, emptyBuffer } = __nccwpck_require__(5929)
 const {
   kWebSocketURL,
   kReadyState,
@@ -64103,13 +68648,13 @@ const {
   kResponse,
   kSentClose,
   kByteParser
-} = __nccwpck_require__(6949)
-const { isEstablished, isClosing, isValidSubprotocol, failWebsocketConnection, fireEvent } = __nccwpck_require__(4603)
-const { establishWebSocketConnection } = __nccwpck_require__(3592)
-const { WebsocketFrameSend } = __nccwpck_require__(5156)
-const { ByteParser } = __nccwpck_require__(4944)
-const { kEnumerableProperty, isBlobLike } = __nccwpck_require__(9647)
-const { getGlobalDispatcher } = __nccwpck_require__(5683)
+} = __nccwpck_require__(3769)
+const { isEstablished, isClosing, isValidSubprotocol, failWebsocketConnection, fireEvent } = __nccwpck_require__(2408)
+const { establishWebSocketConnection } = __nccwpck_require__(9893)
+const { WebsocketFrameSend } = __nccwpck_require__(1664)
+const { ByteParser } = __nccwpck_require__(9032)
+const { kEnumerableProperty, isBlobLike } = __nccwpck_require__(2355)
+const { getGlobalDispatcher } = __nccwpck_require__(8561)
 const { types } = __nccwpck_require__(3837)
 
 let experimentalWarned = false
@@ -64758,852 +69303,6 @@ exports.getUserAgent = getUserAgent;
 
 /***/ }),
 
-/***/ 8493:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-var v1 = __nccwpck_require__(1311);
-var v4 = __nccwpck_require__(7191);
-
-var uuid = v4;
-uuid.v1 = v1;
-uuid.v4 = v4;
-
-module.exports = uuid;
-
-
-/***/ }),
-
-/***/ 2937:
-/***/ ((module) => {
-
-/**
- * Convert array of 16 byte values to UUID string format of the form:
- * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
- */
-var byteToHex = [];
-for (var i = 0; i < 256; ++i) {
-  byteToHex[i] = (i + 0x100).toString(16).substr(1);
-}
-
-function bytesToUuid(buf, offset) {
-  var i = offset || 0;
-  var bth = byteToHex;
-  // join used to fix memory issue caused by concatenation: https://bugs.chromium.org/p/v8/issues/detail?id=3175#c4
-  return ([
-    bth[buf[i++]], bth[buf[i++]],
-    bth[buf[i++]], bth[buf[i++]], '-',
-    bth[buf[i++]], bth[buf[i++]], '-',
-    bth[buf[i++]], bth[buf[i++]], '-',
-    bth[buf[i++]], bth[buf[i++]], '-',
-    bth[buf[i++]], bth[buf[i++]],
-    bth[buf[i++]], bth[buf[i++]],
-    bth[buf[i++]], bth[buf[i++]]
-  ]).join('');
-}
-
-module.exports = bytesToUuid;
-
-
-/***/ }),
-
-/***/ 5403:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-// Unique ID creation requires a high quality random # generator.  In node.js
-// this is pretty straight-forward - we use the crypto API.
-
-var crypto = __nccwpck_require__(6113);
-
-module.exports = function nodeRNG() {
-  return crypto.randomBytes(16);
-};
-
-
-/***/ }),
-
-/***/ 1311:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-var rng = __nccwpck_require__(5403);
-var bytesToUuid = __nccwpck_require__(2937);
-
-// **`v1()` - Generate time-based UUID**
-//
-// Inspired by https://github.com/LiosK/UUID.js
-// and http://docs.python.org/library/uuid.html
-
-var _nodeId;
-var _clockseq;
-
-// Previous uuid creation time
-var _lastMSecs = 0;
-var _lastNSecs = 0;
-
-// See https://github.com/uuidjs/uuid for API details
-function v1(options, buf, offset) {
-  var i = buf && offset || 0;
-  var b = buf || [];
-
-  options = options || {};
-  var node = options.node || _nodeId;
-  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
-
-  // node and clockseq need to be initialized to random values if they're not
-  // specified.  We do this lazily to minimize issues related to insufficient
-  // system entropy.  See #189
-  if (node == null || clockseq == null) {
-    var seedBytes = rng();
-    if (node == null) {
-      // Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
-      node = _nodeId = [
-        seedBytes[0] | 0x01,
-        seedBytes[1], seedBytes[2], seedBytes[3], seedBytes[4], seedBytes[5]
-      ];
-    }
-    if (clockseq == null) {
-      // Per 4.2.2, randomize (14 bit) clockseq
-      clockseq = _clockseq = (seedBytes[6] << 8 | seedBytes[7]) & 0x3fff;
-    }
-  }
-
-  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
-  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
-  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
-  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
-  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
-
-  // Per 4.2.1.2, use count of uuid's generated during the current clock
-  // cycle to simulate higher resolution clock
-  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
-
-  // Time since last uuid creation (in msecs)
-  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
-
-  // Per 4.2.1.2, Bump clockseq on clock regression
-  if (dt < 0 && options.clockseq === undefined) {
-    clockseq = clockseq + 1 & 0x3fff;
-  }
-
-  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
-  // time interval
-  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
-    nsecs = 0;
-  }
-
-  // Per 4.2.1.2 Throw error if too many uuids are requested
-  if (nsecs >= 10000) {
-    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
-  }
-
-  _lastMSecs = msecs;
-  _lastNSecs = nsecs;
-  _clockseq = clockseq;
-
-  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
-  msecs += 12219292800000;
-
-  // `time_low`
-  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
-  b[i++] = tl >>> 24 & 0xff;
-  b[i++] = tl >>> 16 & 0xff;
-  b[i++] = tl >>> 8 & 0xff;
-  b[i++] = tl & 0xff;
-
-  // `time_mid`
-  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
-  b[i++] = tmh >>> 8 & 0xff;
-  b[i++] = tmh & 0xff;
-
-  // `time_high_and_version`
-  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
-  b[i++] = tmh >>> 16 & 0xff;
-
-  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
-  b[i++] = clockseq >>> 8 | 0x80;
-
-  // `clock_seq_low`
-  b[i++] = clockseq & 0xff;
-
-  // `node`
-  for (var n = 0; n < 6; ++n) {
-    b[i + n] = node[n];
-  }
-
-  return buf ? buf : bytesToUuid(b);
-}
-
-module.exports = v1;
-
-
-/***/ }),
-
-/***/ 7191:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-var rng = __nccwpck_require__(5403);
-var bytesToUuid = __nccwpck_require__(2937);
-
-function v4(options, buf, offset) {
-  var i = buf && offset || 0;
-
-  if (typeof(options) == 'string') {
-    buf = options === 'binary' ? new Array(16) : null;
-    options = null;
-  }
-  options = options || {};
-
-  var rnds = options.random || (options.rng || rng)();
-
-  // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
-  rnds[6] = (rnds[6] & 0x0f) | 0x40;
-  rnds[8] = (rnds[8] & 0x3f) | 0x80;
-
-  // Copy bytes to buffer, if provided
-  if (buf) {
-    for (var ii = 0; ii < 16; ++ii) {
-      buf[i + ii] = rnds[ii];
-    }
-  }
-
-  return buf || bytesToUuid(rnds);
-}
-
-module.exports = v4;
-
-
-/***/ }),
-
-/***/ 7338:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-Object.defineProperty(exports, "v1", ({
-  enumerable: true,
-  get: function () {
-    return _v.default;
-  }
-}));
-Object.defineProperty(exports, "v3", ({
-  enumerable: true,
-  get: function () {
-    return _v2.default;
-  }
-}));
-Object.defineProperty(exports, "v4", ({
-  enumerable: true,
-  get: function () {
-    return _v3.default;
-  }
-}));
-Object.defineProperty(exports, "v5", ({
-  enumerable: true,
-  get: function () {
-    return _v4.default;
-  }
-}));
-Object.defineProperty(exports, "NIL", ({
-  enumerable: true,
-  get: function () {
-    return _nil.default;
-  }
-}));
-Object.defineProperty(exports, "version", ({
-  enumerable: true,
-  get: function () {
-    return _version.default;
-  }
-}));
-Object.defineProperty(exports, "validate", ({
-  enumerable: true,
-  get: function () {
-    return _validate.default;
-  }
-}));
-Object.defineProperty(exports, "stringify", ({
-  enumerable: true,
-  get: function () {
-    return _stringify.default;
-  }
-}));
-Object.defineProperty(exports, "parse", ({
-  enumerable: true,
-  get: function () {
-    return _parse.default;
-  }
-}));
-
-var _v = _interopRequireDefault(__nccwpck_require__(6101));
-
-var _v2 = _interopRequireDefault(__nccwpck_require__(9456));
-
-var _v3 = _interopRequireDefault(__nccwpck_require__(1071));
-
-var _v4 = _interopRequireDefault(__nccwpck_require__(8057));
-
-var _nil = _interopRequireDefault(__nccwpck_require__(7448));
-
-var _version = _interopRequireDefault(__nccwpck_require__(5530));
-
-var _validate = _interopRequireDefault(__nccwpck_require__(324));
-
-var _stringify = _interopRequireDefault(__nccwpck_require__(5284));
-
-var _parse = _interopRequireDefault(__nccwpck_require__(6067));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-/***/ }),
-
-/***/ 8612:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _crypto = _interopRequireDefault(__nccwpck_require__(6113));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-function md5(bytes) {
-  if (Array.isArray(bytes)) {
-    bytes = Buffer.from(bytes);
-  } else if (typeof bytes === 'string') {
-    bytes = Buffer.from(bytes, 'utf8');
-  }
-
-  return _crypto.default.createHash('md5').update(bytes).digest();
-}
-
-var _default = md5;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 7448:
-/***/ ((__unused_webpack_module, exports) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-var _default = '00000000-0000-0000-0000-000000000000';
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 6067:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _validate = _interopRequireDefault(__nccwpck_require__(324));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-function parse(uuid) {
-  if (!(0, _validate.default)(uuid)) {
-    throw TypeError('Invalid UUID');
-  }
-
-  let v;
-  const arr = new Uint8Array(16); // Parse ########-....-....-....-............
-
-  arr[0] = (v = parseInt(uuid.slice(0, 8), 16)) >>> 24;
-  arr[1] = v >>> 16 & 0xff;
-  arr[2] = v >>> 8 & 0xff;
-  arr[3] = v & 0xff; // Parse ........-####-....-....-............
-
-  arr[4] = (v = parseInt(uuid.slice(9, 13), 16)) >>> 8;
-  arr[5] = v & 0xff; // Parse ........-....-####-....-............
-
-  arr[6] = (v = parseInt(uuid.slice(14, 18), 16)) >>> 8;
-  arr[7] = v & 0xff; // Parse ........-....-....-####-............
-
-  arr[8] = (v = parseInt(uuid.slice(19, 23), 16)) >>> 8;
-  arr[9] = v & 0xff; // Parse ........-....-....-....-############
-  // (Use "/" to avoid 32-bit truncation when bit-shifting high-order bytes)
-
-  arr[10] = (v = parseInt(uuid.slice(24, 36), 16)) / 0x10000000000 & 0xff;
-  arr[11] = v / 0x100000000 & 0xff;
-  arr[12] = v >>> 24 & 0xff;
-  arr[13] = v >>> 16 & 0xff;
-  arr[14] = v >>> 8 & 0xff;
-  arr[15] = v & 0xff;
-  return arr;
-}
-
-var _default = parse;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 7610:
-/***/ ((__unused_webpack_module, exports) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-var _default = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 6750:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = rng;
-
-var _crypto = _interopRequireDefault(__nccwpck_require__(6113));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-const rnds8Pool = new Uint8Array(256); // # of random values to pre-allocate
-
-let poolPtr = rnds8Pool.length;
-
-function rng() {
-  if (poolPtr > rnds8Pool.length - 16) {
-    _crypto.default.randomFillSync(rnds8Pool);
-
-    poolPtr = 0;
-  }
-
-  return rnds8Pool.slice(poolPtr, poolPtr += 16);
-}
-
-/***/ }),
-
-/***/ 4920:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _crypto = _interopRequireDefault(__nccwpck_require__(6113));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-function sha1(bytes) {
-  if (Array.isArray(bytes)) {
-    bytes = Buffer.from(bytes);
-  } else if (typeof bytes === 'string') {
-    bytes = Buffer.from(bytes, 'utf8');
-  }
-
-  return _crypto.default.createHash('sha1').update(bytes).digest();
-}
-
-var _default = sha1;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 5284:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _validate = _interopRequireDefault(__nccwpck_require__(324));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-/**
- * Convert array of 16 byte values to UUID string format of the form:
- * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
- */
-const byteToHex = [];
-
-for (let i = 0; i < 256; ++i) {
-  byteToHex.push((i + 0x100).toString(16).substr(1));
-}
-
-function stringify(arr, offset = 0) {
-  // Note: Be careful editing this code!  It's been tuned for performance
-  // and works in ways you may not expect. See https://github.com/uuidjs/uuid/pull/434
-  const uuid = (byteToHex[arr[offset + 0]] + byteToHex[arr[offset + 1]] + byteToHex[arr[offset + 2]] + byteToHex[arr[offset + 3]] + '-' + byteToHex[arr[offset + 4]] + byteToHex[arr[offset + 5]] + '-' + byteToHex[arr[offset + 6]] + byteToHex[arr[offset + 7]] + '-' + byteToHex[arr[offset + 8]] + byteToHex[arr[offset + 9]] + '-' + byteToHex[arr[offset + 10]] + byteToHex[arr[offset + 11]] + byteToHex[arr[offset + 12]] + byteToHex[arr[offset + 13]] + byteToHex[arr[offset + 14]] + byteToHex[arr[offset + 15]]).toLowerCase(); // Consistency check for valid UUID.  If this throws, it's likely due to one
-  // of the following:
-  // - One or more input array values don't map to a hex octet (leading to
-  // "undefined" in the uuid)
-  // - Invalid input values for the RFC `version` or `variant` fields
-
-  if (!(0, _validate.default)(uuid)) {
-    throw TypeError('Stringified UUID is invalid');
-  }
-
-  return uuid;
-}
-
-var _default = stringify;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 6101:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _rng = _interopRequireDefault(__nccwpck_require__(6750));
-
-var _stringify = _interopRequireDefault(__nccwpck_require__(5284));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-// **`v1()` - Generate time-based UUID**
-//
-// Inspired by https://github.com/LiosK/UUID.js
-// and http://docs.python.org/library/uuid.html
-let _nodeId;
-
-let _clockseq; // Previous uuid creation time
-
-
-let _lastMSecs = 0;
-let _lastNSecs = 0; // See https://github.com/uuidjs/uuid for API details
-
-function v1(options, buf, offset) {
-  let i = buf && offset || 0;
-  const b = buf || new Array(16);
-  options = options || {};
-  let node = options.node || _nodeId;
-  let clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq; // node and clockseq need to be initialized to random values if they're not
-  // specified.  We do this lazily to minimize issues related to insufficient
-  // system entropy.  See #189
-
-  if (node == null || clockseq == null) {
-    const seedBytes = options.random || (options.rng || _rng.default)();
-
-    if (node == null) {
-      // Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
-      node = _nodeId = [seedBytes[0] | 0x01, seedBytes[1], seedBytes[2], seedBytes[3], seedBytes[4], seedBytes[5]];
-    }
-
-    if (clockseq == null) {
-      // Per 4.2.2, randomize (14 bit) clockseq
-      clockseq = _clockseq = (seedBytes[6] << 8 | seedBytes[7]) & 0x3fff;
-    }
-  } // UUID timestamps are 100 nano-second units since the Gregorian epoch,
-  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
-  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
-  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
-
-
-  let msecs = options.msecs !== undefined ? options.msecs : Date.now(); // Per 4.2.1.2, use count of uuid's generated during the current clock
-  // cycle to simulate higher resolution clock
-
-  let nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1; // Time since last uuid creation (in msecs)
-
-  const dt = msecs - _lastMSecs + (nsecs - _lastNSecs) / 10000; // Per 4.2.1.2, Bump clockseq on clock regression
-
-  if (dt < 0 && options.clockseq === undefined) {
-    clockseq = clockseq + 1 & 0x3fff;
-  } // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
-  // time interval
-
-
-  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
-    nsecs = 0;
-  } // Per 4.2.1.2 Throw error if too many uuids are requested
-
-
-  if (nsecs >= 10000) {
-    throw new Error("uuid.v1(): Can't create more than 10M uuids/sec");
-  }
-
-  _lastMSecs = msecs;
-  _lastNSecs = nsecs;
-  _clockseq = clockseq; // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
-
-  msecs += 12219292800000; // `time_low`
-
-  const tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
-  b[i++] = tl >>> 24 & 0xff;
-  b[i++] = tl >>> 16 & 0xff;
-  b[i++] = tl >>> 8 & 0xff;
-  b[i++] = tl & 0xff; // `time_mid`
-
-  const tmh = msecs / 0x100000000 * 10000 & 0xfffffff;
-  b[i++] = tmh >>> 8 & 0xff;
-  b[i++] = tmh & 0xff; // `time_high_and_version`
-
-  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
-
-  b[i++] = tmh >>> 16 & 0xff; // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
-
-  b[i++] = clockseq >>> 8 | 0x80; // `clock_seq_low`
-
-  b[i++] = clockseq & 0xff; // `node`
-
-  for (let n = 0; n < 6; ++n) {
-    b[i + n] = node[n];
-  }
-
-  return buf || (0, _stringify.default)(b);
-}
-
-var _default = v1;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 9456:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _v = _interopRequireDefault(__nccwpck_require__(9390));
-
-var _md = _interopRequireDefault(__nccwpck_require__(8612));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-const v3 = (0, _v.default)('v3', 0x30, _md.default);
-var _default = v3;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 9390:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = _default;
-exports.URL = exports.DNS = void 0;
-
-var _stringify = _interopRequireDefault(__nccwpck_require__(5284));
-
-var _parse = _interopRequireDefault(__nccwpck_require__(6067));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-function stringToBytes(str) {
-  str = unescape(encodeURIComponent(str)); // UTF8 escape
-
-  const bytes = [];
-
-  for (let i = 0; i < str.length; ++i) {
-    bytes.push(str.charCodeAt(i));
-  }
-
-  return bytes;
-}
-
-const DNS = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
-exports.DNS = DNS;
-const URL = '6ba7b811-9dad-11d1-80b4-00c04fd430c8';
-exports.URL = URL;
-
-function _default(name, version, hashfunc) {
-  function generateUUID(value, namespace, buf, offset) {
-    if (typeof value === 'string') {
-      value = stringToBytes(value);
-    }
-
-    if (typeof namespace === 'string') {
-      namespace = (0, _parse.default)(namespace);
-    }
-
-    if (namespace.length !== 16) {
-      throw TypeError('Namespace must be array-like (16 iterable integer values, 0-255)');
-    } // Compute hash of namespace and value, Per 4.3
-    // Future: Use spread syntax when supported on all platforms, e.g. `bytes =
-    // hashfunc([...namespace, ... value])`
-
-
-    let bytes = new Uint8Array(16 + value.length);
-    bytes.set(namespace);
-    bytes.set(value, namespace.length);
-    bytes = hashfunc(bytes);
-    bytes[6] = bytes[6] & 0x0f | version;
-    bytes[8] = bytes[8] & 0x3f | 0x80;
-
-    if (buf) {
-      offset = offset || 0;
-
-      for (let i = 0; i < 16; ++i) {
-        buf[offset + i] = bytes[i];
-      }
-
-      return buf;
-    }
-
-    return (0, _stringify.default)(bytes);
-  } // Function#name is not settable on some platforms (#270)
-
-
-  try {
-    generateUUID.name = name; // eslint-disable-next-line no-empty
-  } catch (err) {} // For CommonJS default export support
-
-
-  generateUUID.DNS = DNS;
-  generateUUID.URL = URL;
-  return generateUUID;
-}
-
-/***/ }),
-
-/***/ 1071:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _rng = _interopRequireDefault(__nccwpck_require__(6750));
-
-var _stringify = _interopRequireDefault(__nccwpck_require__(5284));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-function v4(options, buf, offset) {
-  options = options || {};
-
-  const rnds = options.random || (options.rng || _rng.default)(); // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
-
-
-  rnds[6] = rnds[6] & 0x0f | 0x40;
-  rnds[8] = rnds[8] & 0x3f | 0x80; // Copy bytes to buffer, if provided
-
-  if (buf) {
-    offset = offset || 0;
-
-    for (let i = 0; i < 16; ++i) {
-      buf[offset + i] = rnds[i];
-    }
-
-    return buf;
-  }
-
-  return (0, _stringify.default)(rnds);
-}
-
-var _default = v4;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 8057:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _v = _interopRequireDefault(__nccwpck_require__(9390));
-
-var _sha = _interopRequireDefault(__nccwpck_require__(4920));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-const v5 = (0, _v.default)('v5', 0x50, _sha.default);
-var _default = v5;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 324:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _regex = _interopRequireDefault(__nccwpck_require__(7610));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-function validate(uuid) {
-  return typeof uuid === 'string' && _regex.default.test(uuid);
-}
-
-var _default = validate;
-exports["default"] = _default;
-
-/***/ }),
-
-/***/ 5530:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-
-
-Object.defineProperty(exports, "__esModule", ({
-  value: true
-}));
-exports["default"] = void 0;
-
-var _validate = _interopRequireDefault(__nccwpck_require__(324));
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
-
-function version(uuid) {
-  if (!(0, _validate.default)(uuid)) {
-    throw TypeError('Invalid UUID');
-  }
-
-  return parseInt(uuid.substr(14, 1), 16);
-}
-
-var _default = version;
-exports["default"] = _default;
-
-/***/ }),
-
 /***/ 666:
 /***/ ((module) => {
 
@@ -65654,7 +69353,7 @@ __nccwpck_require__.a(module, async (__webpack_handle_async_dependencies__, __we
 /* harmony export */   "bG": () => (/* binding */ fail),
 /* harmony export */   "vc": () => (/* binding */ config)
 /* harmony export */ });
-/* harmony import */ var _actions_core__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(9093);
+/* harmony import */ var _actions_core__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(8407);
 /* harmony import */ var _actions_core__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__nccwpck_require__.n(_actions_core__WEBPACK_IMPORTED_MODULE_0__);
 /* harmony import */ var _actions_github__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(5942);
 /* harmony import */ var _actions_github__WEBPACK_IMPORTED_MODULE_1___default = /*#__PURE__*/__nccwpck_require__.n(_actions_github__WEBPACK_IMPORTED_MODULE_1__);
@@ -65763,6 +69462,10 @@ async function clearCache() {
             repo,
         });
         await Promise.all(list.data.actions_caches
+            .map((cache) => {
+            _actions_core__WEBPACK_IMPORTED_MODULE_0__.info(`Debug cache: ${JSON.stringify(cache)}`);
+            return cache;
+        })
             .filter((cache) => !!cache.key?.startsWith(`${config.cache.key}-`))
             .map((cache) => {
             _actions_core__WEBPACK_IMPORTED_MODULE_0__.info(`Deleting cache ${cache.key}`);
@@ -65789,9 +69492,9 @@ __webpack_async_result__();
 /***/ ((module, __unused_webpack___webpack_exports__, __nccwpck_require__) => {
 
 __nccwpck_require__.a(module, async (__webpack_handle_async_dependencies__, __webpack_async_result__) => { try {
-/* harmony import */ var _actions_cache__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(6878);
+/* harmony import */ var _actions_cache__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(1217);
 /* harmony import */ var _actions_cache__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__nccwpck_require__.n(_actions_cache__WEBPACK_IMPORTED_MODULE_0__);
-/* harmony import */ var _actions_core__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(9093);
+/* harmony import */ var _actions_core__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(8407);
 /* harmony import */ var _actions_core__WEBPACK_IMPORTED_MODULE_1___default = /*#__PURE__*/__nccwpck_require__.n(_actions_core__WEBPACK_IMPORTED_MODULE_1__);
 /* harmony import */ var _lib_js__WEBPACK_IMPORTED_MODULE_2__ = __nccwpck_require__(3160);
 var __webpack_async_dependencies__ = __webpack_handle_async_dependencies__([_lib_js__WEBPACK_IMPORTED_MODULE_2__]);
@@ -65921,6 +69624,13 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("https");
 /***/ ((module) => {
 
 module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("net");
+
+/***/ }),
+
+/***/ 6005:
+/***/ ((module) => {
+
+module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:crypto");
 
 /***/ }),
 
@@ -66136,12 +69846,12 @@ Object.defineProperty(exports, "AbortError", ({ enumerable: true, get: function 
 
 /***/ }),
 
-/***/ 8935:
+/***/ 662:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.AzureKeyCredential = void 0;
 /**
@@ -66184,15 +69894,16 @@ exports.AzureKeyCredential = AzureKeyCredential;
 
 /***/ }),
 
-/***/ 6058:
+/***/ 5525:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.isNamedKeyCredential = exports.AzureNamedKeyCredential = void 0;
-const core_util_1 = __nccwpck_require__(8143);
+exports.AzureNamedKeyCredential = void 0;
+exports.isNamedKeyCredential = isNamedKeyCredential;
+const core_util_1 = __nccwpck_require__(1910);
 /**
  * A static name/key-based credential that supports updating
  * the underlying name and key values.
@@ -66252,20 +69963,20 @@ function isNamedKeyCredential(credential) {
         typeof credential.key === "string" &&
         typeof credential.name === "string");
 }
-exports.isNamedKeyCredential = isNamedKeyCredential;
 //# sourceMappingURL=azureNamedKeyCredential.js.map
 
 /***/ }),
 
-/***/ 6512:
+/***/ 1446:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.isSASCredential = exports.AzureSASCredential = void 0;
-const core_util_1 = __nccwpck_require__(8143);
+exports.AzureSASCredential = void 0;
+exports.isSASCredential = isSASCredential;
+const core_util_1 = __nccwpck_require__(1910);
 /**
  * A static-signature-based credential that supports updating
  * the underlying signature value.
@@ -66313,44 +70024,41 @@ exports.AzureSASCredential = AzureSASCredential;
 function isSASCredential(credential) {
     return ((0, core_util_1.isObjectWithProperties)(credential, ["signature"]) && typeof credential.signature === "string");
 }
-exports.isSASCredential = isSASCredential;
 //# sourceMappingURL=azureSASCredential.js.map
 
 /***/ }),
 
-/***/ 9334:
+/***/ 3728:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isTokenCredential = exports.isSASCredential = exports.AzureSASCredential = exports.isNamedKeyCredential = exports.AzureNamedKeyCredential = exports.isKeyCredential = exports.AzureKeyCredential = void 0;
-var azureKeyCredential_js_1 = __nccwpck_require__(8935);
+var azureKeyCredential_js_1 = __nccwpck_require__(662);
 Object.defineProperty(exports, "AzureKeyCredential", ({ enumerable: true, get: function () { return azureKeyCredential_js_1.AzureKeyCredential; } }));
-var keyCredential_js_1 = __nccwpck_require__(3921);
+var keyCredential_js_1 = __nccwpck_require__(4770);
 Object.defineProperty(exports, "isKeyCredential", ({ enumerable: true, get: function () { return keyCredential_js_1.isKeyCredential; } }));
-var azureNamedKeyCredential_js_1 = __nccwpck_require__(6058);
+var azureNamedKeyCredential_js_1 = __nccwpck_require__(5525);
 Object.defineProperty(exports, "AzureNamedKeyCredential", ({ enumerable: true, get: function () { return azureNamedKeyCredential_js_1.AzureNamedKeyCredential; } }));
 Object.defineProperty(exports, "isNamedKeyCredential", ({ enumerable: true, get: function () { return azureNamedKeyCredential_js_1.isNamedKeyCredential; } }));
-var azureSASCredential_js_1 = __nccwpck_require__(6512);
+var azureSASCredential_js_1 = __nccwpck_require__(1446);
 Object.defineProperty(exports, "AzureSASCredential", ({ enumerable: true, get: function () { return azureSASCredential_js_1.AzureSASCredential; } }));
 Object.defineProperty(exports, "isSASCredential", ({ enumerable: true, get: function () { return azureSASCredential_js_1.isSASCredential; } }));
-var tokenCredential_js_1 = __nccwpck_require__(8045);
+var tokenCredential_js_1 = __nccwpck_require__(9089);
 Object.defineProperty(exports, "isTokenCredential", ({ enumerable: true, get: function () { return tokenCredential_js_1.isTokenCredential; } }));
 //# sourceMappingURL=index.js.map
 
 /***/ }),
 
-/***/ 3921:
+/***/ 4770:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.isKeyCredential = void 0;
-const core_util_1 = __nccwpck_require__(8143);
+exports.isKeyCredential = isKeyCredential;
+const core_util_1 = __nccwpck_require__(1910);
 /**
  * Tests an object to determine whether it implements KeyCredential.
  *
@@ -66359,19 +70067,36 @@ const core_util_1 = __nccwpck_require__(8143);
 function isKeyCredential(credential) {
     return (0, core_util_1.isObjectWithProperties)(credential, ["key"]) && typeof credential.key === "string";
 }
-exports.isKeyCredential = isKeyCredential;
 //# sourceMappingURL=keyCredential.js.map
 
 /***/ }),
 
-/***/ 8045:
+/***/ 9089:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.isTokenCredential = void 0;
+exports.isBearerToken = isBearerToken;
+exports.isPopToken = isPopToken;
+exports.isTokenCredential = isTokenCredential;
+/**
+ * @internal
+ * @param accessToken - Access token
+ * @returns Whether a token is bearer type or not
+ */
+function isBearerToken(accessToken) {
+    return !accessToken.tokenType || accessToken.tokenType === "Bearer";
+}
+/**
+ * @internal
+ * @param accessToken - Access token
+ * @returns Whether a token is Pop token or not
+ */
+function isPopToken(accessToken) {
+    return accessToken.tokenType === "pop";
+}
 /**
  * Tests an object to determine whether it implements TokenCredential.
  *
@@ -66388,21 +70113,21 @@ function isTokenCredential(credential) {
         typeof castCredential.getToken === "function" &&
         (castCredential.signRequest === undefined || castCredential.getToken.length > 0));
 }
-exports.isTokenCredential = isTokenCredential;
 //# sourceMappingURL=tokenCredential.js.map
 
 /***/ }),
 
-/***/ 2707:
+/***/ 8808:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.authorizeRequestOnClaimChallenge = exports.parseCAEChallenge = void 0;
-const log_js_1 = __nccwpck_require__(5225);
-const base64_js_1 = __nccwpck_require__(447);
+exports.parseCAEChallenge = parseCAEChallenge;
+exports.authorizeRequestOnClaimChallenge = authorizeRequestOnClaimChallenge;
+const log_js_1 = __nccwpck_require__(832);
+const base64_js_1 = __nccwpck_require__(933);
 /**
  * Converts: `Bearer a="b", c="d", Bearer d="e", f="g"`.
  * Into: `[ { a: 'b', c: 'd' }, { d: 'e', f: 'g' } ]`.
@@ -66418,19 +70143,21 @@ function parseCAEChallenge(challenges) {
         return keyValuePairs.reduce((a, b) => (Object.assign(Object.assign({}, a), b)), {});
     });
 }
-exports.parseCAEChallenge = parseCAEChallenge;
 /**
  * This function can be used as a callback for the `bearerTokenAuthenticationPolicy` of `@azure/core-rest-pipeline`, to support CAE challenges:
- * [Continuous Access Evaluation](https://docs.microsoft.com/azure/active-directory/conditional-access/concept-continuous-access-evaluation).
+ * [Continuous Access Evaluation](https://learn.microsoft.com/azure/active-directory/conditional-access/concept-continuous-access-evaluation).
  *
  * Call the `bearerTokenAuthenticationPolicy` with the following options:
  *
- * ```ts
+ * ```ts snippet:AuthorizeRequestOnClaimChallenge
  * import { bearerTokenAuthenticationPolicy } from "@azure/core-rest-pipeline";
  * import { authorizeRequestOnClaimChallenge } from "@azure/core-client";
  *
- * const bearerTokenAuthenticationPolicy = bearerTokenAuthenticationPolicy({
- *   authorizeRequestOnChallenge: authorizeRequestOnClaimChallenge
+ * const policy = bearerTokenAuthenticationPolicy({
+ *   challengeCallbacks: {
+ *     authorizeRequestOnChallenge: authorizeRequestOnClaimChallenge,
+ *   },
+ *   scopes: ["https://service/.default"],
  * });
  * ```
  *
@@ -66446,6 +70173,7 @@ exports.parseCAEChallenge = parseCAEChallenge;
  * ```
  */
 async function authorizeRequestOnClaimChallenge(onChallengeOptions) {
+    var _a;
     const { scopes, response } = onChallengeOptions;
     const logger = onChallengeOptions.logger || log_js_1.logger;
     const challenge = response.headers.get("WWW-Authenticate");
@@ -66465,20 +70193,19 @@ async function authorizeRequestOnClaimChallenge(onChallengeOptions) {
     if (!accessToken) {
         return false;
     }
-    onChallengeOptions.request.headers.set("Authorization", `Bearer ${accessToken.token}`);
+    onChallengeOptions.request.headers.set("Authorization", `${(_a = accessToken.tokenType) !== null && _a !== void 0 ? _a : "Bearer"} ${accessToken.token}`);
     return true;
 }
-exports.authorizeRequestOnClaimChallenge = authorizeRequestOnClaimChallenge;
 //# sourceMappingURL=authorizeRequestOnClaimChallenge.js.map
 
 /***/ }),
 
-/***/ 2968:
+/***/ 7215:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.authorizeRequestOnTenantChallenge = void 0;
 /**
@@ -66501,10 +70228,11 @@ function isUuid(text) {
 }
 /**
  * Defines a callback to handle auth challenge for Storage APIs.
- * This implements the bearer challenge process described here: https://docs.microsoft.com/rest/api/storageservices/authorize-with-azure-active-directory#bearer-challenge
+ * This implements the bearer challenge process described here: https://learn.microsoft.com/rest/api/storageservices/authorize-with-azure-active-directory#bearer-challenge
  * Handling has specific features for storage that departs to the general AAD challenge docs.
  **/
 const authorizeRequestOnTenantChallenge = async (challengeOptions) => {
+    var _a;
     const requestOptions = requestToOptions(challengeOptions.request);
     const challenge = getChallenge(challengeOptions.response);
     if (challenge) {
@@ -66518,7 +70246,7 @@ const authorizeRequestOnTenantChallenge = async (challengeOptions) => {
         if (!accessToken) {
             return false;
         }
-        challengeOptions.request.headers.set(Constants.HeaderConstants.AUTHORIZATION, `Bearer ${accessToken.token}`);
+        challengeOptions.request.headers.set(Constants.HeaderConstants.AUTHORIZATION, `${(_a = accessToken.tokenType) !== null && _a !== void 0 ? _a : "Bearer"} ${accessToken.token}`);
         return true;
     }
     return false;
@@ -66596,14 +70324,17 @@ function requestToOptions(request) {
 
 /***/ }),
 
-/***/ 447:
+/***/ 933:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.decodeStringToString = exports.decodeString = exports.encodeByteArray = exports.encodeString = void 0;
+exports.encodeString = encodeString;
+exports.encodeByteArray = encodeByteArray;
+exports.decodeString = decodeString;
+exports.decodeStringToString = decodeStringToString;
 /**
  * Encodes a string in base64 format.
  * @param value - the string to encode
@@ -66612,7 +70343,6 @@ exports.decodeStringToString = exports.decodeString = exports.encodeByteArray = 
 function encodeString(value) {
     return Buffer.from(value).toString("base64");
 }
-exports.encodeString = encodeString;
 /**
  * Encodes a byte array in base64 format.
  * @param value - the Uint8Aray to encode
@@ -66622,7 +70352,6 @@ function encodeByteArray(value) {
     const bufferValue = value instanceof Buffer ? value : Buffer.from(value.buffer);
     return bufferValue.toString("base64");
 }
-exports.encodeByteArray = encodeByteArray;
 /**
  * Decodes a base64 string into a byte array.
  * @param value - the base64 string to decode
@@ -66631,7 +70360,6 @@ exports.encodeByteArray = encodeByteArray;
 function decodeString(value) {
     return Buffer.from(value, "base64");
 }
-exports.decodeString = decodeString;
 /**
  * Decodes a base64 string into a string.
  * @param value - the base64 string to decode
@@ -66640,23 +70368,23 @@ exports.decodeString = decodeString;
 function decodeStringToString(value) {
     return Buffer.from(value, "base64").toString();
 }
-exports.decodeStringToString = decodeStringToString;
 //# sourceMappingURL=base64.js.map
 
 /***/ }),
 
-/***/ 9430:
+/***/ 1160:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.deserializationPolicy = exports.deserializationPolicyName = void 0;
-const interfaces_js_1 = __nccwpck_require__(5915);
-const core_rest_pipeline_1 = __nccwpck_require__(7314);
-const serializer_js_1 = __nccwpck_require__(8293);
-const operationHelpers_js_1 = __nccwpck_require__(164);
+exports.deserializationPolicyName = void 0;
+exports.deserializationPolicy = deserializationPolicy;
+const interfaces_js_1 = __nccwpck_require__(9566);
+const core_rest_pipeline_1 = __nccwpck_require__(7371);
+const serializer_js_1 = __nccwpck_require__(8362);
+const operationHelpers_js_1 = __nccwpck_require__(2752);
 const defaultJsonContentTypes = ["application/json", "text/json"];
 const defaultXmlContentTypes = ["application/xml", "application/atom+xml"];
 /**
@@ -66687,7 +70415,6 @@ function deserializationPolicy(options = {}) {
         },
     };
 }
-exports.deserializationPolicy = deserializationPolicy;
 function getOperationResponseMap(parsedResponse) {
     let result;
     const request = parsedResponse.request;
@@ -66776,7 +70503,7 @@ function isOperationSpecEmpty(operationSpec) {
         (expectedStatusCodes.length === 1 && expectedStatusCodes[0] === "default"));
 }
 function handleErrorResponse(parsedResponse, operationSpec, responseSpec, options) {
-    var _a;
+    var _a, _b, _c, _d, _e;
     const isSuccessByStatus = 200 <= parsedResponse.status && parsedResponse.status < 300;
     const isExpectedStatusCode = isOperationSpecEmpty(operationSpec)
         ? isSuccessByStatus
@@ -66801,12 +70528,14 @@ function handleErrorResponse(parsedResponse, operationSpec, responseSpec, option
         response: parsedResponse,
     });
     // If the item failed but there's no error spec or default spec to deserialize the error,
+    // and the parsed body doesn't look like an error object,
     // we should fail so we just throw the parsed response
-    if (!errorResponseSpec) {
+    if (!errorResponseSpec &&
+        !(((_c = (_b = parsedResponse.parsedBody) === null || _b === void 0 ? void 0 : _b.error) === null || _c === void 0 ? void 0 : _c.code) && ((_e = (_d = parsedResponse.parsedBody) === null || _d === void 0 ? void 0 : _d.error) === null || _e === void 0 ? void 0 : _e.message))) {
         throw error;
     }
-    const defaultBodyMapper = errorResponseSpec.bodyMapper;
-    const defaultHeadersMapper = errorResponseSpec.headersMapper;
+    const defaultBodyMapper = errorResponseSpec === null || errorResponseSpec === void 0 ? void 0 : errorResponseSpec.bodyMapper;
+    const defaultHeadersMapper = errorResponseSpec === null || errorResponseSpec === void 0 ? void 0 : errorResponseSpec.headersMapper;
     try {
         // If error response has a body, try to deserialize it using default body mapper.
         // Then try to extract error code & message from it
@@ -66886,15 +70615,15 @@ async function parse(jsonContentTypes, xmlContentTypes, operationResponse, opts,
 
 /***/ }),
 
-/***/ 9509:
+/***/ 5211:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.getCachedDefaultHttpClient = void 0;
-const core_rest_pipeline_1 = __nccwpck_require__(7314);
+exports.getCachedDefaultHttpClient = getCachedDefaultHttpClient;
+const core_rest_pipeline_1 = __nccwpck_require__(7371);
 let cachedHttpClient;
 function getCachedDefaultHttpClient() {
     if (!cachedHttpClient) {
@@ -66902,52 +70631,52 @@ function getCachedDefaultHttpClient() {
     }
     return cachedHttpClient;
 }
-exports.getCachedDefaultHttpClient = getCachedDefaultHttpClient;
 //# sourceMappingURL=httpClientCache.js.map
 
 /***/ }),
 
-/***/ 2026:
+/***/ 9668:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.authorizeRequestOnTenantChallenge = exports.authorizeRequestOnClaimChallenge = exports.serializationPolicyName = exports.serializationPolicy = exports.deserializationPolicyName = exports.deserializationPolicy = exports.XML_CHARKEY = exports.XML_ATTRKEY = exports.createClientPipeline = exports.ServiceClient = exports.MapperTypeNames = exports.createSerializer = void 0;
-var serializer_js_1 = __nccwpck_require__(8293);
+var serializer_js_1 = __nccwpck_require__(8362);
 Object.defineProperty(exports, "createSerializer", ({ enumerable: true, get: function () { return serializer_js_1.createSerializer; } }));
 Object.defineProperty(exports, "MapperTypeNames", ({ enumerable: true, get: function () { return serializer_js_1.MapperTypeNames; } }));
-var serviceClient_js_1 = __nccwpck_require__(7107);
+var serviceClient_js_1 = __nccwpck_require__(9789);
 Object.defineProperty(exports, "ServiceClient", ({ enumerable: true, get: function () { return serviceClient_js_1.ServiceClient; } }));
-var pipeline_js_1 = __nccwpck_require__(8381);
+var pipeline_js_1 = __nccwpck_require__(2305);
 Object.defineProperty(exports, "createClientPipeline", ({ enumerable: true, get: function () { return pipeline_js_1.createClientPipeline; } }));
-var interfaces_js_1 = __nccwpck_require__(5915);
+var interfaces_js_1 = __nccwpck_require__(9566);
 Object.defineProperty(exports, "XML_ATTRKEY", ({ enumerable: true, get: function () { return interfaces_js_1.XML_ATTRKEY; } }));
 Object.defineProperty(exports, "XML_CHARKEY", ({ enumerable: true, get: function () { return interfaces_js_1.XML_CHARKEY; } }));
-var deserializationPolicy_js_1 = __nccwpck_require__(9430);
+var deserializationPolicy_js_1 = __nccwpck_require__(1160);
 Object.defineProperty(exports, "deserializationPolicy", ({ enumerable: true, get: function () { return deserializationPolicy_js_1.deserializationPolicy; } }));
 Object.defineProperty(exports, "deserializationPolicyName", ({ enumerable: true, get: function () { return deserializationPolicy_js_1.deserializationPolicyName; } }));
-var serializationPolicy_js_1 = __nccwpck_require__(7709);
+var serializationPolicy_js_1 = __nccwpck_require__(6089);
 Object.defineProperty(exports, "serializationPolicy", ({ enumerable: true, get: function () { return serializationPolicy_js_1.serializationPolicy; } }));
 Object.defineProperty(exports, "serializationPolicyName", ({ enumerable: true, get: function () { return serializationPolicy_js_1.serializationPolicyName; } }));
-var authorizeRequestOnClaimChallenge_js_1 = __nccwpck_require__(2707);
+var authorizeRequestOnClaimChallenge_js_1 = __nccwpck_require__(8808);
 Object.defineProperty(exports, "authorizeRequestOnClaimChallenge", ({ enumerable: true, get: function () { return authorizeRequestOnClaimChallenge_js_1.authorizeRequestOnClaimChallenge; } }));
-var authorizeRequestOnTenantChallenge_js_1 = __nccwpck_require__(2968);
+var authorizeRequestOnTenantChallenge_js_1 = __nccwpck_require__(7215);
 Object.defineProperty(exports, "authorizeRequestOnTenantChallenge", ({ enumerable: true, get: function () { return authorizeRequestOnTenantChallenge_js_1.authorizeRequestOnTenantChallenge; } }));
 //# sourceMappingURL=index.js.map
 
 /***/ }),
 
-/***/ 8829:
+/***/ 1531:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.getPathStringFromParameter = exports.getStreamingResponseStatusCodes = void 0;
-const serializer_js_1 = __nccwpck_require__(8293);
+exports.getStreamingResponseStatusCodes = getStreamingResponseStatusCodes;
+exports.getPathStringFromParameter = getPathStringFromParameter;
+const serializer_js_1 = __nccwpck_require__(8362);
 /**
  * Gets the list of status codes for streaming responses.
  * @internal
@@ -66963,7 +70692,6 @@ function getStreamingResponseStatusCodes(operationSpec) {
     }
     return result;
 }
-exports.getStreamingResponseStatusCodes = getStreamingResponseStatusCodes;
 /**
  * Get the path to this parameter's value as a dotted string (a.b.c).
  * @param parameter - The parameter to get the path string for.
@@ -66984,17 +70712,16 @@ function getPathStringFromParameter(parameter) {
     }
     return result;
 }
-exports.getPathStringFromParameter = getPathStringFromParameter;
 //# sourceMappingURL=interfaceHelpers.js.map
 
 /***/ }),
 
-/***/ 5915:
+/***/ 9566:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.XML_CHARKEY = exports.XML_ATTRKEY = void 0;
 /**
@@ -67009,12 +70736,12 @@ exports.XML_CHARKEY = "_";
 
 /***/ }),
 
-/***/ 5225:
+/***/ 832:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.logger = void 0;
 const logger_1 = __nccwpck_require__(2208);
@@ -67023,15 +70750,16 @@ exports.logger = (0, logger_1.createClientLogger)("core-client");
 
 /***/ }),
 
-/***/ 164:
+/***/ 2752:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.getOperationRequestInfo = exports.getOperationArgumentValueFromParameter = void 0;
-const state_js_1 = __nccwpck_require__(682);
+exports.getOperationArgumentValueFromParameter = getOperationArgumentValueFromParameter;
+exports.getOperationRequestInfo = getOperationRequestInfo;
+const state_js_1 = __nccwpck_require__(6357);
 /**
  * @internal
  * Retrieves the value to use for a given operation argument
@@ -67088,7 +70816,6 @@ function getOperationArgumentValueFromParameter(operationArguments, parameter, f
     }
     return value;
 }
-exports.getOperationArgumentValueFromParameter = getOperationArgumentValueFromParameter;
 function getPropertyFromParameterPath(parent, parameterPath) {
     const result = { propertyFound: false };
     let i = 0;
@@ -67123,22 +70850,21 @@ function getOperationRequestInfo(request) {
     }
     return info;
 }
-exports.getOperationRequestInfo = getOperationRequestInfo;
 //# sourceMappingURL=operationHelpers.js.map
 
 /***/ }),
 
-/***/ 8381:
+/***/ 2305:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createClientPipeline = void 0;
-const deserializationPolicy_js_1 = __nccwpck_require__(9430);
-const core_rest_pipeline_1 = __nccwpck_require__(7314);
-const serializationPolicy_js_1 = __nccwpck_require__(7709);
+exports.createClientPipeline = createClientPipeline;
+const deserializationPolicy_js_1 = __nccwpck_require__(1160);
+const core_rest_pipeline_1 = __nccwpck_require__(7371);
+const serializationPolicy_js_1 = __nccwpck_require__(6089);
 /**
  * Creates a new Pipeline for use with a Service Client.
  * Adds in deserializationPolicy by default.
@@ -67159,23 +70885,25 @@ function createClientPipeline(options = {}) {
     });
     return pipeline;
 }
-exports.createClientPipeline = createClientPipeline;
 //# sourceMappingURL=pipeline.js.map
 
 /***/ }),
 
-/***/ 7709:
+/***/ 6089:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.serializeRequestBody = exports.serializeHeaders = exports.serializationPolicy = exports.serializationPolicyName = void 0;
-const interfaces_js_1 = __nccwpck_require__(5915);
-const operationHelpers_js_1 = __nccwpck_require__(164);
-const serializer_js_1 = __nccwpck_require__(8293);
-const interfaceHelpers_js_1 = __nccwpck_require__(8829);
+exports.serializationPolicyName = void 0;
+exports.serializationPolicy = serializationPolicy;
+exports.serializeHeaders = serializeHeaders;
+exports.serializeRequestBody = serializeRequestBody;
+const interfaces_js_1 = __nccwpck_require__(9566);
+const operationHelpers_js_1 = __nccwpck_require__(2752);
+const serializer_js_1 = __nccwpck_require__(8362);
+const interfaceHelpers_js_1 = __nccwpck_require__(1531);
 /**
  * The programmatic identifier of the serializationPolicy.
  */
@@ -67200,7 +70928,6 @@ function serializationPolicy(options = {}) {
         },
     };
 }
-exports.serializationPolicy = serializationPolicy;
 /**
  * @internal
  */
@@ -67231,7 +70958,6 @@ function serializeHeaders(request, operationArguments, operationSpec) {
         }
     }
 }
-exports.serializeHeaders = serializeHeaders;
 /**
  * @internal
  */
@@ -67299,7 +71025,6 @@ function serializeRequestBody(request, operationArguments, operationSpec, string
         }
     }
 }
-exports.serializeRequestBody = serializeRequestBody;
 /**
  * Adds an xml namespace to the xml serialized object if needed, otherwise it just returns the value itself
  */
@@ -67329,18 +71054,19 @@ function prepareXMLRootList(obj, elementName, xmlNamespaceKey, xmlNamespace) {
 
 /***/ }),
 
-/***/ 8293:
+/***/ 8362:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.MapperTypeNames = exports.createSerializer = void 0;
-const tslib_1 = __nccwpck_require__(6928);
-const base64 = tslib_1.__importStar(__nccwpck_require__(447));
-const interfaces_js_1 = __nccwpck_require__(5915);
-const utils_js_1 = __nccwpck_require__(382);
+exports.MapperTypeNames = void 0;
+exports.createSerializer = createSerializer;
+const tslib_1 = __nccwpck_require__(1772);
+const base64 = tslib_1.__importStar(__nccwpck_require__(933));
+const interfaces_js_1 = __nccwpck_require__(9566);
+const utils_js_1 = __nccwpck_require__(9036);
 class SerializerImpl {
     constructor(modelMappers = {}, isXML = false) {
         this.modelMappers = modelMappers;
@@ -67590,7 +71316,6 @@ class SerializerImpl {
 function createSerializer(modelMappers = {}, isXML = false) {
     return new SerializerImpl(modelMappers, isXML);
 }
-exports.createSerializer = createSerializer;
 function trimEnd(str, ch) {
     let len = str.length;
     while (len - 1 >= 0 && str[len - 1] === ch) {
@@ -68262,29 +71987,28 @@ exports.MapperTypeNames = {
 
 /***/ }),
 
-/***/ 7107:
+/***/ 9789:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.ServiceClient = void 0;
-const core_rest_pipeline_1 = __nccwpck_require__(7314);
-const pipeline_js_1 = __nccwpck_require__(8381);
-const utils_js_1 = __nccwpck_require__(382);
-const httpClientCache_js_1 = __nccwpck_require__(9509);
-const operationHelpers_js_1 = __nccwpck_require__(164);
-const urlHelpers_js_1 = __nccwpck_require__(7415);
-const interfaceHelpers_js_1 = __nccwpck_require__(8829);
-const log_js_1 = __nccwpck_require__(5225);
+const core_rest_pipeline_1 = __nccwpck_require__(7371);
+const pipeline_js_1 = __nccwpck_require__(2305);
+const utils_js_1 = __nccwpck_require__(9036);
+const httpClientCache_js_1 = __nccwpck_require__(5211);
+const operationHelpers_js_1 = __nccwpck_require__(2752);
+const urlHelpers_js_1 = __nccwpck_require__(606);
+const interfaceHelpers_js_1 = __nccwpck_require__(1531);
+const log_js_1 = __nccwpck_require__(832);
 /**
  * Initializes a new instance of the ServiceClient.
  */
 class ServiceClient {
     /**
      * The ServiceClient constructor
-     * @param credential - The credentials used for authentication with the service.
      * @param options - The service client options that govern the behavior of the client.
      */
     constructor(options = {}) {
@@ -68421,12 +72145,12 @@ function getCredentialScopes(options) {
 
 /***/ }),
 
-/***/ 682:
+/***/ 6357:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.state = void 0;
 /**
@@ -68439,16 +72163,17 @@ exports.state = {
 
 /***/ }),
 
-/***/ 7415:
+/***/ 606:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.appendQueryParams = exports.getRequestUrl = void 0;
-const operationHelpers_js_1 = __nccwpck_require__(164);
-const interfaceHelpers_js_1 = __nccwpck_require__(8829);
+exports.getRequestUrl = getRequestUrl;
+exports.appendQueryParams = appendQueryParams;
+const operationHelpers_js_1 = __nccwpck_require__(2752);
+const interfaceHelpers_js_1 = __nccwpck_require__(1531);
 const CollectionFormatToDelimiterMap = {
     CSV: ",",
     SSV: " ",
@@ -68489,7 +72214,6 @@ function getRequestUrl(baseUri, operationSpec, operationArguments, fallbackObjec
     requestUrl = appendQueryParams(requestUrl, queryParams, sequenceParams, isAbsolutePath);
     return requestUrl;
 }
-exports.getRequestUrl = getRequestUrl;
 function replaceAll(input, replacements) {
     let result = input;
     for (const [searchValue, replaceValue] of replacements) {
@@ -68680,19 +72404,21 @@ function appendQueryParams(url, queryParams, sequenceParams, noOverwrite = false
     parsedUrl.search = searchPieces.length ? `?${searchPieces.join("&")}` : "";
     return parsedUrl.toString();
 }
-exports.appendQueryParams = appendQueryParams;
 //# sourceMappingURL=urlHelpers.js.map
 
 /***/ }),
 
-/***/ 382:
+/***/ 9036:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.flattenResponse = exports.isValidUuid = exports.isDuration = exports.isPrimitiveBody = void 0;
+exports.isPrimitiveBody = isPrimitiveBody;
+exports.isDuration = isDuration;
+exports.isValidUuid = isValidUuid;
+exports.flattenResponse = flattenResponse;
 /**
  * A type guard for a primitive response body.
  * @param value - Value to test
@@ -68710,7 +72436,6 @@ function isPrimitiveBody(value, mapperTypeName) {
             value === undefined ||
             value === null));
 }
-exports.isPrimitiveBody = isPrimitiveBody;
 const validateISODuration = /^(-|\+)?P(?:([-+]?[0-9,.]*)Y)?(?:([-+]?[0-9,.]*)M)?(?:([-+]?[0-9,.]*)W)?(?:([-+]?[0-9,.]*)D)?(?:T(?:([-+]?[0-9,.]*)H)?(?:([-+]?[0-9,.]*)M)?(?:([-+]?[0-9,.]*)S)?)?$/;
 /**
  * Returns true if the given string is in ISO 8601 format.
@@ -68720,7 +72445,6 @@ const validateISODuration = /^(-|\+)?P(?:([-+]?[0-9,.]*)Y)?(?:([-+]?[0-9,.]*)M)?
 function isDuration(value) {
     return validateISODuration.test(value);
 }
-exports.isDuration = isDuration;
 const validUuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/i;
 /**
  * Returns true if the provided uuid is valid.
@@ -68732,7 +72456,6 @@ const validUuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 function isValidUuid(uuid) {
     return validUuidRegex.test(uuid);
 }
-exports.isValidUuid = isValidUuid;
 /**
  * Maps the response as follows:
  * - wraps the response body if needed (typically if its type is primitive).
@@ -68808,23 +72531,22 @@ function flattenResponse(fullResponse, responseSpec) {
         shouldWrapBody: isPrimitiveBody(fullResponse.parsedBody, expectedBodyTypeName),
     });
 }
-exports.flattenResponse = flattenResponse;
 //# sourceMappingURL=utils.js.map
 
 /***/ }),
 
-/***/ 7185:
+/***/ 7741:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.ExtendedServiceClient = void 0;
-const disableKeepAlivePolicy_js_1 = __nccwpck_require__(5268);
-const core_rest_pipeline_1 = __nccwpck_require__(7314);
-const core_client_1 = __nccwpck_require__(2026);
-const response_js_1 = __nccwpck_require__(4023);
+const disableKeepAlivePolicy_js_1 = __nccwpck_require__(2013);
+const core_rest_pipeline_1 = __nccwpck_require__(7371);
+const core_client_1 = __nccwpck_require__(9668);
+const response_js_1 = __nccwpck_require__(6531);
 /**
  * Client to provide compatability between core V1 & V2.
  */
@@ -68874,16 +72596,16 @@ exports.ExtendedServiceClient = ExtendedServiceClient;
 
 /***/ }),
 
-/***/ 4687:
+/***/ 4416:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.convertHttpClient = void 0;
-const response_js_1 = __nccwpck_require__(4023);
-const util_js_1 = __nccwpck_require__(4912);
+exports.convertHttpClient = convertHttpClient;
+const response_js_1 = __nccwpck_require__(6531);
+const util_js_1 = __nccwpck_require__(634);
 /**
  * Converts a RequestPolicy based HttpClient to a PipelineRequest based HttpClient.
  * @param requestPolicyClient - A HttpClient compatible with core-http
@@ -68897,17 +72619,16 @@ function convertHttpClient(requestPolicyClient) {
         },
     };
 }
-exports.convertHttpClient = convertHttpClient;
 //# sourceMappingURL=httpClientAdapter.js.map
 
 /***/ }),
 
-/***/ 7050:
+/***/ 4490:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.toHttpHeadersLike = exports.convertHttpClient = exports.disableKeepAlivePolicyName = exports.HttpPipelineLogLevel = exports.createRequestPolicyFactoryPolicy = exports.requestPolicyFactoryPolicyName = exports.ExtendedServiceClient = void 0;
 /**
@@ -68915,30 +72636,32 @@ exports.toHttpHeadersLike = exports.convertHttpClient = exports.disableKeepAlive
  *
  * @packageDocumentation
  */
-var extendedClient_js_1 = __nccwpck_require__(7185);
+var extendedClient_js_1 = __nccwpck_require__(7741);
 Object.defineProperty(exports, "ExtendedServiceClient", ({ enumerable: true, get: function () { return extendedClient_js_1.ExtendedServiceClient; } }));
-var requestPolicyFactoryPolicy_js_1 = __nccwpck_require__(3119);
+var requestPolicyFactoryPolicy_js_1 = __nccwpck_require__(2396);
 Object.defineProperty(exports, "requestPolicyFactoryPolicyName", ({ enumerable: true, get: function () { return requestPolicyFactoryPolicy_js_1.requestPolicyFactoryPolicyName; } }));
 Object.defineProperty(exports, "createRequestPolicyFactoryPolicy", ({ enumerable: true, get: function () { return requestPolicyFactoryPolicy_js_1.createRequestPolicyFactoryPolicy; } }));
 Object.defineProperty(exports, "HttpPipelineLogLevel", ({ enumerable: true, get: function () { return requestPolicyFactoryPolicy_js_1.HttpPipelineLogLevel; } }));
-var disableKeepAlivePolicy_js_1 = __nccwpck_require__(5268);
+var disableKeepAlivePolicy_js_1 = __nccwpck_require__(2013);
 Object.defineProperty(exports, "disableKeepAlivePolicyName", ({ enumerable: true, get: function () { return disableKeepAlivePolicy_js_1.disableKeepAlivePolicyName; } }));
-var httpClientAdapter_js_1 = __nccwpck_require__(4687);
+var httpClientAdapter_js_1 = __nccwpck_require__(4416);
 Object.defineProperty(exports, "convertHttpClient", ({ enumerable: true, get: function () { return httpClientAdapter_js_1.convertHttpClient; } }));
-var util_js_1 = __nccwpck_require__(4912);
+var util_js_1 = __nccwpck_require__(634);
 Object.defineProperty(exports, "toHttpHeadersLike", ({ enumerable: true, get: function () { return util_js_1.toHttpHeadersLike; } }));
 //# sourceMappingURL=index.js.map
 
 /***/ }),
 
-/***/ 5268:
+/***/ 2013:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.pipelineContainsDisableKeepAlivePolicy = exports.createDisableKeepAlivePolicy = exports.disableKeepAlivePolicyName = void 0;
+exports.disableKeepAlivePolicyName = void 0;
+exports.createDisableKeepAlivePolicy = createDisableKeepAlivePolicy;
+exports.pipelineContainsDisableKeepAlivePolicy = pipelineContainsDisableKeepAlivePolicy;
 exports.disableKeepAlivePolicyName = "DisableKeepAlivePolicy";
 function createDisableKeepAlivePolicy() {
     return {
@@ -68949,28 +72672,27 @@ function createDisableKeepAlivePolicy() {
         },
     };
 }
-exports.createDisableKeepAlivePolicy = createDisableKeepAlivePolicy;
 /**
  * @internal
  */
 function pipelineContainsDisableKeepAlivePolicy(pipeline) {
     return pipeline.getOrderedPolicies().some((policy) => policy.name === exports.disableKeepAlivePolicyName);
 }
-exports.pipelineContainsDisableKeepAlivePolicy = pipelineContainsDisableKeepAlivePolicy;
 //# sourceMappingURL=disableKeepAlivePolicy.js.map
 
 /***/ }),
 
-/***/ 3119:
+/***/ 2396:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createRequestPolicyFactoryPolicy = exports.requestPolicyFactoryPolicyName = exports.HttpPipelineLogLevel = void 0;
-const util_js_1 = __nccwpck_require__(4912);
-const response_js_1 = __nccwpck_require__(4023);
+exports.requestPolicyFactoryPolicyName = exports.HttpPipelineLogLevel = void 0;
+exports.createRequestPolicyFactoryPolicy = createRequestPolicyFactoryPolicy;
+const util_js_1 = __nccwpck_require__(634);
+const response_js_1 = __nccwpck_require__(6531);
 /**
  * An enum for compatibility with RequestPolicy
  */
@@ -69017,21 +72739,21 @@ function createRequestPolicyFactoryPolicy(factories) {
         },
     };
 }
-exports.createRequestPolicyFactoryPolicy = createRequestPolicyFactoryPolicy;
 //# sourceMappingURL=requestPolicyFactoryPolicy.js.map
 
 /***/ }),
 
-/***/ 4023:
+/***/ 6531:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.toPipelineResponse = exports.toCompatResponse = void 0;
-const core_rest_pipeline_1 = __nccwpck_require__(7314);
-const util_js_1 = __nccwpck_require__(4912);
+exports.toCompatResponse = toCompatResponse;
+exports.toPipelineResponse = toPipelineResponse;
+const core_rest_pipeline_1 = __nccwpck_require__(7371);
+const util_js_1 = __nccwpck_require__(634);
 const originalResponse = Symbol("Original FullOperationResponse");
 /**
  * A helper to convert response objects from the new pipeline back to the old one.
@@ -69071,7 +72793,6 @@ function toCompatResponse(response, options) {
             headers });
     }
 }
-exports.toCompatResponse = toCompatResponse;
 /**
  * A helper to convert back to a PipelineResponse
  * @param compatResponse - A response compatible with `HttpOperationResponse` from core-http.
@@ -69088,20 +72809,22 @@ function toPipelineResponse(compatResponse) {
         return Object.assign(Object.assign({}, compatResponse), { headers, request: (0, util_js_1.toPipelineRequest)(compatResponse.request) });
     }
 }
-exports.toPipelineResponse = toPipelineResponse;
 //# sourceMappingURL=response.js.map
 
 /***/ }),
 
-/***/ 4912:
+/***/ 634:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.HttpHeaders = exports.toHttpHeadersLike = exports.toWebResourceLike = exports.toPipelineRequest = void 0;
-const core_rest_pipeline_1 = __nccwpck_require__(7314);
+exports.HttpHeaders = void 0;
+exports.toPipelineRequest = toPipelineRequest;
+exports.toWebResourceLike = toWebResourceLike;
+exports.toHttpHeadersLike = toHttpHeadersLike;
+const core_rest_pipeline_1 = __nccwpck_require__(7371);
 // We use a custom symbol to cache a reference to the original request without
 // exposing it on the public interface.
 const originalRequestSymbol = Symbol("Original PipelineRequest");
@@ -69134,6 +72857,7 @@ function toPipelineRequest(webResource, options = {}) {
             onUploadProgress: webResource.onUploadProgress,
             proxySettings: webResource.proxySettings,
             streamResponseStatusCodes: webResource.streamResponseStatusCodes,
+            agent: webResource.agent,
         });
         if (options.originalRequest) {
             newRequest[originalClientRequestSymbol] =
@@ -69142,7 +72866,6 @@ function toPipelineRequest(webResource, options = {}) {
         return newRequest;
     }
 }
-exports.toPipelineRequest = toPipelineRequest;
 function toWebResourceLike(request, options) {
     var _a;
     const originalRequest = (_a = options === null || options === void 0 ? void 0 : options.originalRequest) !== null && _a !== void 0 ? _a : request;
@@ -69161,6 +72884,7 @@ function toWebResourceLike(request, options) {
         onUploadProgress: request.onUploadProgress,
         proxySettings: request.proxySettings,
         streamResponseStatusCodes: request.streamResponseStatusCodes,
+        agent: request.agent,
         clone() {
             throw new Error("Cannot clone a non-proxied WebResourceLike");
         },
@@ -69204,6 +72928,7 @@ function toWebResourceLike(request, options) {
                     "onUploadProgress",
                     "proxySettings",
                     "streamResponseStatusCodes",
+                    "agent",
                 ];
                 if (typeof prop === "string" && passThroughProps.includes(prop)) {
                     request[prop] = value;
@@ -69216,7 +72941,6 @@ function toWebResourceLike(request, options) {
         return webResource;
     }
 }
-exports.toWebResourceLike = toWebResourceLike;
 /**
  * Converts HttpHeaders from core-rest-pipeline to look like
  * HttpHeaders from core-http.
@@ -69226,7 +72950,6 @@ exports.toWebResourceLike = toWebResourceLike;
 function toHttpHeadersLike(headers) {
     return new HttpHeaders(headers.toJSON({ preserveCase: true }));
 }
-exports.toHttpHeadersLike = toHttpHeadersLike;
 /**
  * A collection of HttpHeaders that can be sent with a HTTP request.
  */
@@ -69362,7 +73085,7 @@ exports.HttpHeaders = HttpHeaders;
 
 /***/ }),
 
-/***/ 6562:
+/***/ 8452:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
@@ -69671,8 +73394,8 @@ exports.pollHttpOperation = pollHttpOperation;
 // Licensed under the MIT license.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createHttpPoller = void 0;
-const operation_js_1 = __nccwpck_require__(6562);
-const poller_js_1 = __nccwpck_require__(269);
+const operation_js_1 = __nccwpck_require__(8452);
+const poller_js_1 = __nccwpck_require__(2233);
 /**
  * Creates a poller that can be used to poll a long-running operation.
  * @param lro - Description of the long-running operation
@@ -69725,7 +73448,7 @@ exports.createHttpPoller = createHttpPoller;
 // Licensed under the MIT license.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createHttpPoller = void 0;
-const tslib_1 = __nccwpck_require__(6928);
+const tslib_1 = __nccwpck_require__(1772);
 var poller_js_1 = __nccwpck_require__(8969);
 Object.defineProperty(exports, "createHttpPoller", ({ enumerable: true, get: function () { return poller_js_1.createHttpPoller; } }));
 /**
@@ -69808,7 +73531,7 @@ exports.LroEngine = LroEngine;
 // Licensed under the MIT license.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.GenericPollOperation = void 0;
-const operation_js_1 = __nccwpck_require__(6562);
+const operation_js_1 = __nccwpck_require__(8452);
 const logger_js_1 = __nccwpck_require__(6558);
 const createStateProxy = () => ({
     initState: (config) => ({ config, isStarted: true }),
@@ -70530,7 +74253,7 @@ exports.pollOperation = pollOperation;
 
 /***/ }),
 
-/***/ 269:
+/***/ 2233:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
@@ -70540,7 +74263,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.buildCreatePoller = void 0;
 const operation_js_1 = __nccwpck_require__(5258);
 const constants_js_1 = __nccwpck_require__(474);
-const core_util_1 = __nccwpck_require__(8143);
+const core_util_1 = __nccwpck_require__(1910);
 const createStateProxy = () => ({
     /**
      * The state at this point is created to be of type OperationState<TResult>.
@@ -70710,41 +74433,42 @@ exports.buildCreatePoller = buildCreatePoller;
 
 /***/ }),
 
-/***/ 5631:
+/***/ 2086:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.DEFAULT_RETRY_POLICY_COUNT = exports.SDK_VERSION = void 0;
-exports.SDK_VERSION = "1.16.3";
+exports.SDK_VERSION = "1.19.1";
 exports.DEFAULT_RETRY_POLICY_COUNT = 3;
 //# sourceMappingURL=constants.js.map
 
 /***/ }),
 
-/***/ 6881:
+/***/ 7608:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createPipelineFromOptions = createPipelineFromOptions;
-const logPolicy_js_1 = __nccwpck_require__(8383);
-const pipeline_js_1 = __nccwpck_require__(4191);
-const redirectPolicy_js_1 = __nccwpck_require__(2960);
-const userAgentPolicy_js_1 = __nccwpck_require__(8254);
-const multipartPolicy_js_1 = __nccwpck_require__(8807);
-const decompressResponsePolicy_js_1 = __nccwpck_require__(9716);
-const defaultRetryPolicy_js_1 = __nccwpck_require__(6451);
-const formDataPolicy_js_1 = __nccwpck_require__(5204);
-const core_util_1 = __nccwpck_require__(8143);
-const proxyPolicy_js_1 = __nccwpck_require__(6360);
-const setClientRequestIdPolicy_js_1 = __nccwpck_require__(1334);
-const tlsPolicy_js_1 = __nccwpck_require__(8422);
-const tracingPolicy_js_1 = __nccwpck_require__(6105);
+const logPolicy_js_1 = __nccwpck_require__(1848);
+const pipeline_js_1 = __nccwpck_require__(1081);
+const redirectPolicy_js_1 = __nccwpck_require__(8395);
+const userAgentPolicy_js_1 = __nccwpck_require__(4221);
+const multipartPolicy_js_1 = __nccwpck_require__(5565);
+const decompressResponsePolicy_js_1 = __nccwpck_require__(5605);
+const defaultRetryPolicy_js_1 = __nccwpck_require__(3587);
+const formDataPolicy_js_1 = __nccwpck_require__(7848);
+const core_util_1 = __nccwpck_require__(1910);
+const proxyPolicy_js_1 = __nccwpck_require__(1586);
+const setClientRequestIdPolicy_js_1 = __nccwpck_require__(8700);
+const agentPolicy_js_1 = __nccwpck_require__(2906);
+const tlsPolicy_js_1 = __nccwpck_require__(940);
+const tracingPolicy_js_1 = __nccwpck_require__(9627);
 /**
  * Create a new pipeline with a default set of customizable policies.
  * @param options - Options to configure a custom pipeline.
@@ -70753,6 +74477,9 @@ function createPipelineFromOptions(options) {
     var _a;
     const pipeline = (0, pipeline_js_1.createEmptyPipeline)();
     if (core_util_1.isNodeLike) {
+        if (options.agent) {
+            pipeline.addPolicy((0, agentPolicy_js_1.agentPolicy)(options.agent));
+        }
         if (options.tlsOptions) {
             pipeline.addPolicy((0, tlsPolicy_js_1.tlsPolicy)(options.tlsOptions));
         }
@@ -70782,15 +74509,15 @@ function createPipelineFromOptions(options) {
 
 /***/ }),
 
-/***/ 1936:
+/***/ 4823:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createDefaultHttpClient = createDefaultHttpClient;
-const nodeHttpClient_js_1 = __nccwpck_require__(4093);
+const nodeHttpClient_js_1 = __nccwpck_require__(5625);
 /**
  * Create the correct HttpClient for the current environment.
  */
@@ -70801,12 +74528,12 @@ function createDefaultHttpClient() {
 
 /***/ }),
 
-/***/ 3488:
+/***/ 3302:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createHttpHeaders = createHttpHeaders;
 function normalizeName(name) {
@@ -70899,93 +74626,96 @@ function createHttpHeaders(rawHeaders) {
 
 /***/ }),
 
-/***/ 7314:
+/***/ 7371:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createFileFromStream = exports.createFile = exports.auxiliaryAuthenticationHeaderPolicyName = exports.auxiliaryAuthenticationHeaderPolicy = exports.ndJsonPolicyName = exports.ndJsonPolicy = exports.bearerTokenAuthenticationPolicyName = exports.bearerTokenAuthenticationPolicy = exports.formDataPolicyName = exports.formDataPolicy = exports.tlsPolicyName = exports.tlsPolicy = exports.userAgentPolicyName = exports.userAgentPolicy = exports.defaultRetryPolicy = exports.tracingPolicyName = exports.tracingPolicy = exports.retryPolicy = exports.throttlingRetryPolicyName = exports.throttlingRetryPolicy = exports.systemErrorRetryPolicyName = exports.systemErrorRetryPolicy = exports.redirectPolicyName = exports.redirectPolicy = exports.getDefaultProxySettings = exports.proxyPolicyName = exports.proxyPolicy = exports.multipartPolicyName = exports.multipartPolicy = exports.logPolicyName = exports.logPolicy = exports.setClientRequestIdPolicyName = exports.setClientRequestIdPolicy = exports.exponentialRetryPolicyName = exports.exponentialRetryPolicy = exports.decompressResponsePolicyName = exports.decompressResponsePolicy = exports.isRestError = exports.RestError = exports.createPipelineRequest = exports.createHttpHeaders = exports.createDefaultHttpClient = exports.createPipelineFromOptions = exports.createEmptyPipeline = void 0;
-var pipeline_js_1 = __nccwpck_require__(4191);
+exports.createFileFromStream = exports.createFile = exports.agentPolicyName = exports.agentPolicy = exports.auxiliaryAuthenticationHeaderPolicyName = exports.auxiliaryAuthenticationHeaderPolicy = exports.ndJsonPolicyName = exports.ndJsonPolicy = exports.bearerTokenAuthenticationPolicyName = exports.bearerTokenAuthenticationPolicy = exports.formDataPolicyName = exports.formDataPolicy = exports.tlsPolicyName = exports.tlsPolicy = exports.userAgentPolicyName = exports.userAgentPolicy = exports.defaultRetryPolicy = exports.tracingPolicyName = exports.tracingPolicy = exports.retryPolicy = exports.throttlingRetryPolicyName = exports.throttlingRetryPolicy = exports.systemErrorRetryPolicyName = exports.systemErrorRetryPolicy = exports.redirectPolicyName = exports.redirectPolicy = exports.getDefaultProxySettings = exports.proxyPolicyName = exports.proxyPolicy = exports.multipartPolicyName = exports.multipartPolicy = exports.logPolicyName = exports.logPolicy = exports.setClientRequestIdPolicyName = exports.setClientRequestIdPolicy = exports.exponentialRetryPolicyName = exports.exponentialRetryPolicy = exports.decompressResponsePolicyName = exports.decompressResponsePolicy = exports.isRestError = exports.RestError = exports.createPipelineRequest = exports.createHttpHeaders = exports.createDefaultHttpClient = exports.createPipelineFromOptions = exports.createEmptyPipeline = void 0;
+var pipeline_js_1 = __nccwpck_require__(1081);
 Object.defineProperty(exports, "createEmptyPipeline", ({ enumerable: true, get: function () { return pipeline_js_1.createEmptyPipeline; } }));
-var createPipelineFromOptions_js_1 = __nccwpck_require__(6881);
+var createPipelineFromOptions_js_1 = __nccwpck_require__(7608);
 Object.defineProperty(exports, "createPipelineFromOptions", ({ enumerable: true, get: function () { return createPipelineFromOptions_js_1.createPipelineFromOptions; } }));
-var defaultHttpClient_js_1 = __nccwpck_require__(1936);
+var defaultHttpClient_js_1 = __nccwpck_require__(4823);
 Object.defineProperty(exports, "createDefaultHttpClient", ({ enumerable: true, get: function () { return defaultHttpClient_js_1.createDefaultHttpClient; } }));
-var httpHeaders_js_1 = __nccwpck_require__(3488);
+var httpHeaders_js_1 = __nccwpck_require__(3302);
 Object.defineProperty(exports, "createHttpHeaders", ({ enumerable: true, get: function () { return httpHeaders_js_1.createHttpHeaders; } }));
-var pipelineRequest_js_1 = __nccwpck_require__(3375);
+var pipelineRequest_js_1 = __nccwpck_require__(8582);
 Object.defineProperty(exports, "createPipelineRequest", ({ enumerable: true, get: function () { return pipelineRequest_js_1.createPipelineRequest; } }));
-var restError_js_1 = __nccwpck_require__(6985);
+var restError_js_1 = __nccwpck_require__(306);
 Object.defineProperty(exports, "RestError", ({ enumerable: true, get: function () { return restError_js_1.RestError; } }));
 Object.defineProperty(exports, "isRestError", ({ enumerable: true, get: function () { return restError_js_1.isRestError; } }));
-var decompressResponsePolicy_js_1 = __nccwpck_require__(9716);
+var decompressResponsePolicy_js_1 = __nccwpck_require__(5605);
 Object.defineProperty(exports, "decompressResponsePolicy", ({ enumerable: true, get: function () { return decompressResponsePolicy_js_1.decompressResponsePolicy; } }));
 Object.defineProperty(exports, "decompressResponsePolicyName", ({ enumerable: true, get: function () { return decompressResponsePolicy_js_1.decompressResponsePolicyName; } }));
-var exponentialRetryPolicy_js_1 = __nccwpck_require__(2233);
+var exponentialRetryPolicy_js_1 = __nccwpck_require__(5182);
 Object.defineProperty(exports, "exponentialRetryPolicy", ({ enumerable: true, get: function () { return exponentialRetryPolicy_js_1.exponentialRetryPolicy; } }));
 Object.defineProperty(exports, "exponentialRetryPolicyName", ({ enumerable: true, get: function () { return exponentialRetryPolicy_js_1.exponentialRetryPolicyName; } }));
-var setClientRequestIdPolicy_js_1 = __nccwpck_require__(1334);
+var setClientRequestIdPolicy_js_1 = __nccwpck_require__(8700);
 Object.defineProperty(exports, "setClientRequestIdPolicy", ({ enumerable: true, get: function () { return setClientRequestIdPolicy_js_1.setClientRequestIdPolicy; } }));
 Object.defineProperty(exports, "setClientRequestIdPolicyName", ({ enumerable: true, get: function () { return setClientRequestIdPolicy_js_1.setClientRequestIdPolicyName; } }));
-var logPolicy_js_1 = __nccwpck_require__(8383);
+var logPolicy_js_1 = __nccwpck_require__(1848);
 Object.defineProperty(exports, "logPolicy", ({ enumerable: true, get: function () { return logPolicy_js_1.logPolicy; } }));
 Object.defineProperty(exports, "logPolicyName", ({ enumerable: true, get: function () { return logPolicy_js_1.logPolicyName; } }));
-var multipartPolicy_js_1 = __nccwpck_require__(8807);
+var multipartPolicy_js_1 = __nccwpck_require__(5565);
 Object.defineProperty(exports, "multipartPolicy", ({ enumerable: true, get: function () { return multipartPolicy_js_1.multipartPolicy; } }));
 Object.defineProperty(exports, "multipartPolicyName", ({ enumerable: true, get: function () { return multipartPolicy_js_1.multipartPolicyName; } }));
-var proxyPolicy_js_1 = __nccwpck_require__(6360);
+var proxyPolicy_js_1 = __nccwpck_require__(1586);
 Object.defineProperty(exports, "proxyPolicy", ({ enumerable: true, get: function () { return proxyPolicy_js_1.proxyPolicy; } }));
 Object.defineProperty(exports, "proxyPolicyName", ({ enumerable: true, get: function () { return proxyPolicy_js_1.proxyPolicyName; } }));
 Object.defineProperty(exports, "getDefaultProxySettings", ({ enumerable: true, get: function () { return proxyPolicy_js_1.getDefaultProxySettings; } }));
-var redirectPolicy_js_1 = __nccwpck_require__(2960);
+var redirectPolicy_js_1 = __nccwpck_require__(8395);
 Object.defineProperty(exports, "redirectPolicy", ({ enumerable: true, get: function () { return redirectPolicy_js_1.redirectPolicy; } }));
 Object.defineProperty(exports, "redirectPolicyName", ({ enumerable: true, get: function () { return redirectPolicy_js_1.redirectPolicyName; } }));
-var systemErrorRetryPolicy_js_1 = __nccwpck_require__(8009);
+var systemErrorRetryPolicy_js_1 = __nccwpck_require__(6165);
 Object.defineProperty(exports, "systemErrorRetryPolicy", ({ enumerable: true, get: function () { return systemErrorRetryPolicy_js_1.systemErrorRetryPolicy; } }));
 Object.defineProperty(exports, "systemErrorRetryPolicyName", ({ enumerable: true, get: function () { return systemErrorRetryPolicy_js_1.systemErrorRetryPolicyName; } }));
-var throttlingRetryPolicy_js_1 = __nccwpck_require__(3297);
+var throttlingRetryPolicy_js_1 = __nccwpck_require__(1853);
 Object.defineProperty(exports, "throttlingRetryPolicy", ({ enumerable: true, get: function () { return throttlingRetryPolicy_js_1.throttlingRetryPolicy; } }));
 Object.defineProperty(exports, "throttlingRetryPolicyName", ({ enumerable: true, get: function () { return throttlingRetryPolicy_js_1.throttlingRetryPolicyName; } }));
-var retryPolicy_js_1 = __nccwpck_require__(3261);
+var retryPolicy_js_1 = __nccwpck_require__(9473);
 Object.defineProperty(exports, "retryPolicy", ({ enumerable: true, get: function () { return retryPolicy_js_1.retryPolicy; } }));
-var tracingPolicy_js_1 = __nccwpck_require__(6105);
+var tracingPolicy_js_1 = __nccwpck_require__(9627);
 Object.defineProperty(exports, "tracingPolicy", ({ enumerable: true, get: function () { return tracingPolicy_js_1.tracingPolicy; } }));
 Object.defineProperty(exports, "tracingPolicyName", ({ enumerable: true, get: function () { return tracingPolicy_js_1.tracingPolicyName; } }));
-var defaultRetryPolicy_js_1 = __nccwpck_require__(6451);
+var defaultRetryPolicy_js_1 = __nccwpck_require__(3587);
 Object.defineProperty(exports, "defaultRetryPolicy", ({ enumerable: true, get: function () { return defaultRetryPolicy_js_1.defaultRetryPolicy; } }));
-var userAgentPolicy_js_1 = __nccwpck_require__(8254);
+var userAgentPolicy_js_1 = __nccwpck_require__(4221);
 Object.defineProperty(exports, "userAgentPolicy", ({ enumerable: true, get: function () { return userAgentPolicy_js_1.userAgentPolicy; } }));
 Object.defineProperty(exports, "userAgentPolicyName", ({ enumerable: true, get: function () { return userAgentPolicy_js_1.userAgentPolicyName; } }));
-var tlsPolicy_js_1 = __nccwpck_require__(8422);
+var tlsPolicy_js_1 = __nccwpck_require__(940);
 Object.defineProperty(exports, "tlsPolicy", ({ enumerable: true, get: function () { return tlsPolicy_js_1.tlsPolicy; } }));
 Object.defineProperty(exports, "tlsPolicyName", ({ enumerable: true, get: function () { return tlsPolicy_js_1.tlsPolicyName; } }));
-var formDataPolicy_js_1 = __nccwpck_require__(5204);
+var formDataPolicy_js_1 = __nccwpck_require__(7848);
 Object.defineProperty(exports, "formDataPolicy", ({ enumerable: true, get: function () { return formDataPolicy_js_1.formDataPolicy; } }));
 Object.defineProperty(exports, "formDataPolicyName", ({ enumerable: true, get: function () { return formDataPolicy_js_1.formDataPolicyName; } }));
-var bearerTokenAuthenticationPolicy_js_1 = __nccwpck_require__(8050);
+var bearerTokenAuthenticationPolicy_js_1 = __nccwpck_require__(6221);
 Object.defineProperty(exports, "bearerTokenAuthenticationPolicy", ({ enumerable: true, get: function () { return bearerTokenAuthenticationPolicy_js_1.bearerTokenAuthenticationPolicy; } }));
 Object.defineProperty(exports, "bearerTokenAuthenticationPolicyName", ({ enumerable: true, get: function () { return bearerTokenAuthenticationPolicy_js_1.bearerTokenAuthenticationPolicyName; } }));
-var ndJsonPolicy_js_1 = __nccwpck_require__(1970);
+var ndJsonPolicy_js_1 = __nccwpck_require__(5128);
 Object.defineProperty(exports, "ndJsonPolicy", ({ enumerable: true, get: function () { return ndJsonPolicy_js_1.ndJsonPolicy; } }));
 Object.defineProperty(exports, "ndJsonPolicyName", ({ enumerable: true, get: function () { return ndJsonPolicy_js_1.ndJsonPolicyName; } }));
-var auxiliaryAuthenticationHeaderPolicy_js_1 = __nccwpck_require__(5864);
+var auxiliaryAuthenticationHeaderPolicy_js_1 = __nccwpck_require__(7512);
 Object.defineProperty(exports, "auxiliaryAuthenticationHeaderPolicy", ({ enumerable: true, get: function () { return auxiliaryAuthenticationHeaderPolicy_js_1.auxiliaryAuthenticationHeaderPolicy; } }));
 Object.defineProperty(exports, "auxiliaryAuthenticationHeaderPolicyName", ({ enumerable: true, get: function () { return auxiliaryAuthenticationHeaderPolicy_js_1.auxiliaryAuthenticationHeaderPolicyName; } }));
-var file_js_1 = __nccwpck_require__(8990);
+var agentPolicy_js_1 = __nccwpck_require__(2906);
+Object.defineProperty(exports, "agentPolicy", ({ enumerable: true, get: function () { return agentPolicy_js_1.agentPolicy; } }));
+Object.defineProperty(exports, "agentPolicyName", ({ enumerable: true, get: function () { return agentPolicy_js_1.agentPolicyName; } }));
+var file_js_1 = __nccwpck_require__(5830);
 Object.defineProperty(exports, "createFile", ({ enumerable: true, get: function () { return file_js_1.createFile; } }));
 Object.defineProperty(exports, "createFileFromStream", ({ enumerable: true, get: function () { return file_js_1.createFileFromStream; } }));
 //# sourceMappingURL=index.js.map
 
 /***/ }),
 
-/***/ 5666:
+/***/ 3187:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.logger = void 0;
 const logger_1 = __nccwpck_require__(2208);
@@ -70994,40 +74724,50 @@ exports.logger = (0, logger_1.createClientLogger)("core-rest-pipeline");
 
 /***/ }),
 
-/***/ 4093:
+/***/ 5625:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getBodyLength = getBodyLength;
 exports.createNodeHttpClient = createNodeHttpClient;
-const tslib_1 = __nccwpck_require__(6928);
+const tslib_1 = __nccwpck_require__(1772);
 const http = tslib_1.__importStar(__nccwpck_require__(8849));
 const https = tslib_1.__importStar(__nccwpck_require__(2286));
 const zlib = tslib_1.__importStar(__nccwpck_require__(5628));
 const node_stream_1 = __nccwpck_require__(4492);
 const abort_controller_1 = __nccwpck_require__(5964);
-const httpHeaders_js_1 = __nccwpck_require__(3488);
-const restError_js_1 = __nccwpck_require__(6985);
-const log_js_1 = __nccwpck_require__(5666);
+const httpHeaders_js_1 = __nccwpck_require__(3302);
+const restError_js_1 = __nccwpck_require__(306);
+const log_js_1 = __nccwpck_require__(3187);
+const sanitizer_js_1 = __nccwpck_require__(5349);
 const DEFAULT_TLS_SETTINGS = {};
 function isReadableStream(body) {
     return body && typeof body.pipe === "function";
 }
 function isStreamComplete(stream) {
+    if (stream.readable === false) {
+        return Promise.resolve();
+    }
     return new Promise((resolve) => {
-        stream.on("close", resolve);
-        stream.on("end", resolve);
-        stream.on("error", resolve);
+        const handler = () => {
+            resolve();
+            stream.removeListener("close", handler);
+            stream.removeListener("end", handler);
+            stream.removeListener("error", handler);
+        };
+        stream.on("close", handler);
+        stream.on("end", handler);
+        stream.on("error", handler);
     });
 }
 function isArrayBuffer(body) {
     return body && typeof body.byteLength === "number";
 }
 class ReportTransform extends node_stream_1.Transform {
-    // eslint-disable-next-line @typescript-eslint/ban-types
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     _transform(chunk, _encoding, callback) {
         this.push(chunk);
         this.loadedBytes += chunk.length;
@@ -71063,7 +74803,7 @@ class NodeHttpClient {
         let abortListener;
         if (request.abortSignal) {
             if (request.abortSignal.aborted) {
-                throw new abort_controller_1.AbortError("The operation was aborted.");
+                throw new abort_controller_1.AbortError("The operation was aborted. Request has already been canceled.");
             }
             abortListener = (event) => {
                 if (event.type === "abort") {
@@ -71072,8 +74812,11 @@ class NodeHttpClient {
             };
             request.abortSignal.addEventListener("abort", abortListener);
         }
+        let timeoutId;
         if (request.timeout > 0) {
-            setTimeout(() => {
+            timeoutId = setTimeout(() => {
+                const sanitizer = new sanitizer_js_1.Sanitizer();
+                log_js_1.logger.info(`request to '${sanitizer.sanitizeUrl(request.url)}' timed out. canceling...`);
                 abortController.abort();
             }, request.timeout);
         }
@@ -71103,6 +74846,9 @@ class NodeHttpClient {
                 body = uploadReportStream;
             }
             const res = await this.makeRequest(request, abortController, body);
+            if (timeoutId !== undefined) {
+                clearTimeout(timeoutId);
+            }
             const headers = getResponseHeaders(res);
             const status = (_a = res.statusCode) !== null && _a !== void 0 ? _a : 0;
             const response = {
@@ -71187,7 +74933,7 @@ class NodeHttpClient {
                 reject(new restError_js_1.RestError(err.message, { code: (_a = err.code) !== null && _a !== void 0 ? _a : restError_js_1.RestError.REQUEST_SEND_ERROR, request }));
             });
             abortController.signal.addEventListener("abort", () => {
-                const abortError = new abort_controller_1.AbortError("The operation was aborted.");
+                const abortError = new abort_controller_1.AbortError("The operation was aborted. Rejecting from abort signal callback while making request.");
                 req.destroy(abortError);
                 reject(abortError);
             });
@@ -71337,12 +75083,12 @@ function createNodeHttpClient() {
 
 /***/ }),
 
-/***/ 4191:
+/***/ 1081:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createEmptyPipeline = createEmptyPipeline;
 const ValidPhaseNames = new Set(["Deserialize", "Serialize", "Retry", "Sign"]);
@@ -71608,16 +75354,16 @@ function createEmptyPipeline() {
 
 /***/ }),
 
-/***/ 3375:
+/***/ 8582:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createPipelineRequest = createPipelineRequest;
-const httpHeaders_js_1 = __nccwpck_require__(3488);
-const core_util_1 = __nccwpck_require__(8143);
+const httpHeaders_js_1 = __nccwpck_require__(3302);
+const core_util_1 = __nccwpck_require__(1910);
 class PipelineRequestImpl {
     constructor(options) {
         var _a, _b, _c, _d, _e, _f, _g;
@@ -71639,6 +75385,8 @@ class PipelineRequestImpl {
         this.requestId = options.requestId || (0, core_util_1.randomUUID)();
         this.allowInsecureConnection = (_f = options.allowInsecureConnection) !== null && _f !== void 0 ? _f : false;
         this.enableBrowserStreams = (_g = options.enableBrowserStreams) !== null && _g !== void 0 ? _g : false;
+        this.agent = options.agent;
+        this.tlsSettings = options.tlsSettings;
     }
 }
 /**
@@ -71653,17 +75401,49 @@ function createPipelineRequest(options) {
 
 /***/ }),
 
-/***/ 5864:
+/***/ 2906:
+/***/ ((__unused_webpack_module, exports) => {
+
+
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.agentPolicyName = void 0;
+exports.agentPolicy = agentPolicy;
+/**
+ * Name of the Agent Policy
+ */
+exports.agentPolicyName = "agentPolicy";
+/**
+ * Gets a pipeline policy that sets http.agent
+ */
+function agentPolicy(agent) {
+    return {
+        name: exports.agentPolicyName,
+        sendRequest: async (req, next) => {
+            // Users may define an agent on the request, honor it over the client level one
+            if (!req.agent) {
+                req.agent = agent;
+            }
+            return next(req);
+        },
+    };
+}
+//# sourceMappingURL=agentPolicy.js.map
+
+/***/ }),
+
+/***/ 7512:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.auxiliaryAuthenticationHeaderPolicyName = void 0;
 exports.auxiliaryAuthenticationHeaderPolicy = auxiliaryAuthenticationHeaderPolicy;
-const tokenCycler_js_1 = __nccwpck_require__(7902);
-const log_js_1 = __nccwpck_require__(5666);
+const tokenCycler_js_1 = __nccwpck_require__(6382);
+const log_js_1 = __nccwpck_require__(3187);
 /**
  * The programmatic identifier of the auxiliaryAuthenticationHeaderPolicy.
  */
@@ -71726,29 +75506,55 @@ function auxiliaryAuthenticationHeaderPolicy(options) {
 
 /***/ }),
 
-/***/ 8050:
+/***/ 6221:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.bearerTokenAuthenticationPolicyName = void 0;
 exports.bearerTokenAuthenticationPolicy = bearerTokenAuthenticationPolicy;
-const tokenCycler_js_1 = __nccwpck_require__(7902);
-const log_js_1 = __nccwpck_require__(5666);
+exports.parseChallenges = parseChallenges;
+const tokenCycler_js_1 = __nccwpck_require__(6382);
+const log_js_1 = __nccwpck_require__(3187);
+const restError_js_1 = __nccwpck_require__(306);
 /**
  * The programmatic identifier of the bearerTokenAuthenticationPolicy.
  */
 exports.bearerTokenAuthenticationPolicyName = "bearerTokenAuthenticationPolicy";
 /**
+ * Try to send the given request.
+ *
+ * When a response is received, returns a tuple of the response received and, if the response was received
+ * inside a thrown RestError, the RestError that was thrown.
+ *
+ * Otherwise, if an error was thrown while sending the request that did not provide an underlying response, it
+ * will be rethrown.
+ */
+async function trySendRequest(request, next) {
+    try {
+        return [await next(request), undefined];
+    }
+    catch (e) {
+        if ((0, restError_js_1.isRestError)(e) && e.response) {
+            return [e.response, e];
+        }
+        else {
+            throw e;
+        }
+    }
+}
+/**
  * Default authorize request handler
  */
 async function defaultAuthorizeRequest(options) {
     const { scopes, getAccessToken, request } = options;
+    // Enable CAE true by default
     const getTokenOptions = {
         abortSignal: request.abortSignal,
         tracingOptions: request.tracingOptions,
+        enableCae: true,
     };
     const accessToken = await getAccessToken(scopes, getTokenOptions);
     if (accessToken) {
@@ -71759,22 +75565,39 @@ async function defaultAuthorizeRequest(options) {
  * We will retrieve the challenge only if the response status code was 401,
  * and if the response contained the header "WWW-Authenticate" with a non-empty value.
  */
-function getChallenge(response) {
-    const challenge = response.headers.get("WWW-Authenticate");
-    if (response.status === 401 && challenge) {
-        return challenge;
+function isChallengeResponse(response) {
+    return response.status === 401 && response.headers.has("WWW-Authenticate");
+}
+/**
+ * Re-authorize the request for CAE challenge.
+ * The response containing the challenge is `options.response`.
+ * If this method returns true, the underlying request will be sent once again.
+ */
+async function authorizeRequestOnCaeChallenge(onChallengeOptions, caeClaims) {
+    var _a;
+    const { scopes } = onChallengeOptions;
+    const accessToken = await onChallengeOptions.getAccessToken(scopes, {
+        enableCae: true,
+        claims: caeClaims,
+    });
+    if (!accessToken) {
+        return false;
     }
-    return;
+    onChallengeOptions.request.headers.set("Authorization", `${(_a = accessToken.tokenType) !== null && _a !== void 0 ? _a : "Bearer"} ${accessToken.token}`);
+    return true;
 }
 /**
  * A policy that can request a token from a TokenCredential implementation and
  * then apply it to the Authorization header of a request as a Bearer token.
  */
 function bearerTokenAuthenticationPolicy(options) {
-    var _a;
+    var _a, _b, _c;
     const { credential, scopes, challengeCallbacks } = options;
     const logger = options.logger || log_js_1.logger;
-    const callbacks = Object.assign({ authorizeRequest: (_a = challengeCallbacks === null || challengeCallbacks === void 0 ? void 0 : challengeCallbacks.authorizeRequest) !== null && _a !== void 0 ? _a : defaultAuthorizeRequest, authorizeRequestOnChallenge: challengeCallbacks === null || challengeCallbacks === void 0 ? void 0 : challengeCallbacks.authorizeRequestOnChallenge }, challengeCallbacks);
+    const callbacks = {
+        authorizeRequest: (_b = (_a = challengeCallbacks === null || challengeCallbacks === void 0 ? void 0 : challengeCallbacks.authorizeRequest) === null || _a === void 0 ? void 0 : _a.bind(challengeCallbacks)) !== null && _b !== void 0 ? _b : defaultAuthorizeRequest,
+        authorizeRequestOnChallenge: (_c = challengeCallbacks === null || challengeCallbacks === void 0 ? void 0 : challengeCallbacks.authorizeRequestOnChallenge) === null || _c === void 0 ? void 0 : _c.bind(challengeCallbacks),
+    };
     // This function encapsulates the entire process of reliably retrieving the token
     // The options are left out of the public API until there's demand to configure this.
     // Remember to extend `BearerTokenAuthenticationPolicyOptions` with `TokenCyclerOptions`
@@ -71809,26 +75632,71 @@ function bearerTokenAuthenticationPolicy(options) {
             });
             let response;
             let error;
-            try {
-                response = await next(request);
-            }
-            catch (err) {
-                error = err;
-                response = err.response;
-            }
-            if (callbacks.authorizeRequestOnChallenge &&
-                (response === null || response === void 0 ? void 0 : response.status) === 401 &&
-                getChallenge(response)) {
-                // processes challenge
-                const shouldSendRequest = await callbacks.authorizeRequestOnChallenge({
-                    scopes: Array.isArray(scopes) ? scopes : [scopes],
-                    request,
-                    response,
-                    getAccessToken,
-                    logger,
-                });
-                if (shouldSendRequest) {
-                    return next(request);
+            let shouldSendRequest;
+            [response, error] = await trySendRequest(request, next);
+            if (isChallengeResponse(response)) {
+                let claims = getCaeChallengeClaims(response.headers.get("WWW-Authenticate"));
+                // Handle CAE by default when receive CAE claim
+                if (claims) {
+                    let parsedClaim;
+                    // Return the response immediately if claims is not a valid base64 encoded string
+                    try {
+                        parsedClaim = atob(claims);
+                    }
+                    catch (e) {
+                        logger.warning(`The WWW-Authenticate header contains "claims" that cannot be parsed. Unable to perform the Continuous Access Evaluation authentication flow. Unparsable claims: ${claims}`);
+                        return response;
+                    }
+                    shouldSendRequest = await authorizeRequestOnCaeChallenge({
+                        scopes: Array.isArray(scopes) ? scopes : [scopes],
+                        response,
+                        request,
+                        getAccessToken,
+                        logger,
+                    }, parsedClaim);
+                    // Send updated request and handle response for RestError
+                    if (shouldSendRequest) {
+                        [response, error] = await trySendRequest(request, next);
+                    }
+                }
+                else if (callbacks.authorizeRequestOnChallenge) {
+                    // Handle custom challenges when client provides custom callback
+                    shouldSendRequest = await callbacks.authorizeRequestOnChallenge({
+                        scopes: Array.isArray(scopes) ? scopes : [scopes],
+                        request,
+                        response,
+                        getAccessToken,
+                        logger,
+                    });
+                    // Send updated request and handle response for RestError
+                    if (shouldSendRequest) {
+                        [response, error] = await trySendRequest(request, next);
+                    }
+                    // If we get another CAE Claim, we will handle it by default and return whatever value we receive for this
+                    if (isChallengeResponse(response)) {
+                        claims = getCaeChallengeClaims(response.headers.get("WWW-Authenticate"));
+                        if (claims) {
+                            let parsedClaim;
+                            try {
+                                parsedClaim = atob(claims);
+                            }
+                            catch (e) {
+                                logger.warning(`The WWW-Authenticate header contains "claims" that cannot be parsed. Unable to perform the Continuous Access Evaluation authentication flow. Unparsable claims: ${claims}`);
+                                return response;
+                            }
+                            shouldSendRequest = await authorizeRequestOnCaeChallenge({
+                                scopes: Array.isArray(scopes) ? scopes : [scopes],
+                                response,
+                                request,
+                                getAccessToken,
+                                logger,
+                            }, parsedClaim);
+                            // Send updated request and handle response for RestError
+                            if (shouldSendRequest) {
+                                [response, error] = await trySendRequest(request, next);
+                            }
+                        }
+                    }
                 }
             }
             if (error) {
@@ -71840,16 +75708,59 @@ function bearerTokenAuthenticationPolicy(options) {
         },
     };
 }
+/**
+ * Converts: `Bearer a="b", c="d", Pop e="f", g="h"`.
+ * Into: `[ { scheme: 'Bearer', params: { a: 'b', c: 'd' } }, { scheme: 'Pop', params: { e: 'f', g: 'h' } } ]`.
+ *
+ * @internal
+ */
+function parseChallenges(challenges) {
+    // Challenge regex seperates the string to individual challenges with different schemes in the format `Scheme a="b", c=d`
+    // The challenge regex captures parameteres with either quotes values or unquoted values
+    const challengeRegex = /(\w+)\s+((?:\w+=(?:"[^"]*"|[^,]*),?\s*)+)/g;
+    // Parameter regex captures the claims group removed from the scheme in the format `a="b"` and `c="d"`
+    // CAE challenge always have quoted parameters. For more reference, https://learn.microsoft.com/entra/identity-platform/claims-challenge
+    const paramRegex = /(\w+)="([^"]*)"/g;
+    const parsedChallenges = [];
+    let match;
+    // Iterate over each challenge match
+    while ((match = challengeRegex.exec(challenges)) !== null) {
+        const scheme = match[1];
+        const paramsString = match[2];
+        const params = {};
+        let paramMatch;
+        // Iterate over each parameter match
+        while ((paramMatch = paramRegex.exec(paramsString)) !== null) {
+            params[paramMatch[1]] = paramMatch[2];
+        }
+        parsedChallenges.push({ scheme, params });
+    }
+    return parsedChallenges;
+}
+/**
+ * Parse a pipeline response and look for a CAE challenge with "Bearer" scheme
+ * Return the value in the header without parsing the challenge
+ * @internal
+ */
+function getCaeChallengeClaims(challenges) {
+    var _a;
+    if (!challenges) {
+        return;
+    }
+    // Find all challenges present in the header
+    const parsedChallenges = parseChallenges(challenges);
+    return (_a = parsedChallenges.find((x) => x.scheme === "Bearer" && x.params.claims && x.params.error === "insufficient_claims")) === null || _a === void 0 ? void 0 : _a.params.claims;
+}
 //# sourceMappingURL=bearerTokenAuthenticationPolicy.js.map
 
 /***/ }),
 
-/***/ 9716:
+/***/ 5605:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.decompressResponsePolicyName = void 0;
 exports.decompressResponsePolicy = decompressResponsePolicy;
@@ -71877,19 +75788,19 @@ function decompressResponsePolicy() {
 
 /***/ }),
 
-/***/ 6451:
+/***/ 3587:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.defaultRetryPolicyName = void 0;
 exports.defaultRetryPolicy = defaultRetryPolicy;
-const exponentialRetryStrategy_js_1 = __nccwpck_require__(3901);
-const throttlingRetryStrategy_js_1 = __nccwpck_require__(6922);
-const retryPolicy_js_1 = __nccwpck_require__(3261);
-const constants_js_1 = __nccwpck_require__(5631);
+const exponentialRetryStrategy_js_1 = __nccwpck_require__(9146);
+const throttlingRetryStrategy_js_1 = __nccwpck_require__(6016);
+const retryPolicy_js_1 = __nccwpck_require__(9473);
+const constants_js_1 = __nccwpck_require__(2086);
 /**
  * Name of the {@link defaultRetryPolicy}
  */
@@ -71913,18 +75824,18 @@ function defaultRetryPolicy(options = {}) {
 
 /***/ }),
 
-/***/ 2233:
+/***/ 5182:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.exponentialRetryPolicyName = void 0;
 exports.exponentialRetryPolicy = exponentialRetryPolicy;
-const exponentialRetryStrategy_js_1 = __nccwpck_require__(3901);
-const retryPolicy_js_1 = __nccwpck_require__(3261);
-const constants_js_1 = __nccwpck_require__(5631);
+const exponentialRetryStrategy_js_1 = __nccwpck_require__(9146);
+const retryPolicy_js_1 = __nccwpck_require__(9473);
+const constants_js_1 = __nccwpck_require__(2086);
 /**
  * The programmatic identifier of the exponentialRetryPolicy.
  */
@@ -71945,17 +75856,17 @@ function exponentialRetryPolicy(options = {}) {
 
 /***/ }),
 
-/***/ 5204:
+/***/ 7848:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.formDataPolicyName = void 0;
 exports.formDataPolicy = formDataPolicy;
-const core_util_1 = __nccwpck_require__(8143);
-const httpHeaders_js_1 = __nccwpck_require__(3488);
+const core_util_1 = __nccwpck_require__(1910);
+const httpHeaders_js_1 = __nccwpck_require__(3302);
 /**
  * The programmatic identifier of the formDataPolicy.
  */
@@ -72051,17 +75962,17 @@ async function prepareFormData(formData, request) {
 
 /***/ }),
 
-/***/ 8383:
+/***/ 1848:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.logPolicyName = void 0;
 exports.logPolicy = logPolicy;
-const log_js_1 = __nccwpck_require__(5666);
-const sanitizer_js_1 = __nccwpck_require__(8464);
+const log_js_1 = __nccwpck_require__(3187);
+const sanitizer_js_1 = __nccwpck_require__(5349);
 /**
  * The programmatic identifier of the logPolicy.
  */
@@ -72095,18 +76006,18 @@ function logPolicy(options = {}) {
 
 /***/ }),
 
-/***/ 8807:
+/***/ 5565:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.multipartPolicyName = void 0;
 exports.multipartPolicy = multipartPolicy;
-const core_util_1 = __nccwpck_require__(8143);
-const concat_js_1 = __nccwpck_require__(2694);
-const typeGuards_js_1 = __nccwpck_require__(7734);
+const core_util_1 = __nccwpck_require__(1910);
+const concat_js_1 = __nccwpck_require__(8579);
+const typeGuards_js_1 = __nccwpck_require__(9172);
 function generateBoundary() {
     return `----AzSDKFormBoundary${(0, core_util_1.randomUUID)()}`;
 }
@@ -72216,12 +76127,12 @@ function multipartPolicy() {
 
 /***/ }),
 
-/***/ 1970:
+/***/ 5128:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.ndJsonPolicyName = void 0;
 exports.ndJsonPolicy = ndJsonPolicy;
@@ -72251,20 +76162,20 @@ function ndJsonPolicy() {
 
 /***/ }),
 
-/***/ 6360:
+/***/ 1586:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.globalNoProxyList = exports.proxyPolicyName = void 0;
 exports.loadNoProxy = loadNoProxy;
 exports.getDefaultProxySettings = getDefaultProxySettings;
 exports.proxyPolicy = proxyPolicy;
-const https_proxy_agent_1 = __nccwpck_require__(2838);
+const https_proxy_agent_1 = __nccwpck_require__(4178);
 const http_proxy_agent_1 = __nccwpck_require__(6628);
-const log_js_1 = __nccwpck_require__(5666);
+const log_js_1 = __nccwpck_require__(3187);
 const HTTPS_PROXY = "HTTPS_PROXY";
 const HTTP_PROXY = "HTTP_PROXY";
 const ALL_PROXY = "ALL_PROXY";
@@ -72382,7 +76293,7 @@ function getUrlFromProxySettings(settings) {
     try {
         parsedProxyUrl = new URL(settings.host);
     }
-    catch (_error) {
+    catch (_a) {
         throw new Error(`Expecting a valid host string in proxy settings, but found "${settings.host}".`);
     }
     parsedProxyUrl.port = String(settings.port);
@@ -72454,12 +76365,12 @@ function proxyPolicy(proxySettings, options) {
 
 /***/ }),
 
-/***/ 2960:
+/***/ 8395:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.redirectPolicyName = void 0;
 exports.redirectPolicy = redirectPolicy;
@@ -72516,18 +76427,18 @@ async function handleRedirect(next, response, maxRetries, currentRetries = 0) {
 
 /***/ }),
 
-/***/ 3261:
+/***/ 9473:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.retryPolicy = retryPolicy;
-const helpers_js_1 = __nccwpck_require__(7714);
+const helpers_js_1 = __nccwpck_require__(534);
 const logger_1 = __nccwpck_require__(2208);
 const abort_controller_1 = __nccwpck_require__(5964);
-const constants_js_1 = __nccwpck_require__(5631);
+const constants_js_1 = __nccwpck_require__(2086);
 const retryPolicyLogger = (0, logger_1.createClientLogger)("core-rest-pipeline retryPolicy");
 /**
  * The programmatic identifier of the retryPolicy.
@@ -72545,7 +76456,6 @@ function retryPolicy(strategies, options = { maxRetries: constants_js_1.DEFAULT_
             let response;
             let responseError;
             let retryCount = -1;
-            // eslint-disable-next-line no-constant-condition
             retryRequest: while (true) {
                 retryCount += 1;
                 response = undefined;
@@ -72631,12 +76541,12 @@ function retryPolicy(strategies, options = { maxRetries: constants_js_1.DEFAULT_
 
 /***/ }),
 
-/***/ 1334:
+/***/ 8700:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.setClientRequestIdPolicyName = void 0;
 exports.setClientRequestIdPolicy = setClientRequestIdPolicy;
@@ -72665,18 +76575,18 @@ function setClientRequestIdPolicy(requestIdHeaderName = "x-ms-client-request-id"
 
 /***/ }),
 
-/***/ 8009:
+/***/ 6165:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.systemErrorRetryPolicyName = void 0;
 exports.systemErrorRetryPolicy = systemErrorRetryPolicy;
-const exponentialRetryStrategy_js_1 = __nccwpck_require__(3901);
-const retryPolicy_js_1 = __nccwpck_require__(3261);
-const constants_js_1 = __nccwpck_require__(5631);
+const exponentialRetryStrategy_js_1 = __nccwpck_require__(9146);
+const retryPolicy_js_1 = __nccwpck_require__(9473);
+const constants_js_1 = __nccwpck_require__(2086);
 /**
  * Name of the {@link systemErrorRetryPolicy}
  */
@@ -72702,18 +76612,18 @@ function systemErrorRetryPolicy(options = {}) {
 
 /***/ }),
 
-/***/ 3297:
+/***/ 1853:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.throttlingRetryPolicyName = void 0;
 exports.throttlingRetryPolicy = throttlingRetryPolicy;
-const throttlingRetryStrategy_js_1 = __nccwpck_require__(6922);
-const retryPolicy_js_1 = __nccwpck_require__(3261);
-const constants_js_1 = __nccwpck_require__(5631);
+const throttlingRetryStrategy_js_1 = __nccwpck_require__(6016);
+const retryPolicy_js_1 = __nccwpck_require__(9473);
+const constants_js_1 = __nccwpck_require__(2086);
 /**
  * Name of the {@link throttlingRetryPolicy}
  */
@@ -72722,9 +76632,9 @@ exports.throttlingRetryPolicyName = "throttlingRetryPolicy";
  * A policy that retries when the server sends a 429 response with a Retry-After header.
  *
  * To learn more, please refer to
- * https://docs.microsoft.com/en-us/azure/azure-resource-manager/resource-manager-request-limits,
- * https://docs.microsoft.com/en-us/azure/azure-subscription-service-limits and
- * https://docs.microsoft.com/en-us/azure/virtual-machines/troubleshooting/troubleshooting-throttling-errors
+ * https://learn.microsoft.com/en-us/azure/azure-resource-manager/resource-manager-request-limits,
+ * https://learn.microsoft.com/en-us/azure/azure-subscription-service-limits and
+ * https://learn.microsoft.com/en-us/azure/virtual-machines/troubleshooting/troubleshooting-throttling-errors
  *
  * @param options - Options that configure retry logic.
  */
@@ -72741,12 +76651,12 @@ function throttlingRetryPolicy(options = {}) {
 
 /***/ }),
 
-/***/ 8422:
+/***/ 940:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.tlsPolicyName = void 0;
 exports.tlsPolicy = tlsPolicy;
@@ -72773,22 +76683,22 @@ function tlsPolicy(tlsSettings) {
 
 /***/ }),
 
-/***/ 6105:
+/***/ 9627:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.tracingPolicyName = void 0;
 exports.tracingPolicy = tracingPolicy;
-const core_tracing_1 = __nccwpck_require__(7423);
-const constants_js_1 = __nccwpck_require__(5631);
-const userAgent_js_1 = __nccwpck_require__(8478);
-const log_js_1 = __nccwpck_require__(5666);
-const core_util_1 = __nccwpck_require__(8143);
-const restError_js_1 = __nccwpck_require__(6985);
-const sanitizer_js_1 = __nccwpck_require__(8464);
+const core_tracing_1 = __nccwpck_require__(3810);
+const constants_js_1 = __nccwpck_require__(2086);
+const userAgent_js_1 = __nccwpck_require__(2768);
+const log_js_1 = __nccwpck_require__(3187);
+const core_util_1 = __nccwpck_require__(1910);
+const restError_js_1 = __nccwpck_require__(306);
+const sanitizer_js_1 = __nccwpck_require__(5349);
 /**
  * The programmatic identifier of the tracingPolicy.
  */
@@ -72808,8 +76718,8 @@ function tracingPolicy(options = {}) {
     return {
         name: exports.tracingPolicyName,
         async sendRequest(request, next) {
-            var _a, _b;
-            if (!tracingClient || !((_a = request.tracingOptions) === null || _a === void 0 ? void 0 : _a.tracingContext)) {
+            var _a;
+            if (!tracingClient) {
                 return next(request);
             }
             const userAgent = await userAgentPromise;
@@ -72822,7 +76732,7 @@ function tracingPolicy(options = {}) {
             if (userAgent) {
                 spanAttributes["http.user_agent"] = userAgent;
             }
-            const { span, tracingContext } = (_b = tryCreateSpan(tracingClient, request, spanAttributes)) !== null && _b !== void 0 ? _b : {};
+            const { span, tracingContext } = (_a = tryCreateSpan(tracingClient, request, spanAttributes)) !== null && _a !== void 0 ? _a : {};
             if (!span || !tracingContext) {
                 return next(request);
             }
@@ -72897,9 +76807,14 @@ function tryProcessResponse(span, response) {
         if (serviceRequestId) {
             span.setAttribute("serviceRequestId", serviceRequestId);
         }
-        span.setStatus({
-            status: "success",
-        });
+        // Per semantic conventions, only set the status to error if the status code is 4xx or 5xx.
+        // Otherwise, the status MUST remain unset.
+        // https://opentelemetry.io/docs/specs/semconv/http/http-spans/#status
+        if (response.status >= 400) {
+            span.setStatus({
+                status: "error",
+            });
+        }
         span.end();
     }
     catch (e) {
@@ -72910,16 +76825,16 @@ function tryProcessResponse(span, response) {
 
 /***/ }),
 
-/***/ 8254:
+/***/ 4221:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.userAgentPolicyName = void 0;
 exports.userAgentPolicy = userAgentPolicy;
-const userAgent_js_1 = __nccwpck_require__(8478);
+const userAgent_js_1 = __nccwpck_require__(2768);
 const UserAgentHeaderName = (0, userAgent_js_1.getUserAgentHeaderName)();
 /**
  * The programmatic identifier of the userAgentPolicy.
@@ -72946,18 +76861,18 @@ function userAgentPolicy(options = {}) {
 
 /***/ }),
 
-/***/ 6985:
+/***/ 306:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.RestError = void 0;
 exports.isRestError = isRestError;
-const core_util_1 = __nccwpck_require__(8143);
-const inspect_js_1 = __nccwpck_require__(1838);
-const sanitizer_js_1 = __nccwpck_require__(8464);
+const core_util_1 = __nccwpck_require__(1910);
+const inspect_js_1 = __nccwpck_require__(6993);
+const sanitizer_js_1 = __nccwpck_require__(5349);
 const errorSanitizer = new sanitizer_js_1.Sanitizer();
 /**
  * A custom error type for failed pipeline requests.
@@ -73011,18 +76926,18 @@ function isRestError(e) {
 
 /***/ }),
 
-/***/ 3901:
+/***/ 9146:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.exponentialRetryStrategy = exponentialRetryStrategy;
 exports.isExponentialRetryResponse = isExponentialRetryResponse;
 exports.isSystemError = isSystemError;
-const core_util_1 = __nccwpck_require__(8143);
-const throttlingRetryStrategy_js_1 = __nccwpck_require__(6922);
+const core_util_1 = __nccwpck_require__(1910);
+const throttlingRetryStrategy_js_1 = __nccwpck_require__(6016);
 // intervals are in milliseconds
 const DEFAULT_CLIENT_RETRY_INTERVAL = 1000;
 const DEFAULT_CLIENT_MAX_RETRY_INTERVAL = 1000 * 64;
@@ -73035,7 +76950,6 @@ function exponentialRetryStrategy(options = {}) {
     var _a, _b;
     const retryInterval = (_a = options.retryDelayInMs) !== null && _a !== void 0 ? _a : DEFAULT_CLIENT_RETRY_INTERVAL;
     const maxRetryInterval = (_b = options.maxRetryDelayInMs) !== null && _b !== void 0 ? _b : DEFAULT_CLIENT_MAX_RETRY_INTERVAL;
-    let retryAfterInMs = retryInterval;
     return {
         name: "exponentialRetryStrategy",
         retry({ retryCount, response, responseError }) {
@@ -73050,15 +76964,10 @@ function exponentialRetryStrategy(options = {}) {
             if (responseError && !matchedSystemError && !isExponential) {
                 return { errorToThrow: responseError };
             }
-            // Exponentially increase the delay each time
-            const exponentialDelay = retryAfterInMs * Math.pow(2, retryCount);
-            // Don't let the delay exceed the maximum
-            const clampedExponentialDelay = Math.min(maxRetryInterval, exponentialDelay);
-            // Allow the final value to have some "jitter" (within 50% of the delay size) so
-            // that retries across multiple clients don't occur simultaneously.
-            retryAfterInMs =
-                clampedExponentialDelay / 2 + (0, core_util_1.getRandomIntegerInclusive)(0, clampedExponentialDelay / 2);
-            return { retryAfterInMs };
+            return (0, core_util_1.calculateRetryDelay)(retryCount, {
+                retryDelayInMs: retryInterval,
+                maxRetryDelayInMs: maxRetryInterval,
+            });
         },
     };
 }
@@ -73092,16 +77001,16 @@ function isSystemError(err) {
 
 /***/ }),
 
-/***/ 6922:
+/***/ 6016:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isThrottlingRetryResponse = isThrottlingRetryResponse;
 exports.throttlingRetryStrategy = throttlingRetryStrategy;
-const helpers_js_1 = __nccwpck_require__(7714);
+const helpers_js_1 = __nccwpck_require__(534);
 /**
  * The header that comes back from Azure services representing
  * the amount of time (minimum) to wait to retry (in seconds or timestamp after which we can retry).
@@ -73147,7 +77056,7 @@ function getRetryAfterInMs(response) {
         // negative diff would mean a date in the past, so retry asap with 0 milliseconds
         return Number.isFinite(diff) ? Math.max(0, diff) : undefined;
     }
-    catch (e) {
+    catch (_a) {
         return undefined;
     }
 }
@@ -73176,18 +77085,18 @@ function throttlingRetryStrategy() {
 
 /***/ }),
 
-/***/ 2694:
+/***/ 8579:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.concat = concat;
-const tslib_1 = __nccwpck_require__(6928);
+const tslib_1 = __nccwpck_require__(1772);
 const node_stream_1 = __nccwpck_require__(4492);
-const typeGuards_js_1 = __nccwpck_require__(7734);
-const file_js_1 = __nccwpck_require__(8990);
+const typeGuards_js_1 = __nccwpck_require__(9172);
+const file_js_1 = __nccwpck_require__(5830);
 function streamAsyncIterator() {
     return tslib_1.__asyncGenerator(this, arguments, function* streamAsyncIterator_1() {
         const reader = this.getReader();
@@ -73273,20 +77182,23 @@ async function concat(sources) {
 
 /***/ }),
 
-/***/ 8990:
+/***/ 5830:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getRawContent = getRawContent;
 exports.createFileFromStream = createFileFromStream;
 exports.createFile = createFile;
-const core_util_1 = __nccwpck_require__(8143);
-const typeGuards_js_1 = __nccwpck_require__(7734);
+const core_util_1 = __nccwpck_require__(1910);
+const typeGuards_js_1 = __nccwpck_require__(9172);
 const unimplementedMethods = {
     arrayBuffer: () => {
+        throw new Error("Not implemented");
+    },
+    bytes: () => {
         throw new Error("Not implemented");
     },
     slice: () => {
@@ -73380,12 +77292,12 @@ function createFile(content, name, options = {}) {
 
 /***/ }),
 
-/***/ 7714:
+/***/ 534:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.delay = delay;
 exports.parseHeaderValueAsNumber = parseHeaderValueAsNumber;
@@ -73448,12 +77360,12 @@ function parseHeaderValueAsNumber(response, headerName) {
 
 /***/ }),
 
-/***/ 1838:
+/***/ 6993:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.custom = void 0;
 const node_util_1 = __nccwpck_require__(7261);
@@ -73462,15 +77374,15 @@ exports.custom = node_util_1.inspect.custom;
 
 /***/ }),
 
-/***/ 8464:
+/***/ 5349:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.Sanitizer = void 0;
-const core_util_1 = __nccwpck_require__(8143);
+const core_util_1 = __nccwpck_require__(1910);
 const RedactedString = "REDACTED";
 // Make sure this list is up-to-date with the one under core/logger/Readme#Keyconcepts
 const defaultAllowedHeaderNames = [
@@ -73611,16 +77523,16 @@ exports.Sanitizer = Sanitizer;
 
 /***/ }),
 
-/***/ 7902:
+/***/ 6382:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.DEFAULT_CYCLER_OPTIONS = void 0;
 exports.createTokenCycler = createTokenCycler;
-const helpers_js_1 = __nccwpck_require__(7714);
+const helpers_js_1 = __nccwpck_require__(534);
 // Default options for the cycler if none are provided
 exports.DEFAULT_CYCLER_OPTIONS = {
     forcedRefreshWindowInMs: 1000, // Force waiting for a refresh 1s before the token expires
@@ -73701,8 +77613,13 @@ function createTokenCycler(credential, tokenCyclerOptions) {
          */
         get shouldRefresh() {
             var _a;
-            return (!cycler.isRefreshing &&
-                ((_a = token === null || token === void 0 ? void 0 : token.expiresOnTimestamp) !== null && _a !== void 0 ? _a : 0) - options.refreshWindowInMs < Date.now());
+            if (cycler.isRefreshing) {
+                return false;
+            }
+            if ((token === null || token === void 0 ? void 0 : token.refreshAfterTimestamp) && token.refreshAfterTimestamp < Date.now()) {
+                return true;
+            }
+            return ((_a = token === null || token === void 0 ? void 0 : token.expiresOnTimestamp) !== null && _a !== void 0 ? _a : 0) - options.refreshWindowInMs < Date.now();
         },
         /**
          * Produces true if the cycler MUST refresh (null or nearly-expired
@@ -73778,12 +77695,12 @@ function createTokenCycler(credential, tokenCyclerOptions) {
 
 /***/ }),
 
-/***/ 7734:
+/***/ 9172:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isNodeReadableStream = isNodeReadableStream;
 exports.isWebReadableStream = isWebReadableStream;
@@ -73807,17 +77724,17 @@ function isBlob(x) {
 
 /***/ }),
 
-/***/ 8478:
+/***/ 2768:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getUserAgentHeaderName = getUserAgentHeaderName;
 exports.getUserAgentValue = getUserAgentValue;
-const userAgentPlatform_js_1 = __nccwpck_require__(5886);
-const constants_js_1 = __nccwpck_require__(5631);
+const userAgentPlatform_js_1 = __nccwpck_require__(7978);
+const constants_js_1 = __nccwpck_require__(2086);
 function getUserAgentString(telemetryInfo) {
     const parts = [];
     for (const [key, value] of telemetryInfo) {
@@ -73847,16 +77764,16 @@ async function getUserAgentValue(prefix) {
 
 /***/ }),
 
-/***/ 5886:
+/***/ 7978:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getHeaderName = getHeaderName;
 exports.setPlatformSpecificData = setPlatformSpecificData;
-const tslib_1 = __nccwpck_require__(6928);
+const tslib_1 = __nccwpck_require__(1772);
 const os = tslib_1.__importStar(__nccwpck_require__(612));
 const process = tslib_1.__importStar(__nccwpck_require__(7742));
 /**
@@ -73887,32 +77804,35 @@ async function setPlatformSpecificData(map) {
 
 /***/ }),
 
-/***/ 7423:
+/***/ 3810:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createTracingClient = exports.useInstrumenter = void 0;
-var instrumenter_js_1 = __nccwpck_require__(4746);
+var instrumenter_js_1 = __nccwpck_require__(6912);
 Object.defineProperty(exports, "useInstrumenter", ({ enumerable: true, get: function () { return instrumenter_js_1.useInstrumenter; } }));
-var tracingClient_js_1 = __nccwpck_require__(1291);
+var tracingClient_js_1 = __nccwpck_require__(5450);
 Object.defineProperty(exports, "createTracingClient", ({ enumerable: true, get: function () { return tracingClient_js_1.createTracingClient; } }));
 //# sourceMappingURL=index.js.map
 
 /***/ }),
 
-/***/ 4746:
+/***/ 6912:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.getInstrumenter = exports.useInstrumenter = exports.createDefaultInstrumenter = exports.createDefaultTracingSpan = void 0;
-const tracingContext_js_1 = __nccwpck_require__(2402);
-const state_js_1 = __nccwpck_require__(3133);
+exports.createDefaultTracingSpan = createDefaultTracingSpan;
+exports.createDefaultInstrumenter = createDefaultInstrumenter;
+exports.useInstrumenter = useInstrumenter;
+exports.getInstrumenter = getInstrumenter;
+const tracingContext_js_1 = __nccwpck_require__(7419);
+const state_js_1 = __nccwpck_require__(9926);
 function createDefaultTracingSpan() {
     return {
         end: () => {
@@ -73928,9 +77848,11 @@ function createDefaultTracingSpan() {
         setStatus: () => {
             // noop
         },
+        addEvent: () => {
+            // noop
+        },
     };
 }
-exports.createDefaultTracingSpan = createDefaultTracingSpan;
 function createDefaultInstrumenter() {
     return {
         createRequestHeaders: () => {
@@ -73950,7 +77872,6 @@ function createDefaultInstrumenter() {
         },
     };
 }
-exports.createDefaultInstrumenter = createDefaultInstrumenter;
 /**
  * Extends the Azure SDK with support for a given instrumenter implementation.
  *
@@ -73959,7 +77880,6 @@ exports.createDefaultInstrumenter = createDefaultInstrumenter;
 function useInstrumenter(instrumenter) {
     state_js_1.state.instrumenterImplementation = instrumenter;
 }
-exports.useInstrumenter = useInstrumenter;
 /**
  * Gets the currently set instrumenter, a No-Op instrumenter by default.
  *
@@ -73971,17 +77891,16 @@ function getInstrumenter() {
     }
     return state_js_1.state.instrumenterImplementation;
 }
-exports.getInstrumenter = getInstrumenter;
 //# sourceMappingURL=instrumenter.js.map
 
 /***/ }),
 
-/***/ 3133:
+/***/ 9926:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.state = void 0;
 /**
@@ -73996,16 +77915,16 @@ exports.state = {
 
 /***/ }),
 
-/***/ 1291:
+/***/ 5450:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createTracingClient = void 0;
-const instrumenter_js_1 = __nccwpck_require__(4746);
-const tracingContext_js_1 = __nccwpck_require__(2402);
+exports.createTracingClient = createTracingClient;
+const instrumenter_js_1 = __nccwpck_require__(6912);
+const tracingContext_js_1 = __nccwpck_require__(7419);
 /**
  * Creates a new tracing client.
  *
@@ -74075,19 +77994,19 @@ function createTracingClient(options) {
         createRequestHeaders,
     };
 }
-exports.createTracingClient = createTracingClient;
 //# sourceMappingURL=tracingClient.js.map
 
 /***/ }),
 
-/***/ 2402:
+/***/ 7419:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.TracingContextImpl = exports.createTracingContext = exports.knownContextKeys = void 0;
+exports.TracingContextImpl = exports.knownContextKeys = void 0;
+exports.createTracingContext = createTracingContext;
 /** @internal */
 exports.knownContextKeys = {
     span: Symbol.for("@azure/core-tracing span"),
@@ -74110,7 +78029,6 @@ function createTracingContext(options = {}) {
     }
     return context;
 }
-exports.createTracingContext = createTracingContext;
 /** @internal */
 class TracingContextImpl {
     constructor(initialContext) {
@@ -74138,12 +78056,12 @@ exports.TracingContextImpl = TracingContextImpl;
 
 /***/ }),
 
-/***/ 3736:
+/***/ 2521:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.cancelablePromiseRace = cancelablePromiseRace;
 /**
@@ -74168,12 +78086,12 @@ async function cancelablePromiseRace(abortablePromiseBuilders, options) {
 
 /***/ }),
 
-/***/ 3095:
+/***/ 8978:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.uint8ArrayToString = uint8ArrayToString;
 exports.stringToUint8Array = stringToUint8Array;
@@ -74199,12 +78117,12 @@ function stringToUint8Array(value, format) {
 
 /***/ }),
 
-/***/ 5083:
+/***/ 2185:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 var _a, _b, _c, _d;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isReactNative = exports.isNodeRuntime = exports.isNode = exports.isNodeLike = exports.isBun = exports.isDeno = exports.isWebWorker = exports.isBrowser = void 0;
@@ -74255,12 +78173,12 @@ exports.isReactNative = typeof navigator !== "undefined" && (navigator === null 
 
 /***/ }),
 
-/***/ 5361:
+/***/ 533:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createAbortablePromise = createAbortablePromise;
 const abort_controller_1 = __nccwpck_require__(5964);
@@ -74306,15 +78224,17 @@ function createAbortablePromise(buildPromise, options) {
 
 /***/ }),
 
-/***/ 7030:
+/***/ 3986:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.delay = delay;
-const createAbortablePromise_js_1 = __nccwpck_require__(5361);
+exports.calculateRetryDelay = calculateRetryDelay;
+const createAbortablePromise_js_1 = __nccwpck_require__(533);
+const random_js_1 = __nccwpck_require__(3319);
 const StandardAbortMessage = "The delay was aborted.";
 /**
  * A wrapper for setTimeout that resolves a promise after timeInMs milliseconds.
@@ -74333,20 +78253,36 @@ function delay(timeInMs, options) {
         abortErrorMsg: abortErrorMsg !== null && abortErrorMsg !== void 0 ? abortErrorMsg : StandardAbortMessage,
     });
 }
+/**
+ * Calculates the delay interval for retry attempts using exponential delay with jitter.
+ * @param retryAttempt - The current retry attempt number.
+ * @param config - The exponential retry configuration.
+ * @returns An object containing the calculated retry delay.
+ */
+function calculateRetryDelay(retryAttempt, config) {
+    // Exponentially increase the delay each time
+    const exponentialDelay = config.retryDelayInMs * Math.pow(2, retryAttempt);
+    // Don't let the delay exceed the maximum
+    const clampedDelay = Math.min(config.maxRetryDelayInMs, exponentialDelay);
+    // Allow the final value to have some "jitter" (within 50% of the delay size) so
+    // that retries across multiple clients don't occur simultaneously.
+    const retryAfterInMs = clampedDelay / 2 + (0, random_js_1.getRandomIntegerInclusive)(0, clampedDelay / 2);
+    return { retryAfterInMs };
+}
 //# sourceMappingURL=delay.js.map
 
 /***/ }),
 
-/***/ 2280:
+/***/ 5206:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isError = isError;
 exports.getErrorMessage = getErrorMessage;
-const object_js_1 = __nccwpck_require__(7844);
+const object_js_1 = __nccwpck_require__(8444);
 /**
  * Typeguard for an error object shape (has name and message)
  * @param e - Something caught by a catch clause.
@@ -74389,37 +78325,38 @@ function getErrorMessage(e) {
 
 /***/ }),
 
-/***/ 8143:
+/***/ 1910:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.stringToUint8Array = exports.uint8ArrayToString = exports.isWebWorker = exports.isReactNative = exports.isDeno = exports.isNodeRuntime = exports.isNodeLike = exports.isNode = exports.isBun = exports.isBrowser = exports.randomUUID = exports.objectHasProperty = exports.isObjectWithProperties = exports.isDefined = exports.computeSha256Hmac = exports.computeSha256Hash = exports.getErrorMessage = exports.isError = exports.isObject = exports.getRandomIntegerInclusive = exports.createAbortablePromise = exports.cancelablePromiseRace = exports.delay = void 0;
-var delay_js_1 = __nccwpck_require__(7030);
+exports.stringToUint8Array = exports.uint8ArrayToString = exports.isWebWorker = exports.isReactNative = exports.isDeno = exports.isNodeRuntime = exports.isNodeLike = exports.isNode = exports.isBun = exports.isBrowser = exports.randomUUID = exports.objectHasProperty = exports.isObjectWithProperties = exports.isDefined = exports.computeSha256Hmac = exports.computeSha256Hash = exports.getErrorMessage = exports.isError = exports.isObject = exports.getRandomIntegerInclusive = exports.createAbortablePromise = exports.cancelablePromiseRace = exports.calculateRetryDelay = exports.delay = void 0;
+var delay_js_1 = __nccwpck_require__(3986);
 Object.defineProperty(exports, "delay", ({ enumerable: true, get: function () { return delay_js_1.delay; } }));
-var aborterUtils_js_1 = __nccwpck_require__(3736);
+Object.defineProperty(exports, "calculateRetryDelay", ({ enumerable: true, get: function () { return delay_js_1.calculateRetryDelay; } }));
+var aborterUtils_js_1 = __nccwpck_require__(2521);
 Object.defineProperty(exports, "cancelablePromiseRace", ({ enumerable: true, get: function () { return aborterUtils_js_1.cancelablePromiseRace; } }));
-var createAbortablePromise_js_1 = __nccwpck_require__(5361);
+var createAbortablePromise_js_1 = __nccwpck_require__(533);
 Object.defineProperty(exports, "createAbortablePromise", ({ enumerable: true, get: function () { return createAbortablePromise_js_1.createAbortablePromise; } }));
-var random_js_1 = __nccwpck_require__(9566);
+var random_js_1 = __nccwpck_require__(3319);
 Object.defineProperty(exports, "getRandomIntegerInclusive", ({ enumerable: true, get: function () { return random_js_1.getRandomIntegerInclusive; } }));
-var object_js_1 = __nccwpck_require__(7844);
+var object_js_1 = __nccwpck_require__(8444);
 Object.defineProperty(exports, "isObject", ({ enumerable: true, get: function () { return object_js_1.isObject; } }));
-var error_js_1 = __nccwpck_require__(2280);
+var error_js_1 = __nccwpck_require__(5206);
 Object.defineProperty(exports, "isError", ({ enumerable: true, get: function () { return error_js_1.isError; } }));
 Object.defineProperty(exports, "getErrorMessage", ({ enumerable: true, get: function () { return error_js_1.getErrorMessage; } }));
-var sha256_js_1 = __nccwpck_require__(7931);
+var sha256_js_1 = __nccwpck_require__(5775);
 Object.defineProperty(exports, "computeSha256Hash", ({ enumerable: true, get: function () { return sha256_js_1.computeSha256Hash; } }));
 Object.defineProperty(exports, "computeSha256Hmac", ({ enumerable: true, get: function () { return sha256_js_1.computeSha256Hmac; } }));
-var typeGuards_js_1 = __nccwpck_require__(1467);
+var typeGuards_js_1 = __nccwpck_require__(1465);
 Object.defineProperty(exports, "isDefined", ({ enumerable: true, get: function () { return typeGuards_js_1.isDefined; } }));
 Object.defineProperty(exports, "isObjectWithProperties", ({ enumerable: true, get: function () { return typeGuards_js_1.isObjectWithProperties; } }));
 Object.defineProperty(exports, "objectHasProperty", ({ enumerable: true, get: function () { return typeGuards_js_1.objectHasProperty; } }));
-var uuidUtils_js_1 = __nccwpck_require__(9057);
+var uuidUtils_js_1 = __nccwpck_require__(2809);
 Object.defineProperty(exports, "randomUUID", ({ enumerable: true, get: function () { return uuidUtils_js_1.randomUUID; } }));
-var checkEnvironment_js_1 = __nccwpck_require__(5083);
+var checkEnvironment_js_1 = __nccwpck_require__(2185);
 Object.defineProperty(exports, "isBrowser", ({ enumerable: true, get: function () { return checkEnvironment_js_1.isBrowser; } }));
 Object.defineProperty(exports, "isBun", ({ enumerable: true, get: function () { return checkEnvironment_js_1.isBun; } }));
 Object.defineProperty(exports, "isNode", ({ enumerable: true, get: function () { return checkEnvironment_js_1.isNode; } }));
@@ -74428,19 +78365,19 @@ Object.defineProperty(exports, "isNodeRuntime", ({ enumerable: true, get: functi
 Object.defineProperty(exports, "isDeno", ({ enumerable: true, get: function () { return checkEnvironment_js_1.isDeno; } }));
 Object.defineProperty(exports, "isReactNative", ({ enumerable: true, get: function () { return checkEnvironment_js_1.isReactNative; } }));
 Object.defineProperty(exports, "isWebWorker", ({ enumerable: true, get: function () { return checkEnvironment_js_1.isWebWorker; } }));
-var bytesEncoding_js_1 = __nccwpck_require__(3095);
+var bytesEncoding_js_1 = __nccwpck_require__(8978);
 Object.defineProperty(exports, "uint8ArrayToString", ({ enumerable: true, get: function () { return bytesEncoding_js_1.uint8ArrayToString; } }));
 Object.defineProperty(exports, "stringToUint8Array", ({ enumerable: true, get: function () { return bytesEncoding_js_1.stringToUint8Array; } }));
 //# sourceMappingURL=index.js.map
 
 /***/ }),
 
-/***/ 7844:
+/***/ 8444:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isObject = isObject;
 /**
@@ -74458,12 +78395,12 @@ function isObject(input) {
 
 /***/ }),
 
-/***/ 9566:
+/***/ 3319:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getRandomIntegerInclusive = getRandomIntegerInclusive;
 /**
@@ -74488,12 +78425,12 @@ function getRandomIntegerInclusive(min, max) {
 
 /***/ }),
 
-/***/ 7931:
+/***/ 5775:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.computeSha256Hmac = computeSha256Hmac;
 exports.computeSha256Hash = computeSha256Hash;
@@ -74520,12 +78457,12 @@ async function computeSha256Hash(content, encoding) {
 
 /***/ }),
 
-/***/ 1467:
+/***/ 1465:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isDefined = isDefined;
 exports.isObjectWithProperties = isObjectWithProperties;
@@ -74565,12 +78502,12 @@ function objectHasProperty(thing, property) {
 
 /***/ }),
 
-/***/ 9057:
+/***/ 2809:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 var _a;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.randomUUID = randomUUID;
@@ -74591,30 +78528,30 @@ function randomUUID() {
 
 /***/ }),
 
-/***/ 5182:
+/***/ 6228:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.XML_CHARKEY = exports.XML_ATTRKEY = exports.parseXML = exports.stringifyXML = void 0;
-var xml_js_1 = __nccwpck_require__(5795);
+var xml_js_1 = __nccwpck_require__(9860);
 Object.defineProperty(exports, "stringifyXML", ({ enumerable: true, get: function () { return xml_js_1.stringifyXML; } }));
 Object.defineProperty(exports, "parseXML", ({ enumerable: true, get: function () { return xml_js_1.parseXML; } }));
-var xml_common_js_1 = __nccwpck_require__(8917);
+var xml_common_js_1 = __nccwpck_require__(737);
 Object.defineProperty(exports, "XML_ATTRKEY", ({ enumerable: true, get: function () { return xml_common_js_1.XML_ATTRKEY; } }));
 Object.defineProperty(exports, "XML_CHARKEY", ({ enumerable: true, get: function () { return xml_common_js_1.XML_CHARKEY; } }));
 //# sourceMappingURL=index.js.map
 
 /***/ }),
 
-/***/ 8917:
+/***/ 737:
 /***/ ((__unused_webpack_module, exports) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.XML_CHARKEY = exports.XML_ATTRKEY = void 0;
 /**
@@ -74629,17 +78566,17 @@ exports.XML_CHARKEY = "_";
 
 /***/ }),
 
-/***/ 5795:
+/***/ 9860:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.stringifyXML = stringifyXML;
 exports.parseXML = parseXML;
-const fast_xml_parser_1 = __nccwpck_require__(3601);
-const xml_common_js_1 = __nccwpck_require__(8917);
+const fast_xml_parser_1 = __nccwpck_require__(8712);
+const xml_common_js_1 = __nccwpck_require__(737);
 function getCommonOptions(options) {
     var _a;
     return {
@@ -74654,7 +78591,7 @@ function getSerializerOptions(options = {}) {
     return Object.assign(Object.assign({}, getCommonOptions(options)), { attributeNamePrefix: "@_", format: true, suppressEmptyNode: true, indentBy: "", rootNodeName: (_a = options.rootName) !== null && _a !== void 0 ? _a : "root", cdataPropName: (_b = options.cdataPropName) !== null && _b !== void 0 ? _b : "__cdata" });
 }
 function getParserOptions(options = {}) {
-    return Object.assign(Object.assign({}, getCommonOptions(options)), { parseAttributeValue: false, parseTagValue: false, attributeNamePrefix: "", stopNodes: options.stopNodes, processEntities: true });
+    return Object.assign(Object.assign({}, getCommonOptions(options)), { parseAttributeValue: false, parseTagValue: false, attributeNamePrefix: "", stopNodes: options.stopNodes, processEntities: true, trimValues: false });
 }
 /**
  * Converts given JSON object to XML string
@@ -74814,7 +78751,7 @@ exports.AzureLogger = void 0;
 exports.setLogLevel = setLogLevel;
 exports.getLogLevel = getLogLevel;
 exports.createClientLogger = createClientLogger;
-const tslib_1 = __nccwpck_require__(6928);
+const tslib_1 = __nccwpck_require__(1772);
 const debug_js_1 = tslib_1.__importDefault(__nccwpck_require__(8630));
 const registeredLoggers = new Set();
 const logLevelFromEnv = (typeof process !== "undefined" && process.env && process.env.AZURE_LOG_LEVEL) || undefined;
@@ -74922,7 +78859,7 @@ function isAzureLogLevel(logLevel) {
 // Licensed under the MIT license.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.log = log;
-const tslib_1 = __nccwpck_require__(6928);
+const tslib_1 = __nccwpck_require__(1772);
 const node_os_1 = __nccwpck_require__(612);
 const node_util_1 = tslib_1.__importDefault(__nccwpck_require__(7261));
 const process = tslib_1.__importStar(__nccwpck_require__(7742));
@@ -76543,6 +80480,219 @@ function parseParams (str) {
 
 module.exports = parseParams
 
+
+/***/ }),
+
+/***/ 8712:
+/***/ ((module) => {
+
+/*
+ * ATTENTION: The "eval" devtool has been used (maybe by default in mode: "development").
+ * This devtool is neither made for production nor for readable output files.
+ * It uses "eval()" calls to create a separate source file in the browser devtools.
+ * If you are trying to read the output file, select a different devtool (https://webpack.js.org/configuration/devtool/)
+ * or disable the default devtool with "devtool: false".
+ * If you are looking for production-ready output files, see mode: "production" (https://webpack.js.org/configuration/mode/).
+ */
+/******/ (() => { // webpackBootstrap
+/******/ 	"use strict";
+/******/ 	var __webpack_modules__ = ({
+
+/***/ "./node_modules/strnum/strnum.js":
+/*!***************************************!*\
+  !*** ./node_modules/strnum/strnum.js ***!
+  \***************************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   \"default\": () => (/* binding */ toNumber)\n/* harmony export */ });\nconst hexRegex = /^[-+]?0x[a-fA-F0-9]+$/;\nconst numRegex = /^([\\-\\+])?(0*)([0-9]*(\\.[0-9]*)?)$/;\n// const octRegex = /^0x[a-z0-9]+/;\n// const binRegex = /0x[a-z0-9]+/;\n\n \nconst consider = {\n    hex :  true,\n    // oct: false,\n    leadingZeros: true,\n    decimalPoint: \"\\.\",\n    eNotation: true,\n    //skipLike: /regex/\n};\n\nfunction toNumber(str, options = {}){\n    options = Object.assign({}, consider, options );\n    if(!str || typeof str !== \"string\" ) return str;\n    \n    let trimmedStr  = str.trim();\n    \n    if(options.skipLike !== undefined && options.skipLike.test(trimmedStr)) return str;\n    else if(str===\"0\") return 0;\n    else if (options.hex && hexRegex.test(trimmedStr)) {\n        return parse_int(trimmedStr, 16);\n    // }else if (options.oct && octRegex.test(str)) {\n    //     return Number.parseInt(val, 8);\n    }else if (trimmedStr.search(/[eE]/)!== -1) { //eNotation\n        const notation = trimmedStr.match(/^([-\\+])?(0*)([0-9]*(\\.[0-9]*)?[eE][-\\+]?[0-9]+)$/); \n        // +00.123 => [ , '+', '00', '.123', ..\n        if(notation){\n            // console.log(notation)\n            if(options.leadingZeros){ //accept with leading zeros\n                trimmedStr = (notation[1] || \"\") + notation[3];\n            }else{\n                if(notation[2] === \"0\" && notation[3][0]=== \".\"){ //valid number\n                }else{\n                    return str;\n                }\n            }\n            return options.eNotation ? Number(trimmedStr) : str;\n        }else{\n            return str;\n        }\n    // }else if (options.parseBin && binRegex.test(str)) {\n    //     return Number.parseInt(val, 2);\n    }else{\n        //separate negative sign, leading zeros, and rest number\n        const match = numRegex.exec(trimmedStr);\n        // +00.123 => [ , '+', '00', '.123', ..\n        if(match){\n            const sign = match[1];\n            const leadingZeros = match[2];\n            let numTrimmedByZeros = trimZeros(match[3]); //complete num without leading zeros\n            //trim ending zeros for floating number\n            \n            if(!options.leadingZeros && leadingZeros.length > 0 && sign && trimmedStr[2] !== \".\") return str; //-0123\n            else if(!options.leadingZeros && leadingZeros.length > 0 && !sign && trimmedStr[1] !== \".\") return str; //0123\n            else if(options.leadingZeros && leadingZeros===str) return 0; //00\n            \n            else{//no leading zeros or leading zeros are allowed\n                const num = Number(trimmedStr);\n                const numStr = \"\" + num;\n\n                if(numStr.search(/[eE]/) !== -1){ //given number is long and parsed to eNotation\n                    if(options.eNotation) return num;\n                    else return str;\n                }else if(trimmedStr.indexOf(\".\") !== -1){ //floating number\n                    if(numStr === \"0\" && (numTrimmedByZeros === \"\") ) return num; //0.0\n                    else if(numStr === numTrimmedByZeros) return num; //0.456. 0.79000\n                    else if( sign && numStr === \"-\"+numTrimmedByZeros) return num;\n                    else return str;\n                }\n                \n                if(leadingZeros){\n                    return (numTrimmedByZeros === numStr) || (sign+numTrimmedByZeros === numStr) ? num : str\n                }else  {\n                    return (trimmedStr === numStr) || (trimmedStr === sign+numStr) ? num : str\n                }\n            }\n        }else{ //non-numeric string\n            return str;\n        }\n    }\n}\n\n/**\n * \n * @param {string} numStr without leading zeros\n * @returns \n */\nfunction trimZeros(numStr){\n    if(numStr && numStr.indexOf(\".\") !== -1){//float\n        numStr = numStr.replace(/0+$/, \"\"); //remove ending zeros\n        if(numStr === \".\")  numStr = \"0\";\n        else if(numStr[0] === \".\")  numStr = \"0\"+numStr;\n        else if(numStr[numStr.length-1] === \".\")  numStr = numStr.substr(0,numStr.length-1);\n        return numStr;\n    }\n    return numStr;\n}\n\nfunction parse_int(numStr, base){\n    //polyfill\n    if(parseInt) return parseInt(numStr, base);\n    else if(Number.parseInt) return Number.parseInt(numStr, base);\n    else if(window && window.parseInt) return window.parseInt(numStr, base);\n    else throw new Error(\"parseInt, Number.parseInt, window.parseInt are not supported\")\n}\n\n//# sourceURL=webpack://fast-xml-parser/./node_modules/strnum/strnum.js?");
+
+/***/ }),
+
+/***/ "./src/fxp.js":
+/*!********************!*\
+  !*** ./src/fxp.js ***!
+  \********************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   XMLBuilder: () => (/* reexport safe */ _xmlbuilder_json2xml_js__WEBPACK_IMPORTED_MODULE_2__[\"default\"]),\n/* harmony export */   XMLParser: () => (/* reexport safe */ _xmlparser_XMLParser_js__WEBPACK_IMPORTED_MODULE_1__[\"default\"]),\n/* harmony export */   XMLValidator: () => (/* binding */ XMLValidator)\n/* harmony export */ });\n/* harmony import */ var _validator_js__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(/*! ./validator.js */ \"./src/validator.js\");\n/* harmony import */ var _xmlparser_XMLParser_js__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(/*! ./xmlparser/XMLParser.js */ \"./src/xmlparser/XMLParser.js\");\n/* harmony import */ var _xmlbuilder_json2xml_js__WEBPACK_IMPORTED_MODULE_2__ = __nccwpck_require__(/*! ./xmlbuilder/json2xml.js */ \"./src/xmlbuilder/json2xml.js\");\n\n\n\n\n\n\nconst XMLValidator = {\n  validate: _validator_js__WEBPACK_IMPORTED_MODULE_0__.validate\n}\n\n\n//# sourceURL=webpack://fast-xml-parser/./src/fxp.js?");
+
+/***/ }),
+
+/***/ "./src/ignoreAttributes.js":
+/*!*********************************!*\
+  !*** ./src/ignoreAttributes.js ***!
+  \*********************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   \"default\": () => (/* binding */ getIgnoreAttributesFn)\n/* harmony export */ });\nfunction getIgnoreAttributesFn(ignoreAttributes) {\n    if (typeof ignoreAttributes === 'function') {\n        return ignoreAttributes\n    }\n    if (Array.isArray(ignoreAttributes)) {\n        return (attrName) => {\n            for (const pattern of ignoreAttributes) {\n                if (typeof pattern === 'string' && attrName === pattern) {\n                    return true\n                }\n                if (pattern instanceof RegExp && pattern.test(attrName)) {\n                    return true\n                }\n            }\n        }\n    }\n    return () => false\n}\n\n//# sourceURL=webpack://fast-xml-parser/./src/ignoreAttributes.js?");
+
+/***/ }),
+
+/***/ "./src/util.js":
+/*!*********************!*\
+  !*** ./src/util.js ***!
+  \*********************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   getAllMatches: () => (/* binding */ getAllMatches),\n/* harmony export */   getValue: () => (/* binding */ getValue),\n/* harmony export */   isEmptyObject: () => (/* binding */ isEmptyObject),\n/* harmony export */   isExist: () => (/* binding */ isExist),\n/* harmony export */   isName: () => (/* binding */ isName),\n/* harmony export */   merge: () => (/* binding */ merge),\n/* harmony export */   nameRegexp: () => (/* binding */ nameRegexp)\n/* harmony export */ });\n\n\nconst nameStartChar = ':A-Za-z_\\\\u00C0-\\\\u00D6\\\\u00D8-\\\\u00F6\\\\u00F8-\\\\u02FF\\\\u0370-\\\\u037D\\\\u037F-\\\\u1FFF\\\\u200C-\\\\u200D\\\\u2070-\\\\u218F\\\\u2C00-\\\\u2FEF\\\\u3001-\\\\uD7FF\\\\uF900-\\\\uFDCF\\\\uFDF0-\\\\uFFFD';\nconst nameChar = nameStartChar + '\\\\-.\\\\d\\\\u00B7\\\\u0300-\\\\u036F\\\\u203F-\\\\u2040';\nconst nameRegexp = '[' + nameStartChar + '][' + nameChar + ']*';\nconst regexName = new RegExp('^' + nameRegexp + '$');\n\nfunction getAllMatches(string, regex) {\n  const matches = [];\n  let match = regex.exec(string);\n  while (match) {\n    const allmatches = [];\n    allmatches.startIndex = regex.lastIndex - match[0].length;\n    const len = match.length;\n    for (let index = 0; index < len; index++) {\n      allmatches.push(match[index]);\n    }\n    matches.push(allmatches);\n    match = regex.exec(string);\n  }\n  return matches;\n}\n\nconst isName = function(string) {\n  const match = regexName.exec(string);\n  return !(match === null || typeof match === 'undefined');\n}\n\nfunction isExist(v) {\n  return typeof v !== 'undefined';\n}\n\nfunction isEmptyObject(obj) {\n  return Object.keys(obj).length === 0;\n}\n\n/**\n * Copy all the properties of a into b.\n * @param {*} target\n * @param {*} a\n */\nfunction merge(target, a, arrayMode) {\n  if (a) {\n    const keys = Object.keys(a); // will return an array of own properties\n    const len = keys.length; //don't make it inline\n    for (let i = 0; i < len; i++) {\n      if (arrayMode === 'strict') {\n        target[keys[i]] = [ a[keys[i]] ];\n      } else {\n        target[keys[i]] = a[keys[i]];\n      }\n    }\n  }\n}\n/* exports.merge =function (b,a){\n  return Object.assign(b,a);\n} */\n\nfunction getValue(v) {\n  if (exports.isExist(v)) {\n    return v;\n  } else {\n    return '';\n  }\n}\n\n// const fakeCall = function(a) {return a;};\n// const fakeCallNoReturn = function() {};\n\n//# sourceURL=webpack://fast-xml-parser/./src/util.js?");
+
+/***/ }),
+
+/***/ "./src/validator.js":
+/*!**************************!*\
+  !*** ./src/validator.js ***!
+  \**************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   validate: () => (/* binding */ validate)\n/* harmony export */ });\n/* harmony import */ var _util_js__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(/*! ./util.js */ \"./src/util.js\");\n\n\n\n\nconst defaultOptions = {\n  allowBooleanAttributes: false, //A tag can have attributes without any value\n  unpairedTags: []\n};\n\n//const tagsPattern = new RegExp(\"<\\\\/?([\\\\w:\\\\-_\\.]+)\\\\s*\\/?>\",\"g\");\nfunction validate(xmlData, options) {\n  options = Object.assign({}, defaultOptions, options);\n\n  //xmlData = xmlData.replace(/(\\r\\n|\\n|\\r)/gm,\"\");//make it single line\n  //xmlData = xmlData.replace(/(^\\s*<\\?xml.*?\\?>)/g,\"\");//Remove XML starting tag\n  //xmlData = xmlData.replace(/(<!DOCTYPE[\\s\\w\\\"\\.\\/\\-\\:]+(\\[.*\\])*\\s*>)/g,\"\");//Remove DOCTYPE\n  const tags = [];\n  let tagFound = false;\n\n  //indicates that the root tag has been closed (aka. depth 0 has been reached)\n  let reachedRoot = false;\n\n  if (xmlData[0] === '\\ufeff') {\n    // check for byte order mark (BOM)\n    xmlData = xmlData.substr(1);\n  }\n  \n  for (let i = 0; i < xmlData.length; i++) {\n\n    if (xmlData[i] === '<' && xmlData[i+1] === '?') {\n      i+=2;\n      i = readPI(xmlData,i);\n      if (i.err) return i;\n    }else if (xmlData[i] === '<') {\n      //starting of tag\n      //read until you reach to '>' avoiding any '>' in attribute value\n      let tagStartPos = i;\n      i++;\n      \n      if (xmlData[i] === '!') {\n        i = readCommentAndCDATA(xmlData, i);\n        continue;\n      } else {\n        let closingTag = false;\n        if (xmlData[i] === '/') {\n          //closing tag\n          closingTag = true;\n          i++;\n        }\n        //read tagname\n        let tagName = '';\n        for (; i < xmlData.length &&\n          xmlData[i] !== '>' &&\n          xmlData[i] !== ' ' &&\n          xmlData[i] !== '\\t' &&\n          xmlData[i] !== '\\n' &&\n          xmlData[i] !== '\\r'; i++\n        ) {\n          tagName += xmlData[i];\n        }\n        tagName = tagName.trim();\n        //console.log(tagName);\n\n        if (tagName[tagName.length - 1] === '/') {\n          //self closing tag without attributes\n          tagName = tagName.substring(0, tagName.length - 1);\n          //continue;\n          i--;\n        }\n        if (!validateTagName(tagName)) {\n          let msg;\n          if (tagName.trim().length === 0) {\n            msg = \"Invalid space after '<'.\";\n          } else {\n            msg = \"Tag '\"+tagName+\"' is an invalid name.\";\n          }\n          return getErrorObject('InvalidTag', msg, getLineNumberForPosition(xmlData, i));\n        }\n\n        const result = readAttributeStr(xmlData, i);\n        if (result === false) {\n          return getErrorObject('InvalidAttr', \"Attributes for '\"+tagName+\"' have open quote.\", getLineNumberForPosition(xmlData, i));\n        }\n        let attrStr = result.value;\n        i = result.index;\n\n        if (attrStr[attrStr.length - 1] === '/') {\n          //self closing tag\n          const attrStrStart = i - attrStr.length;\n          attrStr = attrStr.substring(0, attrStr.length - 1);\n          const isValid = validateAttributeString(attrStr, options);\n          if (isValid === true) {\n            tagFound = true;\n            //continue; //text may presents after self closing tag\n          } else {\n            //the result from the nested function returns the position of the error within the attribute\n            //in order to get the 'true' error line, we need to calculate the position where the attribute begins (i - attrStr.length) and then add the position within the attribute\n            //this gives us the absolute index in the entire xml, which we can use to find the line at last\n            return getErrorObject(isValid.err.code, isValid.err.msg, getLineNumberForPosition(xmlData, attrStrStart + isValid.err.line));\n          }\n        } else if (closingTag) {\n          if (!result.tagClosed) {\n            return getErrorObject('InvalidTag', \"Closing tag '\"+tagName+\"' doesn't have proper closing.\", getLineNumberForPosition(xmlData, i));\n          } else if (attrStr.trim().length > 0) {\n            return getErrorObject('InvalidTag', \"Closing tag '\"+tagName+\"' can't have attributes or invalid starting.\", getLineNumberForPosition(xmlData, tagStartPos));\n          } else if (tags.length === 0) {\n            return getErrorObject('InvalidTag', \"Closing tag '\"+tagName+\"' has not been opened.\", getLineNumberForPosition(xmlData, tagStartPos));\n          } else {\n            const otg = tags.pop();\n            if (tagName !== otg.tagName) {\n              let openPos = getLineNumberForPosition(xmlData, otg.tagStartPos);\n              return getErrorObject('InvalidTag',\n                \"Expected closing tag '\"+otg.tagName+\"' (opened in line \"+openPos.line+\", col \"+openPos.col+\") instead of closing tag '\"+tagName+\"'.\",\n                getLineNumberForPosition(xmlData, tagStartPos));\n            }\n\n            //when there are no more tags, we reached the root level.\n            if (tags.length == 0) {\n              reachedRoot = true;\n            }\n          }\n        } else {\n          const isValid = validateAttributeString(attrStr, options);\n          if (isValid !== true) {\n            //the result from the nested function returns the position of the error within the attribute\n            //in order to get the 'true' error line, we need to calculate the position where the attribute begins (i - attrStr.length) and then add the position within the attribute\n            //this gives us the absolute index in the entire xml, which we can use to find the line at last\n            return getErrorObject(isValid.err.code, isValid.err.msg, getLineNumberForPosition(xmlData, i - attrStr.length + isValid.err.line));\n          }\n\n          //if the root level has been reached before ...\n          if (reachedRoot === true) {\n            return getErrorObject('InvalidXml', 'Multiple possible root nodes found.', getLineNumberForPosition(xmlData, i));\n          } else if(options.unpairedTags.indexOf(tagName) !== -1){\n            //don't push into stack\n          } else {\n            tags.push({tagName, tagStartPos});\n          }\n          tagFound = true;\n        }\n\n        //skip tag text value\n        //It may include comments and CDATA value\n        for (i++; i < xmlData.length; i++) {\n          if (xmlData[i] === '<') {\n            if (xmlData[i + 1] === '!') {\n              //comment or CADATA\n              i++;\n              i = readCommentAndCDATA(xmlData, i);\n              continue;\n            } else if (xmlData[i+1] === '?') {\n              i = readPI(xmlData, ++i);\n              if (i.err) return i;\n            } else{\n              break;\n            }\n          } else if (xmlData[i] === '&') {\n            const afterAmp = validateAmpersand(xmlData, i);\n            if (afterAmp == -1)\n              return getErrorObject('InvalidChar', \"char '&' is not expected.\", getLineNumberForPosition(xmlData, i));\n            i = afterAmp;\n          }else{\n            if (reachedRoot === true && !isWhiteSpace(xmlData[i])) {\n              return getErrorObject('InvalidXml', \"Extra text at the end\", getLineNumberForPosition(xmlData, i));\n            }\n          }\n        } //end of reading tag text value\n        if (xmlData[i] === '<') {\n          i--;\n        }\n      }\n    } else {\n      if ( isWhiteSpace(xmlData[i])) {\n        continue;\n      }\n      return getErrorObject('InvalidChar', \"char '\"+xmlData[i]+\"' is not expected.\", getLineNumberForPosition(xmlData, i));\n    }\n  }\n\n  if (!tagFound) {\n    return getErrorObject('InvalidXml', 'Start tag expected.', 1);\n  }else if (tags.length == 1) {\n      return getErrorObject('InvalidTag', \"Unclosed tag '\"+tags[0].tagName+\"'.\", getLineNumberForPosition(xmlData, tags[0].tagStartPos));\n  }else if (tags.length > 0) {\n      return getErrorObject('InvalidXml', \"Invalid '\"+\n          JSON.stringify(tags.map(t => t.tagName), null, 4).replace(/\\r?\\n/g, '')+\n          \"' found.\", {line: 1, col: 1});\n  }\n\n  return true;\n};\n\nfunction isWhiteSpace(char){\n  return char === ' ' || char === '\\t' || char === '\\n'  || char === '\\r';\n}\n/**\n * Read Processing insstructions and skip\n * @param {*} xmlData\n * @param {*} i\n */\nfunction readPI(xmlData, i) {\n  const start = i;\n  for (; i < xmlData.length; i++) {\n    if (xmlData[i] == '?' || xmlData[i] == ' ') {\n      //tagname\n      const tagname = xmlData.substr(start, i - start);\n      if (i > 5 && tagname === 'xml') {\n        return getErrorObject('InvalidXml', 'XML declaration allowed only at the start of the document.', getLineNumberForPosition(xmlData, i));\n      } else if (xmlData[i] == '?' && xmlData[i + 1] == '>') {\n        //check if valid attribut string\n        i++;\n        break;\n      } else {\n        continue;\n      }\n    }\n  }\n  return i;\n}\n\nfunction readCommentAndCDATA(xmlData, i) {\n  if (xmlData.length > i + 5 && xmlData[i + 1] === '-' && xmlData[i + 2] === '-') {\n    //comment\n    for (i += 3; i < xmlData.length; i++) {\n      if (xmlData[i] === '-' && xmlData[i + 1] === '-' && xmlData[i + 2] === '>') {\n        i += 2;\n        break;\n      }\n    }\n  } else if (\n    xmlData.length > i + 8 &&\n    xmlData[i + 1] === 'D' &&\n    xmlData[i + 2] === 'O' &&\n    xmlData[i + 3] === 'C' &&\n    xmlData[i + 4] === 'T' &&\n    xmlData[i + 5] === 'Y' &&\n    xmlData[i + 6] === 'P' &&\n    xmlData[i + 7] === 'E'\n  ) {\n    let angleBracketsCount = 1;\n    for (i += 8; i < xmlData.length; i++) {\n      if (xmlData[i] === '<') {\n        angleBracketsCount++;\n      } else if (xmlData[i] === '>') {\n        angleBracketsCount--;\n        if (angleBracketsCount === 0) {\n          break;\n        }\n      }\n    }\n  } else if (\n    xmlData.length > i + 9 &&\n    xmlData[i + 1] === '[' &&\n    xmlData[i + 2] === 'C' &&\n    xmlData[i + 3] === 'D' &&\n    xmlData[i + 4] === 'A' &&\n    xmlData[i + 5] === 'T' &&\n    xmlData[i + 6] === 'A' &&\n    xmlData[i + 7] === '['\n  ) {\n    for (i += 8; i < xmlData.length; i++) {\n      if (xmlData[i] === ']' && xmlData[i + 1] === ']' && xmlData[i + 2] === '>') {\n        i += 2;\n        break;\n      }\n    }\n  }\n\n  return i;\n}\n\nconst doubleQuote = '\"';\nconst singleQuote = \"'\";\n\n/**\n * Keep reading xmlData until '<' is found outside the attribute value.\n * @param {string} xmlData\n * @param {number} i\n */\nfunction readAttributeStr(xmlData, i) {\n  let attrStr = '';\n  let startChar = '';\n  let tagClosed = false;\n  for (; i < xmlData.length; i++) {\n    if (xmlData[i] === doubleQuote || xmlData[i] === singleQuote) {\n      if (startChar === '') {\n        startChar = xmlData[i];\n      } else if (startChar !== xmlData[i]) {\n        //if vaue is enclosed with double quote then single quotes are allowed inside the value and vice versa\n      } else {\n        startChar = '';\n      }\n    } else if (xmlData[i] === '>') {\n      if (startChar === '') {\n        tagClosed = true;\n        break;\n      }\n    }\n    attrStr += xmlData[i];\n  }\n  if (startChar !== '') {\n    return false;\n  }\n\n  return {\n    value: attrStr,\n    index: i,\n    tagClosed: tagClosed\n  };\n}\n\n/**\n * Select all the attributes whether valid or invalid.\n */\nconst validAttrStrRegxp = new RegExp('(\\\\s*)([^\\\\s=]+)(\\\\s*=)?(\\\\s*([\\'\"])(([\\\\s\\\\S])*?)\\\\5)?', 'g');\n\n//attr, =\"sd\", a=\"amit's\", a=\"sd\"b=\"saf\", ab  cd=\"\"\n\nfunction validateAttributeString(attrStr, options) {\n  //console.log(\"start:\"+attrStr+\":end\");\n\n  //if(attrStr.trim().length === 0) return true; //empty string\n\n  const matches = (0,_util_js__WEBPACK_IMPORTED_MODULE_0__.getAllMatches)(attrStr, validAttrStrRegxp);\n  const attrNames = {};\n\n  for (let i = 0; i < matches.length; i++) {\n    if (matches[i][1].length === 0) {\n      //nospace before attribute name: a=\"sd\"b=\"saf\"\n      return getErrorObject('InvalidAttr', \"Attribute '\"+matches[i][2]+\"' has no space in starting.\", getPositionFromMatch(matches[i]))\n    } else if (matches[i][3] !== undefined && matches[i][4] === undefined) {\n      return getErrorObject('InvalidAttr', \"Attribute '\"+matches[i][2]+\"' is without value.\", getPositionFromMatch(matches[i]));\n    } else if (matches[i][3] === undefined && !options.allowBooleanAttributes) {\n      //independent attribute: ab\n      return getErrorObject('InvalidAttr', \"boolean attribute '\"+matches[i][2]+\"' is not allowed.\", getPositionFromMatch(matches[i]));\n    }\n    /* else if(matches[i][6] === undefined){//attribute without value: ab=\n                    return { err: { code:\"InvalidAttr\",msg:\"attribute \" + matches[i][2] + \" has no value assigned.\"}};\n                } */\n    const attrName = matches[i][2];\n    if (!validateAttrName(attrName)) {\n      return getErrorObject('InvalidAttr', \"Attribute '\"+attrName+\"' is an invalid name.\", getPositionFromMatch(matches[i]));\n    }\n    if (!attrNames.hasOwnProperty(attrName)) {\n      //check for duplicate attribute.\n      attrNames[attrName] = 1;\n    } else {\n      return getErrorObject('InvalidAttr', \"Attribute '\"+attrName+\"' is repeated.\", getPositionFromMatch(matches[i]));\n    }\n  }\n\n  return true;\n}\n\nfunction validateNumberAmpersand(xmlData, i) {\n  let re = /\\d/;\n  if (xmlData[i] === 'x') {\n    i++;\n    re = /[\\da-fA-F]/;\n  }\n  for (; i < xmlData.length; i++) {\n    if (xmlData[i] === ';')\n      return i;\n    if (!xmlData[i].match(re))\n      break;\n  }\n  return -1;\n}\n\nfunction validateAmpersand(xmlData, i) {\n  // https://www.w3.org/TR/xml/#dt-charref\n  i++;\n  if (xmlData[i] === ';')\n    return -1;\n  if (xmlData[i] === '#') {\n    i++;\n    return validateNumberAmpersand(xmlData, i);\n  }\n  let count = 0;\n  for (; i < xmlData.length; i++, count++) {\n    if (xmlData[i].match(/\\w/) && count < 20)\n      continue;\n    if (xmlData[i] === ';')\n      break;\n    return -1;\n  }\n  return i;\n}\n\nfunction getErrorObject(code, message, lineNumber) {\n  return {\n    err: {\n      code: code,\n      msg: message,\n      line: lineNumber.line || lineNumber,\n      col: lineNumber.col,\n    },\n  };\n}\n\nfunction validateAttrName(attrName) {\n  return (0,_util_js__WEBPACK_IMPORTED_MODULE_0__.isName)(attrName);\n}\n\n// const startsWithXML = /^xml/i;\n\nfunction validateTagName(tagname) {\n  return (0,_util_js__WEBPACK_IMPORTED_MODULE_0__.isName)(tagname) /* && !tagname.match(startsWithXML) */;\n}\n\n//this function returns the line number for the character at the given index\nfunction getLineNumberForPosition(xmlData, index) {\n  const lines = xmlData.substring(0, index).split(/\\r?\\n/);\n  return {\n    line: lines.length,\n\n    // column number is last line's length + 1, because column numbering starts at 1:\n    col: lines[lines.length - 1].length + 1\n  };\n}\n\n//this function returns the position of the first character of match within attrStr\nfunction getPositionFromMatch(match) {\n  return match.startIndex + match[1].length;\n}\n\n\n//# sourceURL=webpack://fast-xml-parser/./src/validator.js?");
+
+/***/ }),
+
+/***/ "./src/xmlbuilder/json2xml.js":
+/*!************************************!*\
+  !*** ./src/xmlbuilder/json2xml.js ***!
+  \************************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   \"default\": () => (/* binding */ Builder)\n/* harmony export */ });\n/* harmony import */ var _orderedJs2Xml_js__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(/*! ./orderedJs2Xml.js */ \"./src/xmlbuilder/orderedJs2Xml.js\");\n/* harmony import */ var _ignoreAttributes_js__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(/*! ../ignoreAttributes.js */ \"./src/ignoreAttributes.js\");\n\n//parse Empty Node as self closing node\n\n\n\nconst defaultOptions = {\n  attributeNamePrefix: '@_',\n  attributesGroupName: false,\n  textNodeName: '#text',\n  ignoreAttributes: true,\n  cdataPropName: false,\n  format: false,\n  indentBy: '  ',\n  suppressEmptyNode: false,\n  suppressUnpairedNode: true,\n  suppressBooleanAttributes: true,\n  tagValueProcessor: function(key, a) {\n    return a;\n  },\n  attributeValueProcessor: function(attrName, a) {\n    return a;\n  },\n  preserveOrder: false,\n  commentPropName: false,\n  unpairedTags: [],\n  entities: [\n    { regex: new RegExp(\"&\", \"g\"), val: \"&amp;\" },//it must be on top\n    { regex: new RegExp(\">\", \"g\"), val: \"&gt;\" },\n    { regex: new RegExp(\"<\", \"g\"), val: \"&lt;\" },\n    { regex: new RegExp(\"\\'\", \"g\"), val: \"&apos;\" },\n    { regex: new RegExp(\"\\\"\", \"g\"), val: \"&quot;\" }\n  ],\n  processEntities: true,\n  stopNodes: [],\n  // transformTagName: false,\n  // transformAttributeName: false,\n  oneListGroup: false\n};\n\nfunction Builder(options) {\n  this.options = Object.assign({}, defaultOptions, options);\n  if (this.options.ignoreAttributes === true || this.options.attributesGroupName) {\n    this.isAttribute = function(/*a*/) {\n      return false;\n    };\n  } else {\n    this.ignoreAttributesFn = (0,_ignoreAttributes_js__WEBPACK_IMPORTED_MODULE_1__[\"default\"])(this.options.ignoreAttributes)\n    this.attrPrefixLen = this.options.attributeNamePrefix.length;\n    this.isAttribute = isAttribute;\n  }\n\n  this.processTextOrObjNode = processTextOrObjNode\n\n  if (this.options.format) {\n    this.indentate = indentate;\n    this.tagEndChar = '>\\n';\n    this.newLine = '\\n';\n  } else {\n    this.indentate = function() {\n      return '';\n    };\n    this.tagEndChar = '>';\n    this.newLine = '';\n  }\n}\n\nBuilder.prototype.build = function(jObj) {\n  if(this.options.preserveOrder){\n    return (0,_orderedJs2Xml_js__WEBPACK_IMPORTED_MODULE_0__[\"default\"])(jObj, this.options);\n  }else {\n    if(Array.isArray(jObj) && this.options.arrayNodeName && this.options.arrayNodeName.length > 1){\n      jObj = {\n        [this.options.arrayNodeName] : jObj\n      }\n    }\n    return this.j2x(jObj, 0, []).val;\n  }\n};\n\nBuilder.prototype.j2x = function(jObj, level, ajPath) {\n  let attrStr = '';\n  let val = '';\n  const jPath = ajPath.join('.')\n  for (let key in jObj) {\n    if(!Object.prototype.hasOwnProperty.call(jObj, key)) continue;\n    if (typeof jObj[key] === 'undefined') {\n      // supress undefined node only if it is not an attribute\n      if (this.isAttribute(key)) {\n        val += '';\n      }\n    } else if (jObj[key] === null) {\n      // null attribute should be ignored by the attribute list, but should not cause the tag closing\n      if (this.isAttribute(key)) {\n        val += '';\n      } else if (key === this.options.cdataPropName) {\n        val += '';\n      } else if (key[0] === '?') {\n        val += this.indentate(level) + '<' + key + '?' + this.tagEndChar;\n      } else {\n        val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;\n      }\n      // val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;\n    } else if (jObj[key] instanceof Date) {\n      val += this.buildTextValNode(jObj[key], key, '', level);\n    } else if (typeof jObj[key] !== 'object') {\n      //premitive type\n      const attr = this.isAttribute(key);\n      if (attr && !this.ignoreAttributesFn(attr, jPath)) {\n        attrStr += this.buildAttrPairStr(attr, '' + jObj[key]);\n      } else if (!attr) {\n        //tag value\n        if (key === this.options.textNodeName) {\n          let newval = this.options.tagValueProcessor(key, '' + jObj[key]);\n          val += this.replaceEntitiesValue(newval);\n        } else {\n          val += this.buildTextValNode(jObj[key], key, '', level);\n        }\n      }\n    } else if (Array.isArray(jObj[key])) {\n      //repeated nodes\n      const arrLen = jObj[key].length;\n      let listTagVal = \"\";\n      let listTagAttr = \"\";\n      for (let j = 0; j < arrLen; j++) {\n        const item = jObj[key][j];\n        if (typeof item === 'undefined') {\n          // supress undefined node\n        } else if (item === null) {\n          if(key[0] === \"?\") val += this.indentate(level) + '<' + key + '?' + this.tagEndChar;\n          else val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;\n          // val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;\n        } else if (typeof item === 'object') {\n          if(this.options.oneListGroup){\n            const result = this.j2x(item, level + 1, ajPath.concat(key));\n            listTagVal += result.val;\n            if (this.options.attributesGroupName && item.hasOwnProperty(this.options.attributesGroupName)) {\n              listTagAttr += result.attrStr\n            }\n          }else{\n            listTagVal += this.processTextOrObjNode(item, key, level, ajPath)\n          }\n        } else {\n          if (this.options.oneListGroup) {\n            let textValue = this.options.tagValueProcessor(key, item);\n            textValue = this.replaceEntitiesValue(textValue);\n            listTagVal += textValue;\n          } else {\n            listTagVal += this.buildTextValNode(item, key, '', level);\n          }\n        }\n      }\n      if(this.options.oneListGroup){\n        listTagVal = this.buildObjectNode(listTagVal, key, listTagAttr, level);\n      }\n      val += listTagVal;\n    } else {\n      //nested node\n      if (this.options.attributesGroupName && key === this.options.attributesGroupName) {\n        const Ks = Object.keys(jObj[key]);\n        const L = Ks.length;\n        for (let j = 0; j < L; j++) {\n          attrStr += this.buildAttrPairStr(Ks[j], '' + jObj[key][Ks[j]]);\n        }\n      } else {\n        val += this.processTextOrObjNode(jObj[key], key, level, ajPath)\n      }\n    }\n  }\n  return {attrStr: attrStr, val: val};\n};\n\nBuilder.prototype.buildAttrPairStr = function(attrName, val){\n  val = this.options.attributeValueProcessor(attrName, '' + val);\n  val = this.replaceEntitiesValue(val);\n  if (this.options.suppressBooleanAttributes && val === \"true\") {\n    return ' ' + attrName;\n  } else return ' ' + attrName + '=\"' + val + '\"';\n}\n\nfunction processTextOrObjNode (object, key, level, ajPath) {\n  const result = this.j2x(object, level + 1, ajPath.concat(key));\n  if (object[this.options.textNodeName] !== undefined && Object.keys(object).length === 1) {\n    return this.buildTextValNode(object[this.options.textNodeName], key, result.attrStr, level);\n  } else {\n    return this.buildObjectNode(result.val, key, result.attrStr, level);\n  }\n}\n\nBuilder.prototype.buildObjectNode = function(val, key, attrStr, level) {\n  if(val === \"\"){\n    if(key[0] === \"?\") return  this.indentate(level) + '<' + key + attrStr+ '?' + this.tagEndChar;\n    else {\n      return this.indentate(level) + '<' + key + attrStr + this.closeTag(key) + this.tagEndChar;\n    }\n  }else{\n\n    let tagEndExp = '</' + key + this.tagEndChar;\n    let piClosingChar = \"\";\n    \n    if(key[0] === \"?\") {\n      piClosingChar = \"?\";\n      tagEndExp = \"\";\n    }\n  \n    // attrStr is an empty string in case the attribute came as undefined or null\n    if ((attrStr || attrStr === '') && val.indexOf('<') === -1) {\n      return ( this.indentate(level) + '<' +  key + attrStr + piClosingChar + '>' + val + tagEndExp );\n    } else if (this.options.commentPropName !== false && key === this.options.commentPropName && piClosingChar.length === 0) {\n      return this.indentate(level) + `<!--${val}-->` + this.newLine;\n    }else {\n      return (\n        this.indentate(level) + '<' + key + attrStr + piClosingChar + this.tagEndChar +\n        val +\n        this.indentate(level) + tagEndExp    );\n    }\n  }\n}\n\nBuilder.prototype.closeTag = function(key){\n  let closeTag = \"\";\n  if(this.options.unpairedTags.indexOf(key) !== -1){ //unpaired\n    if(!this.options.suppressUnpairedNode) closeTag = \"/\"\n  }else if(this.options.suppressEmptyNode){ //empty\n    closeTag = \"/\";\n  }else{\n    closeTag = `></${key}`\n  }\n  return closeTag;\n}\n\nfunction buildEmptyObjNode(val, key, attrStr, level) {\n  if (val !== '') {\n    return this.buildObjectNode(val, key, attrStr, level);\n  } else {\n    if(key[0] === \"?\") return  this.indentate(level) + '<' + key + attrStr+ '?' + this.tagEndChar;\n    else {\n      return  this.indentate(level) + '<' + key + attrStr + '/' + this.tagEndChar;\n      // return this.buildTagStr(level,key, attrStr);\n    }\n  }\n}\n\nBuilder.prototype.buildTextValNode = function(val, key, attrStr, level) {\n  if (this.options.cdataPropName !== false && key === this.options.cdataPropName) {\n    return this.indentate(level) + `<![CDATA[${val}]]>` +  this.newLine;\n  }else if (this.options.commentPropName !== false && key === this.options.commentPropName) {\n    return this.indentate(level) + `<!--${val}-->` +  this.newLine;\n  }else if(key[0] === \"?\") {//PI tag\n    return  this.indentate(level) + '<' + key + attrStr+ '?' + this.tagEndChar; \n  }else{\n    let textValue = this.options.tagValueProcessor(key, val);\n    textValue = this.replaceEntitiesValue(textValue);\n  \n    if( textValue === ''){\n      return this.indentate(level) + '<' + key + attrStr + this.closeTag(key) + this.tagEndChar;\n    }else{\n      return this.indentate(level) + '<' + key + attrStr + '>' +\n         textValue +\n        '</' + key + this.tagEndChar;\n    }\n  }\n}\n\nBuilder.prototype.replaceEntitiesValue = function(textValue){\n  if(textValue && textValue.length > 0 && this.options.processEntities){\n    for (let i=0; i<this.options.entities.length; i++) {\n      const entity = this.options.entities[i];\n      textValue = textValue.replace(entity.regex, entity.val);\n    }\n  }\n  return textValue;\n}\n\nfunction indentate(level) {\n  return this.options.indentBy.repeat(level);\n}\n\nfunction isAttribute(name /*, options*/) {\n  if (name.startsWith(this.options.attributeNamePrefix) && name !== this.options.textNodeName) {\n    return name.substr(this.attrPrefixLen);\n  } else {\n    return false;\n  }\n}\n\n\n\n//# sourceURL=webpack://fast-xml-parser/./src/xmlbuilder/json2xml.js?");
+
+/***/ }),
+
+/***/ "./src/xmlbuilder/orderedJs2Xml.js":
+/*!*****************************************!*\
+  !*** ./src/xmlbuilder/orderedJs2Xml.js ***!
+  \*****************************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   \"default\": () => (/* binding */ toXml)\n/* harmony export */ });\nconst EOL = \"\\n\";\n\n/**\n * \n * @param {array} jArray \n * @param {any} options \n * @returns \n */\nfunction toXml(jArray, options) {\n    let indentation = \"\";\n    if (options.format && options.indentBy.length > 0) {\n        indentation = EOL;\n    }\n    return arrToStr(jArray, options, \"\", indentation);\n}\n\nfunction arrToStr(arr, options, jPath, indentation) {\n    let xmlStr = \"\";\n    let isPreviousElementTag = false;\n\n    for (let i = 0; i < arr.length; i++) {\n        const tagObj = arr[i];\n        const tagName = propName(tagObj);\n        if(tagName === undefined) continue;\n\n        let newJPath = \"\";\n        if (jPath.length === 0) newJPath = tagName\n        else newJPath = `${jPath}.${tagName}`;\n\n        if (tagName === options.textNodeName) {\n            let tagText = tagObj[tagName];\n            if (!isStopNode(newJPath, options)) {\n                tagText = options.tagValueProcessor(tagName, tagText);\n                tagText = replaceEntitiesValue(tagText, options);\n            }\n            if (isPreviousElementTag) {\n                xmlStr += indentation;\n            }\n            xmlStr += tagText;\n            isPreviousElementTag = false;\n            continue;\n        } else if (tagName === options.cdataPropName) {\n            if (isPreviousElementTag) {\n                xmlStr += indentation;\n            }\n            xmlStr += `<![CDATA[${tagObj[tagName][0][options.textNodeName]}]]>`;\n            isPreviousElementTag = false;\n            continue;\n        } else if (tagName === options.commentPropName) {\n            xmlStr += indentation + `<!--${tagObj[tagName][0][options.textNodeName]}-->`;\n            isPreviousElementTag = true;\n            continue;\n        } else if (tagName[0] === \"?\") {\n            const attStr = attr_to_str(tagObj[\":@\"], options);\n            const tempInd = tagName === \"?xml\" ? \"\" : indentation;\n            let piTextNodeName = tagObj[tagName][0][options.textNodeName];\n            piTextNodeName = piTextNodeName.length !== 0 ? \" \" + piTextNodeName : \"\"; //remove extra spacing\n            xmlStr += tempInd + `<${tagName}${piTextNodeName}${attStr}?>`;\n            isPreviousElementTag = true;\n            continue;\n        }\n        let newIdentation = indentation;\n        if (newIdentation !== \"\") {\n            newIdentation += options.indentBy;\n        }\n        const attStr = attr_to_str(tagObj[\":@\"], options);\n        const tagStart = indentation + `<${tagName}${attStr}`;\n        const tagValue = arrToStr(tagObj[tagName], options, newJPath, newIdentation);\n        if (options.unpairedTags.indexOf(tagName) !== -1) {\n            if (options.suppressUnpairedNode) xmlStr += tagStart + \">\";\n            else xmlStr += tagStart + \"/>\";\n        } else if ((!tagValue || tagValue.length === 0) && options.suppressEmptyNode) {\n            xmlStr += tagStart + \"/>\";\n        } else if (tagValue && tagValue.endsWith(\">\")) {\n            xmlStr += tagStart + `>${tagValue}${indentation}</${tagName}>`;\n        } else {\n            xmlStr += tagStart + \">\";\n            if (tagValue && indentation !== \"\" && (tagValue.includes(\"/>\") || tagValue.includes(\"</\"))) {\n                xmlStr += indentation + options.indentBy + tagValue + indentation;\n            } else {\n                xmlStr += tagValue;\n            }\n            xmlStr += `</${tagName}>`;\n        }\n        isPreviousElementTag = true;\n    }\n\n    return xmlStr;\n}\n\nfunction propName(obj) {\n    const keys = Object.keys(obj);\n    for (let i = 0; i < keys.length; i++) {\n        const key = keys[i];\n        if(!obj.hasOwnProperty(key)) continue;\n        if (key !== \":@\") return key;\n    }\n}\n\nfunction attr_to_str(attrMap, options) {\n    let attrStr = \"\";\n    if (attrMap && !options.ignoreAttributes) {\n        for (let attr in attrMap) {\n            if(!attrMap.hasOwnProperty(attr)) continue;\n            let attrVal = options.attributeValueProcessor(attr, attrMap[attr]);\n            attrVal = replaceEntitiesValue(attrVal, options);\n            if (attrVal === true && options.suppressBooleanAttributes) {\n                attrStr += ` ${attr.substr(options.attributeNamePrefix.length)}`;\n            } else {\n                attrStr += ` ${attr.substr(options.attributeNamePrefix.length)}=\"${attrVal}\"`;\n            }\n        }\n    }\n    return attrStr;\n}\n\nfunction isStopNode(jPath, options) {\n    jPath = jPath.substr(0, jPath.length - options.textNodeName.length - 1);\n    let tagName = jPath.substr(jPath.lastIndexOf(\".\") + 1);\n    for (let index in options.stopNodes) {\n        if (options.stopNodes[index] === jPath || options.stopNodes[index] === \"*.\" + tagName) return true;\n    }\n    return false;\n}\n\nfunction replaceEntitiesValue(textValue, options) {\n    if (textValue && textValue.length > 0 && options.processEntities) {\n        for (let i = 0; i < options.entities.length; i++) {\n            const entity = options.entities[i];\n            textValue = textValue.replace(entity.regex, entity.val);\n        }\n    }\n    return textValue;\n}\n\n\n//# sourceURL=webpack://fast-xml-parser/./src/xmlbuilder/orderedJs2Xml.js?");
+
+/***/ }),
+
+/***/ "./src/xmlparser/DocTypeReader.js":
+/*!****************************************!*\
+  !*** ./src/xmlparser/DocTypeReader.js ***!
+  \****************************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   \"default\": () => (/* binding */ readDocType)\n/* harmony export */ });\n/* harmony import */ var _util_js__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(/*! ../util.js */ \"./src/util.js\");\n\n\n//TODO: handle comments\nfunction readDocType(xmlData, i){\n    \n    const entities = {};\n    if( xmlData[i + 3] === 'O' &&\n         xmlData[i + 4] === 'C' &&\n         xmlData[i + 5] === 'T' &&\n         xmlData[i + 6] === 'Y' &&\n         xmlData[i + 7] === 'P' &&\n         xmlData[i + 8] === 'E')\n    {    \n        i = i+9;\n        let angleBracketsCount = 1;\n        let hasBody = false, comment = false;\n        let exp = \"\";\n        for(;i<xmlData.length;i++){\n            if (xmlData[i] === '<' && !comment) { //Determine the tag type\n                if( hasBody && isEntity(xmlData, i)){\n                    i += 7; \n                    let entityName, val;\n                    [entityName, val,i] = readEntityExp(xmlData,i+1);\n                    if(val.indexOf(\"&\") === -1) //Parameter entities are not supported\n                        entities[ validateEntityName(entityName) ] = {\n                            regx : RegExp( `&${entityName};`,\"g\"),\n                            val: val\n                        };\n                }\n                else if( hasBody && isElement(xmlData, i))  i += 8;//Not supported\n                else if( hasBody && isAttlist(xmlData, i))  i += 8;//Not supported\n                else if( hasBody && isNotation(xmlData, i)) i += 9;//Not supported\n                else if( isComment)                         comment = true;\n                else                                        throw new Error(\"Invalid DOCTYPE\");\n\n                angleBracketsCount++;\n                exp = \"\";\n            } else if (xmlData[i] === '>') { //Read tag content\n                if(comment){\n                    if( xmlData[i - 1] === \"-\" && xmlData[i - 2] === \"-\"){\n                        comment = false;\n                        angleBracketsCount--;\n                    }\n                }else{\n                    angleBracketsCount--;\n                }\n                if (angleBracketsCount === 0) {\n                  break;\n                }\n            }else if( xmlData[i] === '['){\n                hasBody = true;\n            }else{\n                exp += xmlData[i];\n            }\n        }\n        if(angleBracketsCount !== 0){\n            throw new Error(`Unclosed DOCTYPE`);\n        }\n    }else{\n        throw new Error(`Invalid Tag instead of DOCTYPE`);\n    }\n    return {entities, i};\n}\n\nfunction readEntityExp(xmlData,i){\n    //External entities are not supported\n    //    <!ENTITY ext SYSTEM \"http://normal-website.com\" >\n\n    //Parameter entities are not supported\n    //    <!ENTITY entityname \"&anotherElement;\">\n\n    //Internal entities are supported\n    //    <!ENTITY entityname \"replacement text\">\n    \n    //read EntityName\n    let entityName = \"\";\n    for (; i < xmlData.length && (xmlData[i] !== \"'\" && xmlData[i] !== '\"' ); i++) {\n        // if(xmlData[i] === \" \") continue;\n        // else \n        entityName += xmlData[i];\n    }\n    entityName = entityName.trim();\n    if(entityName.indexOf(\" \") !== -1) throw new Error(\"External entites are not supported\");\n\n    //read Entity Value\n    const startChar = xmlData[i++];\n    let val = \"\"\n    for (; i < xmlData.length && xmlData[i] !== startChar ; i++) {\n        val += xmlData[i];\n    }\n    return [entityName, val, i];\n}\n\nfunction isComment(xmlData, i){\n    if(xmlData[i+1] === '!' &&\n    xmlData[i+2] === '-' &&\n    xmlData[i+3] === '-') return true\n    return false\n}\nfunction isEntity(xmlData, i){\n    if(xmlData[i+1] === '!' &&\n    xmlData[i+2] === 'E' &&\n    xmlData[i+3] === 'N' &&\n    xmlData[i+4] === 'T' &&\n    xmlData[i+5] === 'I' &&\n    xmlData[i+6] === 'T' &&\n    xmlData[i+7] === 'Y') return true\n    return false\n}\nfunction isElement(xmlData, i){\n    if(xmlData[i+1] === '!' &&\n    xmlData[i+2] === 'E' &&\n    xmlData[i+3] === 'L' &&\n    xmlData[i+4] === 'E' &&\n    xmlData[i+5] === 'M' &&\n    xmlData[i+6] === 'E' &&\n    xmlData[i+7] === 'N' &&\n    xmlData[i+8] === 'T') return true\n    return false\n}\n\nfunction isAttlist(xmlData, i){\n    if(xmlData[i+1] === '!' &&\n    xmlData[i+2] === 'A' &&\n    xmlData[i+3] === 'T' &&\n    xmlData[i+4] === 'T' &&\n    xmlData[i+5] === 'L' &&\n    xmlData[i+6] === 'I' &&\n    xmlData[i+7] === 'S' &&\n    xmlData[i+8] === 'T') return true\n    return false\n}\nfunction isNotation(xmlData, i){\n    if(xmlData[i+1] === '!' &&\n    xmlData[i+2] === 'N' &&\n    xmlData[i+3] === 'O' &&\n    xmlData[i+4] === 'T' &&\n    xmlData[i+5] === 'A' &&\n    xmlData[i+6] === 'T' &&\n    xmlData[i+7] === 'I' &&\n    xmlData[i+8] === 'O' &&\n    xmlData[i+9] === 'N') return true\n    return false\n}\n\nfunction validateEntityName(name){\n    if ((0,_util_js__WEBPACK_IMPORTED_MODULE_0__.isName)(name))\n\treturn name;\n    else\n        throw new Error(`Invalid entity name ${name}`);\n}\n\n\n//# sourceURL=webpack://fast-xml-parser/./src/xmlparser/DocTypeReader.js?");
+
+/***/ }),
+
+/***/ "./src/xmlparser/OptionsBuilder.js":
+/*!*****************************************!*\
+  !*** ./src/xmlparser/OptionsBuilder.js ***!
+  \*****************************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   buildOptions: () => (/* binding */ buildOptions),\n/* harmony export */   defaultOptions: () => (/* binding */ defaultOptions)\n/* harmony export */ });\n\nconst defaultOptions = {\n    preserveOrder: false,\n    attributeNamePrefix: '@_',\n    attributesGroupName: false,\n    textNodeName: '#text',\n    ignoreAttributes: true,\n    removeNSPrefix: false, // remove NS from tag name or attribute name if true\n    allowBooleanAttributes: false, //a tag can have attributes without any value\n    //ignoreRootElement : false,\n    parseTagValue: true,\n    parseAttributeValue: false,\n    trimValues: true, //Trim string values of tag and attributes\n    cdataPropName: false,\n    numberParseOptions: {\n      hex: true,\n      leadingZeros: true,\n      eNotation: true\n    },\n    tagValueProcessor: function(tagName, val) {\n      return val;\n    },\n    attributeValueProcessor: function(attrName, val) {\n      return val;\n    },\n    stopNodes: [], //nested tags will not be parsed even for errors\n    alwaysCreateTextNode: false,\n    isArray: () => false,\n    commentPropName: false,\n    unpairedTags: [],\n    processEntities: true,\n    htmlEntities: false,\n    ignoreDeclaration: false,\n    ignorePiTags: false,\n    transformTagName: false,\n    transformAttributeName: false,\n    updateTag: function(tagName, jPath, attrs){\n      return tagName\n    },\n    // skipEmptyListItem: false\n};\n   \nconst buildOptions = function(options) {\n    return Object.assign({}, defaultOptions, options);\n};\n\n\n//# sourceURL=webpack://fast-xml-parser/./src/xmlparser/OptionsBuilder.js?");
+
+/***/ }),
+
+/***/ "./src/xmlparser/OrderedObjParser.js":
+/*!*******************************************!*\
+  !*** ./src/xmlparser/OrderedObjParser.js ***!
+  \*******************************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   \"default\": () => (/* binding */ OrderedObjParser)\n/* harmony export */ });\n/* harmony import */ var _util_js__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(/*! ../util.js */ \"./src/util.js\");\n/* harmony import */ var _xmlNode_js__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(/*! ./xmlNode.js */ \"./src/xmlparser/xmlNode.js\");\n/* harmony import */ var _DocTypeReader_js__WEBPACK_IMPORTED_MODULE_2__ = __nccwpck_require__(/*! ./DocTypeReader.js */ \"./src/xmlparser/DocTypeReader.js\");\n/* harmony import */ var strnum__WEBPACK_IMPORTED_MODULE_3__ = __nccwpck_require__(/*! strnum */ \"./node_modules/strnum/strnum.js\");\n/* harmony import */ var _ignoreAttributes_js__WEBPACK_IMPORTED_MODULE_4__ = __nccwpck_require__(/*! ../ignoreAttributes.js */ \"./src/ignoreAttributes.js\");\n\n///@ts-check\n\n\n\n\n\n\n\n// const regx =\n//   '<((!\\\\[CDATA\\\\[([\\\\s\\\\S]*?)(]]>))|((NAME:)?(NAME))([^>]*)>|((\\\\/)(NAME)\\\\s*>))([^<]*)'\n//   .replace(/NAME/g, util.nameRegexp);\n\n//const tagsRegx = new RegExp(\"<(\\\\/?[\\\\w:\\\\-\\._]+)([^>]*)>(\\\\s*\"+cdataRegx+\")*([^<]+)?\",\"g\");\n//const tagsRegx = new RegExp(\"<(\\\\/?)((\\\\w*:)?([\\\\w:\\\\-\\._]+))([^>]*)>([^<]*)(\"+cdataRegx+\"([^<]*))*([^<]+)?\",\"g\");\n\nclass OrderedObjParser{\n  constructor(options){\n    this.options = options;\n    this.currentNode = null;\n    this.tagsNodeStack = [];\n    this.docTypeEntities = {};\n    this.lastEntities = {\n      \"apos\" : { regex: /&(apos|#39|#x27);/g, val : \"'\"},\n      \"gt\" : { regex: /&(gt|#62|#x3E);/g, val : \">\"},\n      \"lt\" : { regex: /&(lt|#60|#x3C);/g, val : \"<\"},\n      \"quot\" : { regex: /&(quot|#34|#x22);/g, val : \"\\\"\"},\n    };\n    this.ampEntity = { regex: /&(amp|#38|#x26);/g, val : \"&\"};\n    this.htmlEntities = {\n      \"space\": { regex: /&(nbsp|#160);/g, val: \" \" },\n      // \"lt\" : { regex: /&(lt|#60);/g, val: \"<\" },\n      // \"gt\" : { regex: /&(gt|#62);/g, val: \">\" },\n      // \"amp\" : { regex: /&(amp|#38);/g, val: \"&\" },\n      // \"quot\" : { regex: /&(quot|#34);/g, val: \"\\\"\" },\n      // \"apos\" : { regex: /&(apos|#39);/g, val: \"'\" },\n      \"cent\" : { regex: /&(cent|#162);/g, val: \"¢\" },\n      \"pound\" : { regex: /&(pound|#163);/g, val: \"£\" },\n      \"yen\" : { regex: /&(yen|#165);/g, val: \"¥\" },\n      \"euro\" : { regex: /&(euro|#8364);/g, val: \"€\" },\n      \"copyright\" : { regex: /&(copy|#169);/g, val: \"©\" },\n      \"reg\" : { regex: /&(reg|#174);/g, val: \"®\" },\n      \"inr\" : { regex: /&(inr|#8377);/g, val: \"₹\" },\n      \"num_dec\": { regex: /&#([0-9]{1,7});/g, val : (_, str) => String.fromCodePoint(Number.parseInt(str, 10)) },\n      \"num_hex\": { regex: /&#x([0-9a-fA-F]{1,6});/g, val : (_, str) => String.fromCodePoint(Number.parseInt(str, 16)) },\n    };\n    this.addExternalEntities = addExternalEntities;\n    this.parseXml = parseXml;\n    this.parseTextData = parseTextData;\n    this.resolveNameSpace = resolveNameSpace;\n    this.buildAttributesMap = buildAttributesMap;\n    this.isItStopNode = isItStopNode;\n    this.replaceEntitiesValue = replaceEntitiesValue;\n    this.readStopNodeData = readStopNodeData;\n    this.saveTextToParentTag = saveTextToParentTag;\n    this.addChild = addChild;\n    this.ignoreAttributesFn = (0,_ignoreAttributes_js__WEBPACK_IMPORTED_MODULE_4__[\"default\"])(this.options.ignoreAttributes)\n  }\n\n}\n\nfunction addExternalEntities(externalEntities){\n  const entKeys = Object.keys(externalEntities);\n  for (let i = 0; i < entKeys.length; i++) {\n    const ent = entKeys[i];\n    this.lastEntities[ent] = {\n       regex: new RegExp(\"&\"+ent+\";\",\"g\"),\n       val : externalEntities[ent]\n    }\n  }\n}\n\n/**\n * @param {string} val\n * @param {string} tagName\n * @param {string} jPath\n * @param {boolean} dontTrim\n * @param {boolean} hasAttributes\n * @param {boolean} isLeafNode\n * @param {boolean} escapeEntities\n */\nfunction parseTextData(val, tagName, jPath, dontTrim, hasAttributes, isLeafNode, escapeEntities) {\n  if (val !== undefined) {\n    if (this.options.trimValues && !dontTrim) {\n      val = val.trim();\n    }\n    if(val.length > 0){\n      if(!escapeEntities) val = this.replaceEntitiesValue(val);\n      \n      const newval = this.options.tagValueProcessor(tagName, val, jPath, hasAttributes, isLeafNode);\n      if(newval === null || newval === undefined){\n        //don't parse\n        return val;\n      }else if(typeof newval !== typeof val || newval !== val){\n        //overwrite\n        return newval;\n      }else if(this.options.trimValues){\n        return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);\n      }else{\n        const trimmedVal = val.trim();\n        if(trimmedVal === val){\n          return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);\n        }else{\n          return val;\n        }\n      }\n    }\n  }\n}\n\nfunction resolveNameSpace(tagname) {\n  if (this.options.removeNSPrefix) {\n    const tags = tagname.split(':');\n    const prefix = tagname.charAt(0) === '/' ? '/' : '';\n    if (tags[0] === 'xmlns') {\n      return '';\n    }\n    if (tags.length === 2) {\n      tagname = prefix + tags[1];\n    }\n  }\n  return tagname;\n}\n\n//TODO: change regex to capture NS\n//const attrsRegx = new RegExp(\"([\\\\w\\\\-\\\\.\\\\:]+)\\\\s*=\\\\s*(['\\\"])((.|\\n)*?)\\\\2\",\"gm\");\nconst attrsRegx = new RegExp('([^\\\\s=]+)\\\\s*(=\\\\s*([\\'\"])([\\\\s\\\\S]*?)\\\\3)?', 'gm');\n\nfunction buildAttributesMap(attrStr, jPath, tagName) {\n  if (this.options.ignoreAttributes !== true && typeof attrStr === 'string') {\n    // attrStr = attrStr.replace(/\\r?\\n/g, ' ');\n    //attrStr = attrStr || attrStr.trim();\n\n    const matches = (0,_util_js__WEBPACK_IMPORTED_MODULE_0__.getAllMatches)(attrStr, attrsRegx);\n    const len = matches.length; //don't make it inline\n    const attrs = {};\n    for (let i = 0; i < len; i++) {\n      const attrName = this.resolveNameSpace(matches[i][1]);\n      if (this.ignoreAttributesFn(attrName, jPath)) {\n        continue\n      }\n      let oldVal = matches[i][4];\n      let aName = this.options.attributeNamePrefix + attrName;\n      if (attrName.length) {\n        if (this.options.transformAttributeName) {\n          aName = this.options.transformAttributeName(aName);\n        }\n        if(aName === \"__proto__\") aName  = \"#__proto__\";\n        if (oldVal !== undefined) {\n          if (this.options.trimValues) {\n            oldVal = oldVal.trim();\n          }\n          oldVal = this.replaceEntitiesValue(oldVal);\n          const newVal = this.options.attributeValueProcessor(attrName, oldVal, jPath);\n          if(newVal === null || newVal === undefined){\n            //don't parse\n            attrs[aName] = oldVal;\n          }else if(typeof newVal !== typeof oldVal || newVal !== oldVal){\n            //overwrite\n            attrs[aName] = newVal;\n          }else{\n            //parse\n            attrs[aName] = parseValue(\n              oldVal,\n              this.options.parseAttributeValue,\n              this.options.numberParseOptions\n            );\n          }\n        } else if (this.options.allowBooleanAttributes) {\n          attrs[aName] = true;\n        }\n      }\n    }\n    if (!Object.keys(attrs).length) {\n      return;\n    }\n    if (this.options.attributesGroupName) {\n      const attrCollection = {};\n      attrCollection[this.options.attributesGroupName] = attrs;\n      return attrCollection;\n    }\n    return attrs\n  }\n}\n\nconst parseXml = function(xmlData) {\n  xmlData = xmlData.replace(/\\r\\n?/g, \"\\n\"); //TODO: remove this line\n  const xmlObj = new _xmlNode_js__WEBPACK_IMPORTED_MODULE_1__[\"default\"]('!xml');\n  let currentNode = xmlObj;\n  let textData = \"\";\n  let jPath = \"\";\n  for(let i=0; i< xmlData.length; i++){//for each char in XML data\n    const ch = xmlData[i];\n    if(ch === '<'){\n      // const nextIndex = i+1;\n      // const _2ndChar = xmlData[nextIndex];\n      if( xmlData[i+1] === '/') {//Closing Tag\n        const closeIndex = findClosingIndex(xmlData, \">\", i, \"Closing Tag is not closed.\")\n        let tagName = xmlData.substring(i+2,closeIndex).trim();\n\n        if(this.options.removeNSPrefix){\n          const colonIndex = tagName.indexOf(\":\");\n          if(colonIndex !== -1){\n            tagName = tagName.substr(colonIndex+1);\n          }\n        }\n\n        if(this.options.transformTagName) {\n          tagName = this.options.transformTagName(tagName);\n        }\n\n        if(currentNode){\n          textData = this.saveTextToParentTag(textData, currentNode, jPath);\n        }\n\n        //check if last tag of nested tag was unpaired tag\n        const lastTagName = jPath.substring(jPath.lastIndexOf(\".\")+1);\n        if(tagName && this.options.unpairedTags.indexOf(tagName) !== -1 ){\n          throw new Error(`Unpaired tag can not be used as closing tag: </${tagName}>`);\n        }\n        let propIndex = 0\n        if(lastTagName && this.options.unpairedTags.indexOf(lastTagName) !== -1 ){\n          propIndex = jPath.lastIndexOf('.', jPath.lastIndexOf('.')-1)\n          this.tagsNodeStack.pop();\n        }else{\n          propIndex = jPath.lastIndexOf(\".\");\n        }\n        jPath = jPath.substring(0, propIndex);\n\n        currentNode = this.tagsNodeStack.pop();//avoid recursion, set the parent tag scope\n        textData = \"\";\n        i = closeIndex;\n      } else if( xmlData[i+1] === '?') {\n\n        let tagData = readTagExp(xmlData,i, false, \"?>\");\n        if(!tagData) throw new Error(\"Pi Tag is not closed.\");\n\n        textData = this.saveTextToParentTag(textData, currentNode, jPath);\n        if( (this.options.ignoreDeclaration && tagData.tagName === \"?xml\") || this.options.ignorePiTags){\n\n        }else{\n  \n          const childNode = new _xmlNode_js__WEBPACK_IMPORTED_MODULE_1__[\"default\"](tagData.tagName);\n          childNode.add(this.options.textNodeName, \"\");\n          \n          if(tagData.tagName !== tagData.tagExp && tagData.attrExpPresent){\n            childNode[\":@\"] = this.buildAttributesMap(tagData.tagExp, jPath, tagData.tagName);\n          }\n          this.addChild(currentNode, childNode, jPath)\n\n        }\n\n\n        i = tagData.closeIndex + 1;\n      } else if(xmlData.substr(i + 1, 3) === '!--') {\n        const endIndex = findClosingIndex(xmlData, \"-->\", i+4, \"Comment is not closed.\")\n        if(this.options.commentPropName){\n          const comment = xmlData.substring(i + 4, endIndex - 2);\n\n          textData = this.saveTextToParentTag(textData, currentNode, jPath);\n\n          currentNode.add(this.options.commentPropName, [ { [this.options.textNodeName] : comment } ]);\n        }\n        i = endIndex;\n      } else if( xmlData.substr(i + 1, 2) === '!D') {\n        const result = (0,_DocTypeReader_js__WEBPACK_IMPORTED_MODULE_2__[\"default\"])(xmlData, i);\n        this.docTypeEntities = result.entities;\n        i = result.i;\n      }else if(xmlData.substr(i + 1, 2) === '![') {\n        const closeIndex = findClosingIndex(xmlData, \"]]>\", i, \"CDATA is not closed.\") - 2;\n        const tagExp = xmlData.substring(i + 9,closeIndex);\n\n        textData = this.saveTextToParentTag(textData, currentNode, jPath);\n\n        let val = this.parseTextData(tagExp, currentNode.tagname, jPath, true, false, true, true);\n        if(val == undefined) val = \"\";\n\n        //cdata should be set even if it is 0 length string\n        if(this.options.cdataPropName){\n          currentNode.add(this.options.cdataPropName, [ { [this.options.textNodeName] : tagExp } ]);\n        }else{\n          currentNode.add(this.options.textNodeName, val);\n        }\n        \n        i = closeIndex + 2;\n      }else {//Opening tag\n        let result = readTagExp(xmlData,i, this.options.removeNSPrefix);\n        let tagName= result.tagName;\n        const rawTagName = result.rawTagName;\n        let tagExp = result.tagExp;\n        let attrExpPresent = result.attrExpPresent;\n        let closeIndex = result.closeIndex;\n\n        if (this.options.transformTagName) {\n          tagName = this.options.transformTagName(tagName);\n        }\n        \n        //save text as child node\n        if (currentNode && textData) {\n          if(currentNode.tagname !== '!xml'){\n            //when nested tag is found\n            textData = this.saveTextToParentTag(textData, currentNode, jPath, false);\n          }\n        }\n\n        //check if last tag was unpaired tag\n        const lastTag = currentNode;\n        if(lastTag && this.options.unpairedTags.indexOf(lastTag.tagname) !== -1 ){\n          currentNode = this.tagsNodeStack.pop();\n          jPath = jPath.substring(0, jPath.lastIndexOf(\".\"));\n        }\n        if(tagName !== xmlObj.tagname){\n          jPath += jPath ? \".\" + tagName : tagName;\n        }\n        if (this.isItStopNode(this.options.stopNodes, jPath, tagName)) {\n          let tagContent = \"\";\n          //self-closing tag\n          if(tagExp.length > 0 && tagExp.lastIndexOf(\"/\") === tagExp.length - 1){\n            if(tagName[tagName.length - 1] === \"/\"){ //remove trailing '/'\n              tagName = tagName.substr(0, tagName.length - 1);\n              jPath = jPath.substr(0, jPath.length - 1);\n              tagExp = tagName;\n            }else{\n              tagExp = tagExp.substr(0, tagExp.length - 1);\n            }\n            i = result.closeIndex;\n          }\n          //unpaired tag\n          else if(this.options.unpairedTags.indexOf(tagName) !== -1){\n            \n            i = result.closeIndex;\n          }\n          //normal tag\n          else{\n            //read until closing tag is found\n            const result = this.readStopNodeData(xmlData, rawTagName, closeIndex + 1);\n            if(!result) throw new Error(`Unexpected end of ${rawTagName}`);\n            i = result.i;\n            tagContent = result.tagContent;\n          }\n\n          const childNode = new _xmlNode_js__WEBPACK_IMPORTED_MODULE_1__[\"default\"](tagName);\n          if(tagName !== tagExp && attrExpPresent){\n            childNode[\":@\"] = this.buildAttributesMap(tagExp, jPath, tagName);\n          }\n          if(tagContent) {\n            tagContent = this.parseTextData(tagContent, tagName, jPath, true, attrExpPresent, true, true);\n          }\n          \n          jPath = jPath.substr(0, jPath.lastIndexOf(\".\"));\n          childNode.add(this.options.textNodeName, tagContent);\n          \n          this.addChild(currentNode, childNode, jPath)\n        }else{\n  //selfClosing tag\n          if(tagExp.length > 0 && tagExp.lastIndexOf(\"/\") === tagExp.length - 1){\n            if(tagName[tagName.length - 1] === \"/\"){ //remove trailing '/'\n              tagName = tagName.substr(0, tagName.length - 1);\n              jPath = jPath.substr(0, jPath.length - 1);\n              tagExp = tagName;\n            }else{\n              tagExp = tagExp.substr(0, tagExp.length - 1);\n            }\n            \n            if(this.options.transformTagName) {\n              tagName = this.options.transformTagName(tagName);\n            }\n\n            const childNode = new _xmlNode_js__WEBPACK_IMPORTED_MODULE_1__[\"default\"](tagName);\n            if(tagName !== tagExp && attrExpPresent){\n              childNode[\":@\"] = this.buildAttributesMap(tagExp, jPath, tagName);\n            }\n            this.addChild(currentNode, childNode, jPath)\n            jPath = jPath.substr(0, jPath.lastIndexOf(\".\"));\n          }\n    //opening tag\n          else{\n            const childNode = new _xmlNode_js__WEBPACK_IMPORTED_MODULE_1__[\"default\"]( tagName);\n            this.tagsNodeStack.push(currentNode);\n            \n            if(tagName !== tagExp && attrExpPresent){\n              childNode[\":@\"] = this.buildAttributesMap(tagExp, jPath, tagName);\n            }\n            this.addChild(currentNode, childNode, jPath)\n            currentNode = childNode;\n          }\n          textData = \"\";\n          i = closeIndex;\n        }\n      }\n    }else{\n      textData += xmlData[i];\n    }\n  }\n  return xmlObj.child;\n}\n\nfunction addChild(currentNode, childNode, jPath){\n  const result = this.options.updateTag(childNode.tagname, jPath, childNode[\":@\"])\n  if(result === false){\n  }else if(typeof result === \"string\"){\n    childNode.tagname = result\n    currentNode.addChild(childNode);\n  }else{\n    currentNode.addChild(childNode);\n  }\n}\n\nconst replaceEntitiesValue = function(val){\n\n  if(this.options.processEntities){\n    for(let entityName in this.docTypeEntities){\n      const entity = this.docTypeEntities[entityName];\n      val = val.replace( entity.regx, entity.val);\n    }\n    for(let entityName in this.lastEntities){\n      const entity = this.lastEntities[entityName];\n      val = val.replace( entity.regex, entity.val);\n    }\n    if(this.options.htmlEntities){\n      for(let entityName in this.htmlEntities){\n        const entity = this.htmlEntities[entityName];\n        val = val.replace( entity.regex, entity.val);\n      }\n    }\n    val = val.replace( this.ampEntity.regex, this.ampEntity.val);\n  }\n  return val;\n}\nfunction saveTextToParentTag(textData, currentNode, jPath, isLeafNode) {\n  if (textData) { //store previously collected data as textNode\n    if(isLeafNode === undefined) isLeafNode = currentNode.child.length === 0\n    \n    textData = this.parseTextData(textData,\n      currentNode.tagname,\n      jPath,\n      false,\n      currentNode[\":@\"] ? Object.keys(currentNode[\":@\"]).length !== 0 : false,\n      isLeafNode);\n\n    if (textData !== undefined && textData !== \"\")\n      currentNode.add(this.options.textNodeName, textData);\n    textData = \"\";\n  }\n  return textData;\n}\n\n//TODO: use jPath to simplify the logic\n/**\n * \n * @param {string[]} stopNodes \n * @param {string} jPath\n * @param {string} currentTagName \n */\nfunction isItStopNode(stopNodes, jPath, currentTagName){\n  const allNodesExp = \"*.\" + currentTagName;\n  for (const stopNodePath in stopNodes) {\n    const stopNodeExp = stopNodes[stopNodePath];\n    if( allNodesExp === stopNodeExp || jPath === stopNodeExp  ) return true;\n  }\n  return false;\n}\n\n/**\n * Returns the tag Expression and where it is ending handling single-double quotes situation\n * @param {string} xmlData \n * @param {number} i starting index\n * @returns \n */\nfunction tagExpWithClosingIndex(xmlData, i, closingChar = \">\"){\n  let attrBoundary;\n  let tagExp = \"\";\n  for (let index = i; index < xmlData.length; index++) {\n    let ch = xmlData[index];\n    if (attrBoundary) {\n        if (ch === attrBoundary) attrBoundary = \"\";//reset\n    } else if (ch === '\"' || ch === \"'\") {\n        attrBoundary = ch;\n    } else if (ch === closingChar[0]) {\n      if(closingChar[1]){\n        if(xmlData[index + 1] === closingChar[1]){\n          return {\n            data: tagExp,\n            index: index\n          }\n        }\n      }else{\n        return {\n          data: tagExp,\n          index: index\n        }\n      }\n    } else if (ch === '\\t') {\n      ch = \" \"\n    }\n    tagExp += ch;\n  }\n}\n\nfunction findClosingIndex(xmlData, str, i, errMsg){\n  const closingIndex = xmlData.indexOf(str, i);\n  if(closingIndex === -1){\n    throw new Error(errMsg)\n  }else{\n    return closingIndex + str.length - 1;\n  }\n}\n\nfunction readTagExp(xmlData,i, removeNSPrefix, closingChar = \">\"){\n  const result = tagExpWithClosingIndex(xmlData, i+1, closingChar);\n  if(!result) return;\n  let tagExp = result.data;\n  const closeIndex = result.index;\n  const separatorIndex = tagExp.search(/\\s/);\n  let tagName = tagExp;\n  let attrExpPresent = true;\n  if(separatorIndex !== -1){//separate tag name and attributes expression\n    tagName = tagExp.substring(0, separatorIndex);\n    tagExp = tagExp.substring(separatorIndex + 1).trimStart();\n  }\n\n  const rawTagName = tagName;\n  if(removeNSPrefix){\n    const colonIndex = tagName.indexOf(\":\");\n    if(colonIndex !== -1){\n      tagName = tagName.substr(colonIndex+1);\n      attrExpPresent = tagName !== result.data.substr(colonIndex + 1);\n    }\n  }\n\n  return {\n    tagName: tagName,\n    tagExp: tagExp,\n    closeIndex: closeIndex,\n    attrExpPresent: attrExpPresent,\n    rawTagName: rawTagName,\n  }\n}\n/**\n * find paired tag for a stop node\n * @param {string} xmlData \n * @param {string} tagName \n * @param {number} i \n */\nfunction readStopNodeData(xmlData, tagName, i){\n  const startIndex = i;\n  // Starting at 1 since we already have an open tag\n  let openTagCount = 1;\n\n  for (; i < xmlData.length; i++) {\n    if( xmlData[i] === \"<\"){ \n      if (xmlData[i+1] === \"/\") {//close tag\n          const closeIndex = findClosingIndex(xmlData, \">\", i, `${tagName} is not closed`);\n          let closeTagName = xmlData.substring(i+2,closeIndex).trim();\n          if(closeTagName === tagName){\n            openTagCount--;\n            if (openTagCount === 0) {\n              return {\n                tagContent: xmlData.substring(startIndex, i),\n                i : closeIndex\n              }\n            }\n          }\n          i=closeIndex;\n        } else if(xmlData[i+1] === '?') { \n          const closeIndex = findClosingIndex(xmlData, \"?>\", i+1, \"StopNode is not closed.\")\n          i=closeIndex;\n        } else if(xmlData.substr(i + 1, 3) === '!--') { \n          const closeIndex = findClosingIndex(xmlData, \"-->\", i+3, \"StopNode is not closed.\")\n          i=closeIndex;\n        } else if(xmlData.substr(i + 1, 2) === '![') { \n          const closeIndex = findClosingIndex(xmlData, \"]]>\", i, \"StopNode is not closed.\") - 2;\n          i=closeIndex;\n        } else {\n          const tagData = readTagExp(xmlData, i, '>')\n\n          if (tagData) {\n            const openTagName = tagData && tagData.tagName;\n            if (openTagName === tagName && tagData.tagExp[tagData.tagExp.length-1] !== \"/\") {\n              openTagCount++;\n            }\n            i=tagData.closeIndex;\n          }\n        }\n      }\n  }//end for loop\n}\n\nfunction parseValue(val, shouldParse, options) {\n  if (shouldParse && typeof val === 'string') {\n    //console.log(options)\n    const newval = val.trim();\n    if(newval === 'true' ) return true;\n    else if(newval === 'false' ) return false;\n    else return (0,strnum__WEBPACK_IMPORTED_MODULE_3__[\"default\"])(val, options);\n  } else {\n    if ((0,_util_js__WEBPACK_IMPORTED_MODULE_0__.isExist)(val)) {\n      return val;\n    } else {\n      return '';\n    }\n  }\n}\n\n\n//# sourceURL=webpack://fast-xml-parser/./src/xmlparser/OrderedObjParser.js?");
+
+/***/ }),
+
+/***/ "./src/xmlparser/XMLParser.js":
+/*!************************************!*\
+  !*** ./src/xmlparser/XMLParser.js ***!
+  \************************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   \"default\": () => (/* binding */ XMLParser)\n/* harmony export */ });\n/* harmony import */ var _OptionsBuilder_js__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(/*! ./OptionsBuilder.js */ \"./src/xmlparser/OptionsBuilder.js\");\n/* harmony import */ var _OrderedObjParser_js__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(/*! ./OrderedObjParser.js */ \"./src/xmlparser/OrderedObjParser.js\");\n/* harmony import */ var _node2json_js__WEBPACK_IMPORTED_MODULE_2__ = __nccwpck_require__(/*! ./node2json.js */ \"./src/xmlparser/node2json.js\");\n/* harmony import */ var _validator_js__WEBPACK_IMPORTED_MODULE_3__ = __nccwpck_require__(/*! ../validator.js */ \"./src/validator.js\");\n\n\n\n\n\nclass XMLParser{\n    \n    constructor(options){\n        this.externalEntities = {};\n        this.options = (0,_OptionsBuilder_js__WEBPACK_IMPORTED_MODULE_0__.buildOptions)(options);\n        \n    }\n    /**\n     * Parse XML dats to JS object \n     * @param {string|Buffer} xmlData \n     * @param {boolean|Object} validationOption \n     */\n    parse(xmlData,validationOption){\n        if(typeof xmlData === \"string\"){\n        }else if( xmlData.toString){\n            xmlData = xmlData.toString();\n        }else{\n            throw new Error(\"XML data is accepted in String or Bytes[] form.\")\n        }\n        if( validationOption){\n            if(validationOption === true) validationOption = {}; //validate with default options\n            \n            const result = (0,_validator_js__WEBPACK_IMPORTED_MODULE_3__.validate)(xmlData, validationOption);\n            if (result !== true) {\n              throw Error( `${result.err.msg}:${result.err.line}:${result.err.col}` )\n            }\n          }\n        const orderedObjParser = new _OrderedObjParser_js__WEBPACK_IMPORTED_MODULE_1__[\"default\"](this.options);\n        orderedObjParser.addExternalEntities(this.externalEntities);\n        const orderedResult = orderedObjParser.parseXml(xmlData);\n        if(this.options.preserveOrder || orderedResult === undefined) return orderedResult;\n        else return (0,_node2json_js__WEBPACK_IMPORTED_MODULE_2__[\"default\"])(orderedResult, this.options);\n    }\n\n    /**\n     * Add Entity which is not by default supported by this library\n     * @param {string} key \n     * @param {string} value \n     */\n    addEntity(key, value){\n        if(value.indexOf(\"&\") !== -1){\n            throw new Error(\"Entity value can't have '&'\")\n        }else if(key.indexOf(\"&\") !== -1 || key.indexOf(\";\") !== -1){\n            throw new Error(\"An entity must be set without '&' and ';'. Eg. use '#xD' for '&#xD;'\")\n        }else if(value === \"&\"){\n            throw new Error(\"An entity with value '&' is not permitted\");\n        }else{\n            this.externalEntities[key] = value;\n        }\n    }\n}\n\n//# sourceURL=webpack://fast-xml-parser/./src/xmlparser/XMLParser.js?");
+
+/***/ }),
+
+/***/ "./src/xmlparser/node2json.js":
+/*!************************************!*\
+  !*** ./src/xmlparser/node2json.js ***!
+  \************************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   \"default\": () => (/* binding */ prettify)\n/* harmony export */ });\n\n\n/**\n * \n * @param {array} node \n * @param {any} options \n * @returns \n */\nfunction prettify(node, options){\n  return compress( node, options);\n}\n\n/**\n * \n * @param {array} arr \n * @param {object} options \n * @param {string} jPath \n * @returns object\n */\nfunction compress(arr, options, jPath){\n  let text;\n  const compressedObj = {};\n  for (let i = 0; i < arr.length; i++) {\n    const tagObj = arr[i];\n    const property = propName(tagObj);\n    let newJpath = \"\";\n    if(jPath === undefined) newJpath = property;\n    else newJpath = jPath + \".\" + property;\n\n    if(property === options.textNodeName){\n      if(text === undefined) text = tagObj[property];\n      else text += \"\" + tagObj[property];\n    }else if(property === undefined){\n      continue;\n    }else if(tagObj[property]){\n      \n      let val = compress(tagObj[property], options, newJpath);\n      const isLeaf = isLeafTag(val, options);\n\n      if(tagObj[\":@\"]){\n        assignAttributes( val, tagObj[\":@\"], newJpath, options);\n      }else if(Object.keys(val).length === 1 && val[options.textNodeName] !== undefined && !options.alwaysCreateTextNode){\n        val = val[options.textNodeName];\n      }else if(Object.keys(val).length === 0){\n        if(options.alwaysCreateTextNode) val[options.textNodeName] = \"\";\n        else val = \"\";\n      }\n\n      if(compressedObj[property] !== undefined && compressedObj.hasOwnProperty(property)) {\n        if(!Array.isArray(compressedObj[property])) {\n            compressedObj[property] = [ compressedObj[property] ];\n        }\n        compressedObj[property].push(val);\n      }else{\n        //TODO: if a node is not an array, then check if it should be an array\n        //also determine if it is a leaf node\n        if (options.isArray(property, newJpath, isLeaf )) {\n          compressedObj[property] = [val];\n        }else{\n          compressedObj[property] = val;\n        }\n      }\n    }\n    \n  }\n  // if(text && text.length > 0) compressedObj[options.textNodeName] = text;\n  if(typeof text === \"string\"){\n    if(text.length > 0) compressedObj[options.textNodeName] = text;\n  }else if(text !== undefined) compressedObj[options.textNodeName] = text;\n  return compressedObj;\n}\n\nfunction propName(obj){\n  const keys = Object.keys(obj);\n  for (let i = 0; i < keys.length; i++) {\n    const key = keys[i];\n    if(key !== \":@\") return key;\n  }\n}\n\nfunction assignAttributes(obj, attrMap, jpath, options){\n  if (attrMap) {\n    const keys = Object.keys(attrMap);\n    const len = keys.length; //don't make it inline\n    for (let i = 0; i < len; i++) {\n      const atrrName = keys[i];\n      if (options.isArray(atrrName, jpath + \".\" + atrrName, true, true)) {\n        obj[atrrName] = [ attrMap[atrrName] ];\n      } else {\n        obj[atrrName] = attrMap[atrrName];\n      }\n    }\n  }\n}\n\nfunction isLeafTag(obj, options){\n  const { textNodeName } = options;\n  const propCount = Object.keys(obj).length;\n  \n  if (propCount === 0) {\n    return true;\n  }\n\n  if (\n    propCount === 1 &&\n    (obj[textNodeName] || typeof obj[textNodeName] === \"boolean\" || obj[textNodeName] === 0)\n  ) {\n    return true;\n  }\n\n  return false;\n}\n\n\n//# sourceURL=webpack://fast-xml-parser/./src/xmlparser/node2json.js?");
+
+/***/ }),
+
+/***/ "./src/xmlparser/xmlNode.js":
+/*!**********************************!*\
+  !*** ./src/xmlparser/xmlNode.js ***!
+  \**********************************/
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+eval("__nccwpck_require__.r(__webpack_exports__);\n/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {\n/* harmony export */   \"default\": () => (/* binding */ XmlNode)\n/* harmony export */ });\n\n\nclass XmlNode{\n  constructor(tagname) {\n    this.tagname = tagname;\n    this.child = []; //nested tags, text, cdata, comments in order\n    this[\":@\"] = {}; //attributes map\n  }\n  add(key,val){\n    // this.child.push( {name : key, val: val, isCdata: isCdata });\n    if(key === \"__proto__\") key = \"#__proto__\";\n    this.child.push( {[key]: val });\n  }\n  addChild(node) {\n    if(node.tagname === \"__proto__\") node.tagname = \"#__proto__\";\n    if(node[\":@\"] && Object.keys(node[\":@\"]).length > 0){\n      this.child.push( { [node.tagname]: node.child, [\":@\"]: node[\":@\"] });\n    }else{\n      this.child.push( { [node.tagname]: node.child });\n    }\n  }\n}\n\n\n//# sourceURL=webpack://fast-xml-parser/./src/xmlparser/xmlNode.js?");
+
+/***/ })
+
+/******/ 	});
+/************************************************************************/
+/******/ 	// The module cache
+/******/ 	var __webpack_module_cache__ = {};
+/******/ 	
+/******/ 	// The require function
+/******/ 	function __nested_webpack_require_83014__(moduleId) {
+/******/ 		// Check if module is in cache
+/******/ 		var cachedModule = __webpack_module_cache__[moduleId];
+/******/ 		if (cachedModule !== undefined) {
+/******/ 			return cachedModule.exports;
+/******/ 		}
+/******/ 		// Create a new module (and put it into the cache)
+/******/ 		var module = __webpack_module_cache__[moduleId] = {
+/******/ 			// no module.id needed
+/******/ 			// no module.loaded needed
+/******/ 			exports: {}
+/******/ 		};
+/******/ 	
+/******/ 		// Execute the module function
+/******/ 		__webpack_modules__[moduleId](module, module.exports, __nested_webpack_require_83014__);
+/******/ 	
+/******/ 		// Return the exports of the module
+/******/ 		return module.exports;
+/******/ 	}
+/******/ 	
+/************************************************************************/
+/******/ 	/* webpack/runtime/define property getters */
+/******/ 	(() => {
+/******/ 		// define getter functions for harmony exports
+/******/ 		__nested_webpack_require_83014__.d = (exports, definition) => {
+/******/ 			for(var key in definition) {
+/******/ 				if(__nested_webpack_require_83014__.o(definition, key) && !__nested_webpack_require_83014__.o(exports, key)) {
+/******/ 					Object.defineProperty(exports, key, { enumerable: true, get: definition[key] });
+/******/ 				}
+/******/ 			}
+/******/ 		};
+/******/ 	})();
+/******/ 	
+/******/ 	/* webpack/runtime/hasOwnProperty shorthand */
+/******/ 	(() => {
+/******/ 		__nested_webpack_require_83014__.o = (obj, prop) => (Object.prototype.hasOwnProperty.call(obj, prop))
+/******/ 	})();
+/******/ 	
+/******/ 	/* webpack/runtime/make namespace object */
+/******/ 	(() => {
+/******/ 		// define __esModule on exports
+/******/ 		__nested_webpack_require_83014__.r = (exports) => {
+/******/ 			if(typeof Symbol !== 'undefined' && Symbol.toStringTag) {
+/******/ 				Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
+/******/ 			}
+/******/ 			Object.defineProperty(exports, '__esModule', { value: true });
+/******/ 		};
+/******/ 	})();
+/******/ 	
+/************************************************************************/
+/******/ 	
+/******/ 	// startup
+/******/ 	// Load entry module and return exports
+/******/ 	// This entry module can't be inlined because the eval devtool is used.
+/******/ 	var __webpack_exports__ = __nested_webpack_require_83014__("./src/fxp.js");
+/******/ 	module.exports = __webpack_exports__;
+/******/ 	
+/******/ })()
+;
 
 /***/ }),
 
@@ -84407,6 +88557,13 @@ var z = /*#__PURE__*/Object.freeze({
 
 
 
+
+/***/ }),
+
+/***/ 5873:
+/***/ ((module) => {
+
+module.exports = JSON.parse('{"name":"@actions/cache","version":"4.0.3","preview":true,"description":"Actions cache lib","keywords":["github","actions","cache"],"homepage":"https://github.com/actions/toolkit/tree/main/packages/cache","license":"MIT","main":"lib/cache.js","types":"lib/cache.d.ts","directories":{"lib":"lib","test":"__tests__"},"files":["lib","!.DS_Store"],"publishConfig":{"access":"public"},"repository":{"type":"git","url":"git+https://github.com/actions/toolkit.git","directory":"packages/cache"},"scripts":{"audit-moderate":"npm install && npm audit --json --audit-level=moderate > audit.json","test":"echo \\"Error: run tests from root\\" && exit 1","tsc":"tsc"},"bugs":{"url":"https://github.com/actions/toolkit/issues"},"dependencies":{"@actions/core":"^1.11.1","@actions/exec":"^1.0.1","@actions/glob":"^0.1.0","@actions/http-client":"^2.1.1","@actions/io":"^1.0.1","@azure/abort-controller":"^1.1.0","@azure/ms-rest-js":"^2.6.0","@azure/storage-blob":"^12.13.0","@protobuf-ts/plugin":"^2.9.4","semver":"^6.3.1"},"devDependencies":{"@types/node":"^22.13.9","@types/semver":"^6.0.0","typescript":"^5.2.2"}}');
 
 /***/ })
 
