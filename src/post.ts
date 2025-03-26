@@ -16,12 +16,10 @@ if (isSuccess && config.cache) {
       .replace(/[-:]/g, '')
       .replace(/\..+/, '')
       .replace('T', '_');
-    const savedId = await cache.saveCache(
-      config.cache.paths,
-      `${config.cache.key}-${timestamp}`,
-    );
+    const cacheKey = `${config.cache.key}-${timestamp}`;
+    const savedId = await cache.saveCache(config.cache.paths, cacheKey);
     if (savedId) {
-      core.info(`Cache saved with ID ${savedId}`);
+      core.info(`Cache saved. Key: ${cacheKey}, ID: ${savedId}`);
     } else {
       // While saving a cache sounds like an optional thing to do, actually it's
       // critical to do it. Otherwise, we might get stale builds. For example,
