@@ -40,7 +40,7 @@ jobs:
       # Checkout, prepare, etc. as usual
 
       - name: Publisher
-        uses: AmazeeLabs/publisher-action@SHA
+        uses: amazeeio-solutions/publisher-action@SHA
         with:
           success_env_var_name: BUILD_IS_SUCCESSFUL
           cache_paths: |
